@@ -8,7 +8,9 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use konnect_ipc::client::KiCadIpcClient;
+use konnect_sexp::{parse_sexp, SexpNode};
 use serde_json::json;
+use std::collections::HashMap;
 
 // ─── IPC helper ───────────────────────────────────────────────────────────────
 
@@ -222,6 +224,93 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_duplicate_component(args, ctx).await }
         ),
         tool!(
+            "list_footprint_texts",
+            "List footprint reference/value text position, style, layer and visibility via KiCAD IPC.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "kind": { "type": "string", "description": "Optional: reference or value" },
+                    "reference": { "type": "string", "description": "Optional exact reference filter" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_list_footprint_texts(args, ctx).await }
+        ),
+        tool!(
+            "edit_footprint_reference",
+            "Move, rotate, show/hide, or restyle one footprint reference without moving the footprint.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "reference": { "type": "string" },
+                    "x": { "type": "number" }, "y": { "type": "number" },
+                    "width": { "type": "number", "minimum": 1.0 },
+                    "height": { "type": "number", "minimum": 1.0 },
+                    "stroke_width": { "type": "number", "minimum": 0.15 },
+                    "rotation": { "type": "number" },
+                    "visible": { "type": "boolean" }
+                },
+                "required": ["board", "reference"]
+            }),
+            |args, ctx| async move { handle_edit_footprint_reference(args, ctx).await }
+        ),
+        tool!(
+            "batch_set_reference_style",
+            "Apply JLCPCB-safe reference text size/stroke to selected footprint references.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "references": { "type": "array", "items": { "type": "string" }, "description": "Optional exact reference list; empty means all" },
+                    "prefixes": { "type": "array", "items": { "type": "string" }, "description": "Optional reference prefixes such as U,J,Q" },
+                    "width": { "type": "number", "minimum": 1.0, "default": 1.0 },
+                    "height": { "type": "number", "minimum": 1.0, "default": 1.0 },
+                    "stroke_width": { "type": "number", "minimum": 0.15, "default": 0.15 }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_batch_set_reference_style(args, ctx).await }
+        ),
+        tool!(
+            "check_reference_collisions",
+            "Check visible footprint references against pads, vias, board edges and other references.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "copper_clearance": { "type": "number", "default": 0.20 },
+                    "edge_clearance": { "type": "number", "default": 0.30 }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_check_reference_collisions(args, ctx).await }
+        ),
+        tool!(
+            "auto_place_references",
+            "Place footprint references around their own pad bounds while avoiding pads, vias, board edges and other references.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "references": { "type": "array", "items": { "type": "string" } },
+                    "prefixes": { "type": "array", "items": { "type": "string" } },
+                    "width": { "type": "number", "minimum": 1.0, "default": 1.0 },
+                    "height": { "type": "number", "minimum": 1.0, "default": 1.0 },
+                    "stroke_width": { "type": "number", "minimum": 0.15, "default": 0.15 },
+                    "copper_clearance": { "type": "number", "default": 0.20 },
+                    "edge_clearance": { "type": "number", "default": 0.30 },
+                    "placement_gap": { "type": "number", "default": 0.35 },
+                    "only_colliding": { "type": "boolean", "default": true, "description": "Keep already legal references at their current positions" },
+                    "hide_unplaced_passives": { "type": "boolean", "default": true },
+                    "dry_run": { "type": "boolean", "default": true }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_auto_place_references(args, ctx).await }
+        ),
+        tool!(
             "get_board_2d_view",
             "Render the PCB as a 2-D image using kicad-cli and return it as a base64 PNG.",
             json!({
@@ -239,6 +328,620 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_get_board_2d_view(args, ctx).await }
         ),
     ]
+}
+
+async fn handle_list_footprint_texts(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let kind = args["kind"].as_str().map(str::to_string);
+    let reference = args["reference"].as_str().map(str::to_string);
+    let texts = ipc!(ctx, |c| c.list_footprint_texts());
+    let filtered: Vec<_> = texts
+        .into_iter()
+        .filter(|t| kind.as_ref().is_none_or(|k| &t.kind == k))
+        .filter(|t| reference.as_ref().is_none_or(|r| &t.reference == r))
+        .collect();
+    Ok(CallToolResult::json(
+        &json!({ "count": filtered.len(), "texts": filtered }),
+    ))
+}
+
+fn optional_f64(args: &serde_json::Value, key: &str) -> Option<f64> {
+    args.get(key).and_then(|v| v.as_f64())
+}
+
+async fn handle_edit_footprint_reference(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let reference = match require_str(args, "reference") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let width = optional_f64(args, "width");
+    let height = optional_f64(args, "height");
+    let stroke = optional_f64(args, "stroke_width");
+    let x = optional_f64(args, "x");
+    let y = optional_f64(args, "y");
+    let rotation = optional_f64(args, "rotation");
+    let visible = args.get("visible").and_then(|v| v.as_bool());
+    if width.is_some_and(|v| v < 1.0) || height.is_some_and(|v| v < 1.0) {
+        return Ok(CallToolResult::error(
+            "JLCPCB text width/height must be >= 1.0 mm",
+        ));
+    }
+    if stroke.is_some_and(|v| v < 0.15) {
+        return Ok(CallToolResult::error(
+            "JLCPCB silkscreen stroke width must be >= 0.15 mm",
+        ));
+    }
+    let ref_ipc = reference.clone();
+    ipc!(ctx, |c| c.edit_reference_text(
+        &ref_ipc, x, y, width, height, stroke, rotation, visible
+    ));
+    Ok(CallToolResult::json(&json!({ "updated": reference })))
+}
+
+async fn handle_batch_set_reference_style(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let width = optional_f64(args, "width").unwrap_or(1.0);
+    let height = optional_f64(args, "height").unwrap_or(1.0);
+    let stroke = optional_f64(args, "stroke_width").unwrap_or(0.15);
+    if width < 1.0 || height < 1.0 || stroke < 0.15 {
+        return Ok(CallToolResult::error(
+            "JLCPCB minimum is 1.0 x 1.0 mm with 0.15 mm stroke",
+        ));
+    }
+    let requested: Vec<String> = args["references"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let prefixes: Vec<String> = args["prefixes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let texts = ipc!(ctx, |c| c.list_footprint_texts());
+    let refs: Vec<String> = texts
+        .into_iter()
+        .filter(|t| t.kind == "reference")
+        .map(|t| t.reference)
+        .filter(|r| requested.is_empty() || requested.contains(r))
+        .filter(|r| prefixes.is_empty() || prefixes.iter().any(|p| r.starts_with(p)))
+        .collect();
+    let mut updated = Vec::new();
+    for reference in refs {
+        let ref_ipc = reference.clone();
+        let result = with_ipc(ctx.config.ipc_address.clone(), move |c| {
+            c.edit_reference_text(
+                &ref_ipc,
+                None,
+                None,
+                Some(width),
+                Some(height),
+                Some(stroke),
+                None,
+                None,
+            )
+        })
+        .await?;
+        match result {
+            Ok(()) => updated.push(reference),
+            Err(e) => {
+                return Ok(CallToolResult::error(format!(
+                    "IPC error while updating {}: {}",
+                    reference, e
+                )))
+            }
+        }
+    }
+    Ok(CallToolResult::json(
+        &json!({ "updated_count": updated.len(), "references": updated }),
+    ))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Rect {
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+}
+
+impl Rect {
+    fn from_center(x: f64, y: f64, w: f64, h: f64) -> Self {
+        Self {
+            x0: x - w / 2.0,
+            y0: y - h / 2.0,
+            x1: x + w / 2.0,
+            y1: y + h / 2.0,
+        }
+    }
+    fn expand(self, d: f64) -> Self {
+        Self {
+            x0: self.x0 - d,
+            y0: self.y0 - d,
+            x1: self.x1 + d,
+            y1: self.y1 + d,
+        }
+    }
+    fn intersects(self, other: Self) -> bool {
+        self.x0 < other.x1 && self.x1 > other.x0 && self.y0 < other.y1 && self.y1 > other.y0
+    }
+    fn contains(self, other: Self, margin: f64) -> bool {
+        other.x0 >= self.x0 + margin
+            && other.x1 <= self.x1 - margin
+            && other.y0 >= self.y0 + margin
+            && other.y1 <= self.y1 - margin
+    }
+}
+
+#[derive(Default)]
+struct BoardGeometry {
+    outline: Option<Rect>,
+    copper: Vec<(String, Rect, Option<Side>)>,
+    pads_by_ref: HashMap<String, Rect>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Front,
+    Back,
+}
+
+fn layer_side(layer: &str) -> Option<Side> {
+    if layer.starts_with("F.") {
+        Some(Side::Front)
+    } else if layer.starts_with("B.") {
+        Some(Side::Back)
+    } else {
+        None
+    }
+}
+
+fn node_xy(node: &SexpNode, tag: &str) -> Option<(f64, f64)> {
+    let n = node.find(tag)?;
+    Some((n.get_f64(1)?, n.get_f64(2)?))
+}
+
+fn rotated_point(x: f64, y: f64, ox: f64, oy: f64, degrees: f64) -> (f64, f64) {
+    let a = degrees.to_radians();
+    (
+        ox + x * a.cos() - y * a.sin(),
+        oy + x * a.sin() + y * a.cos(),
+    )
+}
+
+fn union_rect(a: Option<Rect>, b: Rect) -> Rect {
+    a.map_or(b, |a| Rect {
+        x0: a.x0.min(b.x0),
+        y0: a.y0.min(b.y0),
+        x1: a.x1.max(b.x1),
+        y1: a.y1.max(b.y1),
+    })
+}
+
+fn collect_edge_points(node: &SexpNode, points: &mut Vec<(f64, f64)>) {
+    if node.find_str("layer") == Some("Edge.Cuts") {
+        for tag in ["start", "end", "mid", "center"] {
+            if let Some(p) = node_xy(node, tag) {
+                points.push(p);
+            }
+        }
+    }
+    if let Some(children) = node.children() {
+        for child in children {
+            collect_edge_points(child, points);
+        }
+    }
+}
+
+fn parse_board_geometry(path: &std::path::Path) -> anyhow::Result<BoardGeometry> {
+    let tree = parse_sexp(&std::fs::read_to_string(path)?)?;
+    let mut geometry = BoardGeometry::default();
+    let mut edge_points = Vec::new();
+    collect_edge_points(&tree, &mut edge_points);
+    if !edge_points.is_empty() {
+        geometry.outline = Some(Rect {
+            x0: edge_points
+                .iter()
+                .map(|p| p.0)
+                .fold(f64::INFINITY, f64::min),
+            y0: edge_points
+                .iter()
+                .map(|p| p.1)
+                .fold(f64::INFINITY, f64::min),
+            x1: edge_points
+                .iter()
+                .map(|p| p.0)
+                .fold(f64::NEG_INFINITY, f64::max),
+            y1: edge_points
+                .iter()
+                .map(|p| p.1)
+                .fold(f64::NEG_INFINITY, f64::max),
+        });
+    }
+    for fp in tree.find_all("footprint") {
+        let at = fp.find("at");
+        let (fx, fy, fr) = match at {
+            Some(n) => (
+                n.get_f64(1).unwrap_or(0.0),
+                n.get_f64(2).unwrap_or(0.0),
+                n.get_f64(3).unwrap_or(0.0),
+            ),
+            None => continue,
+        };
+        let reference = fp
+            .find_all("property")
+            .into_iter()
+            .find(|p| p.get(1).and_then(SexpNode::as_str) == Some("Reference"))
+            .and_then(|p| p.get(2))
+            .and_then(SexpNode::as_str)
+            .unwrap_or("?")
+            .to_string();
+        let mut own = None;
+        for pad in fp.find_all("pad") {
+            let (px, py) = node_xy(pad, "at").unwrap_or((0.0, 0.0));
+            let pr = pad.find("at").and_then(|n| n.get_f64(3)).unwrap_or(0.0);
+            let (cx, cy) = rotated_point(px, py, fx, fy, fr);
+            let (mut w, mut h) = node_xy(pad, "size").unwrap_or((0.5, 0.5));
+            let angle = (fr + pr).rem_euclid(180.0);
+            if (angle - 90.0).abs() < 45.0 {
+                std::mem::swap(&mut w, &mut h);
+            }
+            let rect = Rect::from_center(cx, cy, w, h);
+            let layers = pad
+                .find("layers")
+                .and_then(SexpNode::children)
+                .unwrap_or(&[]);
+            let has_f = layers
+                .iter()
+                .filter_map(SexpNode::as_str)
+                .any(|l| l == "F.Cu" || l == "*.Cu");
+            let has_b = layers
+                .iter()
+                .filter_map(SexpNode::as_str)
+                .any(|l| l == "B.Cu" || l == "*.Cu");
+            let side = match (has_f, has_b) {
+                (true, false) => Some(Side::Front),
+                (false, true) => Some(Side::Back),
+                _ => None,
+            };
+            geometry
+                .copper
+                .push((format!("pad {}", reference), rect, side));
+            own = Some(union_rect(own, rect));
+        }
+        if let Some(rect) = own {
+            geometry.pads_by_ref.insert(reference, rect);
+        }
+    }
+    for via in tree.find_all("via") {
+        if let Some((x, y)) = node_xy(via, "at") {
+            let size = via.find_f64("size").unwrap_or(0.6);
+            geometry
+                .copper
+                .push(("via".to_string(), Rect::from_center(x, y, size, size), None));
+        }
+    }
+    Ok(geometry)
+}
+
+fn text_rect(
+    text: &str,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    stroke: f64,
+    rotation: f64,
+) -> Rect {
+    let mut w = (text.chars().count() as f64 * width * 0.72 + stroke).max(width);
+    let mut h = height + stroke;
+    if (rotation.rem_euclid(180.0) - 90.0).abs() < 45.0 {
+        std::mem::swap(&mut w, &mut h);
+    }
+    Rect::from_center(x, y, w, h)
+}
+
+fn selected_ref(reference: &str, requested: &[String], prefixes: &[String]) -> bool {
+    (requested.is_empty() || requested.iter().any(|r| r == reference))
+        && (prefixes.is_empty() || prefixes.iter().any(|p| reference.starts_with(p)))
+}
+
+fn geometry_conflicts(
+    r: Rect,
+    side: Option<Side>,
+    geometry: &BoardGeometry,
+    copper_clearance: f64,
+    edge_clearance: f64,
+) -> bool {
+    geometry
+        .outline
+        .is_some_and(|o| !o.contains(r, edge_clearance))
+        || geometry.copper.iter().any(|(_, c, copper_side)| {
+            copper_side.is_none_or(|s| Some(s) == side) && r.intersects(c.expand(copper_clearance))
+        })
+}
+
+async fn handle_check_reference_collisions(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let copper_clearance = optional_f64(args, "copper_clearance").unwrap_or(0.20);
+    let edge_clearance = optional_f64(args, "edge_clearance").unwrap_or(0.30);
+    let geometry = parse_board_geometry(&board)?;
+    let texts = ipc!(ctx, |c| c.list_footprint_texts());
+    let refs: Vec<_> = texts
+        .into_iter()
+        .filter(|t| t.kind == "reference" && t.visible)
+        .collect();
+    let rects: Vec<_> = refs
+        .iter()
+        .map(|t| {
+            text_rect(
+                &t.text,
+                t.x,
+                t.y,
+                t.width,
+                t.height,
+                t.stroke_width,
+                t.rotation,
+            )
+        })
+        .collect();
+    let mut collisions = Vec::new();
+    for (i, t) in refs.iter().enumerate() {
+        let r = rects[i];
+        let mut reasons = Vec::new();
+        if geometry
+            .outline
+            .is_some_and(|o| !o.contains(r, edge_clearance))
+        {
+            reasons.push("board edge".to_string());
+        }
+        let side = layer_side(&t.layer);
+        for (name, c, copper_side) in &geometry.copper {
+            if copper_side.is_none_or(|s| Some(s) == side)
+                && r.intersects(c.expand(copper_clearance))
+            {
+                reasons.push(name.clone());
+            }
+        }
+        for (j, other) in rects.iter().enumerate() {
+            if i != j && layer_side(&refs[j].layer) == side && r.intersects(*other) {
+                reasons.push(format!("reference {}", refs[j].reference));
+            }
+        }
+        reasons.sort();
+        reasons.dedup();
+        if !reasons.is_empty() {
+            collisions.push(json!({"reference": t.reference, "reasons": reasons}));
+        }
+    }
+    Ok(CallToolResult::json(
+        &json!({"visible_references": refs.len(), "collision_count": collisions.len(), "collisions": collisions}),
+    ))
+}
+
+async fn handle_auto_place_references(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let width = optional_f64(args, "width").unwrap_or(1.0);
+    let height = optional_f64(args, "height").unwrap_or(1.0);
+    let stroke = optional_f64(args, "stroke_width").unwrap_or(0.15);
+    if width < 1.0 || height < 1.0 || stroke < 0.15 {
+        return Ok(CallToolResult::error(
+            "JLCPCB minimum is 1.0 x 1.0 mm with 0.15 mm stroke",
+        ));
+    }
+    let copper_clearance = optional_f64(args, "copper_clearance").unwrap_or(0.20);
+    let edge_clearance = optional_f64(args, "edge_clearance").unwrap_or(0.30);
+    let gap = optional_f64(args, "placement_gap").unwrap_or(0.35);
+    let dry_run = args
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let only_colliding = args
+        .get("only_colliding")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let hide_passives = args
+        .get("hide_unplaced_passives")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let requested: Vec<String> = args["references"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let prefixes: Vec<String> = args["prefixes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let geometry = parse_board_geometry(&board)?;
+    let texts = ipc!(ctx, |c| c.list_footprint_texts());
+    let all_refs: Vec<_> = texts
+        .into_iter()
+        .filter(|t| t.kind == "reference")
+        .collect();
+    let initial: Vec<_> = all_refs
+        .iter()
+        .map(|t| {
+            (
+                text_rect(
+                    &t.text,
+                    t.x,
+                    t.y,
+                    t.width,
+                    t.height,
+                    t.stroke_width,
+                    t.rotation,
+                ),
+                layer_side(&t.layer),
+            )
+        })
+        .collect();
+    let mut colliding = vec![false; all_refs.len()];
+    for i in 0..all_refs.len() {
+        if all_refs[i].visible
+            && geometry_conflicts(
+                initial[i].0,
+                initial[i].1,
+                &geometry,
+                copper_clearance,
+                edge_clearance,
+            )
+        {
+            colliding[i] = true;
+        }
+        if all_refs[i].visible {
+            for j in 0..all_refs.len() {
+                if i != j
+                    && all_refs[j].visible
+                    && initial[i].1 == initial[j].1
+                    && initial[i].0.intersects(initial[j].0)
+                {
+                    colliding[i] = true;
+                }
+            }
+        }
+    }
+    let mut refs: Vec<_> = all_refs
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| selected_ref(&t.reference, &requested, &prefixes))
+        .map(|(i, t)| (i, (*t).clone()))
+        .collect();
+    refs.sort_by_key(|(_, t)| {
+        if t.reference.starts_with(['J', 'U', 'Q', 'L', 'D']) {
+            0
+        } else {
+            1
+        }
+    });
+    let mut occupied: Vec<(Rect, Option<Side>)> = all_refs
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| {
+            t.visible
+                && (!selected_ref(&t.reference, &requested, &prefixes)
+                    || (only_colliding && !colliding[*i]))
+        })
+        .map(|(i, _)| initial[i])
+        .collect();
+    let mut actions = Vec::new();
+    for (index, t) in refs {
+        if only_colliding && t.visible && !colliding[index] {
+            actions.push(json!({"reference": t.reference, "action": "keep"}));
+            continue;
+        }
+        let Some(base) = geometry.pads_by_ref.get(&t.reference).copied() else {
+            continue;
+        };
+        let side = layer_side(&t.layer);
+        let tw = (t.reference.chars().count() as f64 * width * 0.72 + stroke).max(width);
+        let th = height + stroke;
+        let candidates = [
+            (base.x0 + tw / 2.0, base.y0 - gap - th / 2.0, 0.0),
+            (base.x0 + tw / 2.0, base.y1 + gap + th / 2.0, 0.0),
+            (base.x0 - gap - th / 2.0, base.y0 + tw / 2.0, 90.0),
+            (base.x1 + gap + th / 2.0, base.y0 + tw / 2.0, 90.0),
+        ];
+        let chosen = candidates.into_iter().find(|(x, y, rot)| {
+            let r = text_rect(&t.reference, *x, *y, width, height, stroke, *rot);
+            geometry
+                .outline
+                .is_none_or(|o| o.contains(r, edge_clearance))
+                && !geometry.copper.iter().any(|(_, c, copper_side)| {
+                    copper_side.is_none_or(|s| Some(s) == side)
+                        && r.intersects(c.expand(copper_clearance))
+                })
+                && !occupied
+                    .iter()
+                    .any(|(o, other_side)| *other_side == side && r.intersects(*o))
+        });
+        if let Some((x, y, rotation)) = chosen {
+            occupied.push((
+                text_rect(&t.reference, x, y, width, height, stroke, rotation),
+                side,
+            ));
+            actions.push(json!({"reference": t.reference, "action": "place", "x": x, "y": y, "rotation": rotation}));
+            if !dry_run {
+                let reference = t.reference.clone();
+                match with_ipc(ctx.config.ipc_address.clone(), move |c| {
+                    c.edit_reference_text(
+                        &reference,
+                        Some(x),
+                        Some(y),
+                        Some(width),
+                        Some(height),
+                        Some(stroke),
+                        Some(rotation),
+                        Some(true),
+                    )
+                })
+                .await?
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        return Ok(CallToolResult::error(format!("IPC update failed: {}", e)))
+                    }
+                }
+            }
+        } else {
+            let passive = t.reference.starts_with('R') || t.reference.starts_with('C');
+            let hide = passive && hide_passives;
+            actions.push(
+                json!({"reference": t.reference, "action": if hide {"hide"} else {"unplaced"}}),
+            );
+            if hide && !dry_run {
+                let reference = t.reference.clone();
+                match with_ipc(ctx.config.ipc_address.clone(), move |c| {
+                    c.edit_reference_text(
+                        &reference,
+                        None,
+                        None,
+                        Some(width),
+                        Some(height),
+                        Some(stroke),
+                        None,
+                        Some(false),
+                    )
+                })
+                .await?
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        return Ok(CallToolResult::error(format!("IPC update failed: {}", e)))
+                    }
+                }
+            }
+        }
+    }
+    Ok(CallToolResult::json(
+        &json!({"dry_run": dry_run, "action_count": actions.len(), "actions": actions}),
+    ))
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -658,4 +1361,31 @@ async fn handle_get_board_2d_view(
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(CallToolResult::image(b64, "image/png"))
+}
+
+#[cfg(test)]
+mod reference_layout_tests {
+    use super::*;
+
+    #[test]
+    fn text_bounds_follow_rotation() {
+        let horizontal = text_rect("R20", 10.0, 20.0, 1.0, 1.0, 0.15, 0.0);
+        let vertical = text_rect("R20", 10.0, 20.0, 1.0, 1.0, 0.15, 90.0);
+        assert!(horizontal.x1 - horizontal.x0 > horizontal.y1 - horizontal.y0);
+        assert!(vertical.y1 - vertical.y0 > vertical.x1 - vertical.x0);
+    }
+
+    #[test]
+    fn side_matching_distinguishes_front_and_back() {
+        assert_eq!(layer_side("F.SilkS"), Some(Side::Front));
+        assert_eq!(layer_side("B.Cu"), Some(Side::Back));
+        assert_eq!(layer_side("Edge.Cuts"), None);
+    }
+
+    #[test]
+    fn rectangle_clearance_is_conservative() {
+        let text = Rect::from_center(0.0, 0.0, 1.0, 1.0);
+        let pad = Rect::from_center(0.8, 0.0, 0.2, 0.2).expand(0.3);
+        assert!(text.intersects(pad));
+    }
 }

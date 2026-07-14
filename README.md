@@ -82,6 +82,20 @@ directly:
   templates with verified component values
 - **Watch it happen** — a live schematic viewer auto-refreshes as the AI edits
 
+### PCB reference silkscreen tools
+
+Load the `pcb_components` toolset to inspect and edit footprint references through
+KiCad IPC. `batch_set_reference_style` enforces a minimum 1.0 x 1.0 mm font with
+0.15 mm stroke. `check_reference_collisions` reports same-side pad, via, board-bound,
+and reference overlaps. `auto_place_references` searches compact positions around
+each footprint's pad bounds. It defaults to `dry_run: true` and
+`only_colliding: true`, so legal hand-placed references remain unchanged. If
+enabled, only ordinary R/C references may be hidden when no legal candidate exists.
+
+Run auto-placement in small reference or prefix groups and review the dry-run
+report before setting `dry_run: false`. These tools never move footprints, pads,
+vias, tracks, zones, or functional pad labels.
+
 The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 
 ## How it works

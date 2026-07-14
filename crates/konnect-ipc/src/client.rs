@@ -475,17 +475,41 @@ impl KiCadIpcClient {
         Ok(())
     }
 
-    /// Add a via to the board using S-expression string (simpler than full protobuf PadStack construction).
+    /// Add a plated through via to the board using KiCAD's native IPC model.
     pub fn add_via(&self, net_name: &str, x: f64, y: f64, drill: f64, pad_size: f64) -> Result<()> {
         let net_code = self.resolve_net_code(net_name)?;
-        let sexp = crate::builders::via_sexp(net_name, net_code, x, y, drill, pad_size);
-        let doc = self.get_board_document()?;
-        let cmd = kiapi::common::commands::ParseAndCreateItemsFromString {
-            document: Some(doc),
-            contents: sexp,
-        };
-        self.send_command(&cmd, "kiapi.common.commands.ParseAndCreateItemsFromString")?;
-        Ok(())
+        let via = crate::builders::build_via(net_name, net_code, x, y, drill, pad_size);
+        let any = crate::builders::pack_any(&via, "kiapi.board.types.Via");
+        self.create_items(vec![any])?;
+
+        // KiCAD may inherit the net from copper under the new via and ignore the
+        // requested net in CreateItems. Find the just-created via by position and
+        // force its net through UpdateItems so inner planes clear correctly.
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbVia)?;
+        for item in items.into_iter().rev() {
+            if let Ok(mut created) = kiapi::board::types::Via::decode(item.value.as_slice()) {
+                let Some(pos) = created.position.as_ref() else {
+                    continue;
+                };
+                if (crate::builders::nm_to_mm(pos.x_nm) - x).abs() < 0.000_001
+                    && (crate::builders::nm_to_mm(pos.y_nm) - y).abs() < 0.000_001
+                {
+                    created.net = Some(crate::builders::net(net_name, net_code));
+                    let updated = crate::builders::pack_any(&created, "kiapi.board.types.Via");
+                    let mut header = self.make_header()?;
+                    header.field_mask = Some(prost_types::FieldMask {
+                        paths: vec!["net".to_string()],
+                    });
+                    let cmd = kiapi::common::commands::UpdateItems {
+                        header: Some(header),
+                        items: vec![updated],
+                    };
+                    self.send_command(&cmd, "kiapi.common.commands.UpdateItems")?;
+                    return Ok(());
+                }
+            }
+        }
+        anyhow::bail!("Created via at ({x}, {y}) could not be found for net assignment")
     }
 
     /// Delete a track by UUID.
@@ -611,6 +635,146 @@ impl KiCadIpcClient {
                     return Ok(());
                 }
             }
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// Return reference and value text properties for all placed footprints.
+    pub fn list_footprint_texts(&self) -> Result<Vec<IpcFootprintText>> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let mut result = Vec::new();
+        for item in &items {
+            let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let reference = fp
+                .reference_field
+                .as_ref()
+                .and_then(|f| f.text.as_ref())
+                .and_then(|bt| bt.text.as_ref())
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
+            for (kind, field) in [
+                ("reference", fp.reference_field.as_ref()),
+                ("value", fp.value_field.as_ref()),
+            ] {
+                let Some(field) = field else { continue };
+                let Some(board_text) = field.text.as_ref() else {
+                    continue;
+                };
+                let Some(text) = board_text.text.as_ref() else {
+                    continue;
+                };
+                let pos = text.position.as_ref();
+                let attrs = text.attributes.as_ref();
+                let size = attrs.and_then(|a| a.size.as_ref());
+                result.push(IpcFootprintText {
+                    reference: reference.clone(),
+                    kind: kind.to_string(),
+                    text: text.text.clone(),
+                    x: pos
+                        .map(|p| crate::builders::nm_to_mm(p.x_nm))
+                        .unwrap_or(0.0),
+                    y: pos
+                        .map(|p| crate::builders::nm_to_mm(p.y_nm))
+                        .unwrap_or(0.0),
+                    width: size
+                        .map(|s| crate::builders::nm_to_mm(s.x_nm))
+                        .unwrap_or(0.0),
+                    height: size
+                        .map(|s| crate::builders::nm_to_mm(s.y_nm))
+                        .unwrap_or(0.0),
+                    stroke_width: attrs
+                        .and_then(|a| a.stroke_width.as_ref())
+                        .map(|w| crate::builders::nm_to_mm(w.value_nm))
+                        .unwrap_or(0.0),
+                    rotation: attrs
+                        .and_then(|a| a.angle.as_ref())
+                        .map(|a| a.value_degrees)
+                        .unwrap_or(0.0),
+                    layer: layer_enum_to_name(board_text.layer().into()).to_string(),
+                    visible: field.visible,
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    /// Edit a footprint reference field without moving the footprint itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_reference_text(
+        &self,
+        reference: &str,
+        x: Option<f64>,
+        y: Option<f64>,
+        width: Option<f64>,
+        height: Option<f64>,
+        stroke_width: Option<f64>,
+        rotation: Option<f64>,
+        visible: Option<bool>,
+    ) -> Result<()> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in &items {
+            let Ok(mut fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let ref_text = fp
+                .reference_field
+                .as_ref()
+                .and_then(|f| f.text.as_ref())
+                .and_then(|bt| bt.text.as_ref())
+                .map(|t| t.text.as_str())
+                .unwrap_or("");
+            if ref_text != reference {
+                continue;
+            }
+
+            let field = fp.reference_field.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("Footprint '{}' has no reference field", reference)
+            })?;
+            if let Some(v) = visible {
+                field.visible = v;
+            }
+            let board_text = field.text.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("Footprint '{}' has no reference board text", reference)
+            })?;
+            let text = board_text.text.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("Footprint '{}' has no reference text", reference)
+            })?;
+
+            if x.is_some() || y.is_some() {
+                let old = text
+                    .position
+                    .clone()
+                    .unwrap_or_else(|| crate::builders::vec2(0.0, 0.0));
+                text.position = Some(crate::builders::vec2(
+                    x.unwrap_or_else(|| crate::builders::nm_to_mm(old.x_nm)),
+                    y.unwrap_or_else(|| crate::builders::nm_to_mm(old.y_nm)),
+                ));
+            }
+            let attrs = text.attributes.get_or_insert_with(Default::default);
+            if width.is_some() || height.is_some() {
+                let old = attrs
+                    .size
+                    .clone()
+                    .unwrap_or_else(|| crate::builders::vec2(1.0, 1.0));
+                attrs.size = Some(crate::builders::vec2(
+                    width.unwrap_or_else(|| crate::builders::nm_to_mm(old.x_nm)),
+                    height.unwrap_or_else(|| crate::builders::nm_to_mm(old.y_nm)),
+                ));
+            }
+            if let Some(v) = stroke_width {
+                attrs.stroke_width = Some(crate::builders::distance(v));
+            }
+            if let Some(v) = rotation {
+                attrs.angle = Some(kiapi::common::types::Angle { value_degrees: v });
+            }
+
+            let any = crate::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
+            self.update_items(vec![any])?;
+            return Ok(());
         }
         anyhow::bail!("Footprint '{}' not found", reference)
     }

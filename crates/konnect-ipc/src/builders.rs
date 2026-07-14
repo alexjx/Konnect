@@ -83,20 +83,48 @@ pub fn build_track(
     }
 }
 
-/// Build S-expression for a via (used with ParseAndCreateItemsFromString).
-/// Complex protobuf PadStack construction is avoided this way.
-pub fn via_sexp(
+/// Build a plated through via using KiCAD 10's native IPC protobuf model.
+pub fn build_via(
     net_name: &str,
     net_code: i32,
     x: f64,
     y: f64,
     drill_mm: f64,
     size_mm: f64,
-) -> String {
-    format!(
-        r#"(via (at {} {}) (size {}) (drill {}) (layers "F.Cu" "B.Cu") (net {} "{}"))"#,
-        x, y, size_mm, drill_mm, net_code, net_name
-    )
+) -> kiapi::board::types::Via {
+    use kiapi::board::types::{
+        BoardLayer, DrillProperties, DrillShape, PadStack, PadStackLayer, PadStackShape,
+        PadStackType, UnconnectedLayerRemoval, ViaType,
+    };
+
+    let copper_shape = PadStackLayer {
+        layer: BoardLayer::BlFCu as i32,
+        shape: PadStackShape::PssCircle as i32,
+        size: Some(vec2(size_mm, size_mm)),
+        ..Default::default()
+    };
+
+    kiapi::board::types::Via {
+        id: None,
+        position: Some(vec2(x, y)),
+        pad_stack: Some(PadStack {
+            r#type: PadStackType::PstNormal as i32,
+            layers: vec![BoardLayer::BlFCu as i32, BoardLayer::BlBCu as i32],
+            drill: Some(DrillProperties {
+                start_layer: BoardLayer::BlFCu as i32,
+                end_layer: BoardLayer::BlBCu as i32,
+                diameter: Some(vec2(drill_mm, drill_mm)),
+                shape: DrillShape::DsCircle as i32,
+                ..Default::default()
+            }),
+            unconnected_layer_removal: UnconnectedLayerRemoval::UlrKeep as i32,
+            copper_layers: vec![copper_shape],
+            ..Default::default()
+        }),
+        locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+        net: Some(net(net_name, net_code)),
+        r#type: ViaType::VtThrough as i32,
+    }
 }
 
 /// Pack a protobuf message into a prost_types::Any.

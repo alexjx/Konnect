@@ -17,6 +17,21 @@ pub struct IpcFootprint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcFootprintText {
+    pub reference: String,
+    pub kind: String,
+    pub text: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub stroke_width: f64,
+    pub rotation: f64,
+    pub layer: String,
+    pub visible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcTrack {
     pub net_name: String,
     pub layer: String,
