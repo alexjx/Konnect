@@ -93,6 +93,7 @@ pub async fn run_erc(cli: &str, schematic: &Path) -> Result<Vec<ErcViolation>> {
     let args = [
         "sch",
         "erc",
+        "--severity-all",
         "--output",
         out_path.to_str().unwrap(),
         "--format",
@@ -112,24 +113,102 @@ pub async fn run_erc(cli: &str, schematic: &Path) -> Result<Vec<ErcViolation>> {
 }
 
 fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
-    let arr = match raw.get("violations").and_then(|v| v.as_array()) {
-        Some(a) => a,
-        None => return Vec::new(),
-    };
-
-    arr.iter()
-        .map(|v| ErcViolation {
+    fn parse_one(v: &serde_json::Value, sheet: Option<&str>) -> ErcViolation {
+        let pos_value = v.get("pos").or_else(|| {
+            v.get("items")
+                .and_then(|items| items.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("pos"))
+        });
+        ErcViolation {
             severity: v["severity"].as_str().unwrap_or("error").to_string(),
             description: v["description"].as_str().unwrap_or("").to_string(),
-            sheet: v["sheet"].as_str().map(String::from),
-            pos: v.get("pos").and_then(|p| {
+            sheet: v["sheet"].as_str().or(sheet).map(String::from),
+            pos: pos_value.and_then(|p| {
                 Some(ErcPos {
                     x: p["x"].as_f64()?,
                     y: p["y"].as_f64()?,
                 })
             }),
+        }
+    }
+
+    // KiCad 10 emits violations under each sheet. Retain support for the
+    // older flat representation so reports from earlier KiCad releases and
+    // fixtures continue to parse.
+    if let Some(violations) = raw.get("violations").and_then(|value| value.as_array()) {
+        return violations
+            .iter()
+            .map(|violation| parse_one(violation, None))
+            .collect();
+    }
+
+    raw.get("sheets")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .flat_map(|sheet| {
+            let path = sheet.get("path").and_then(|value| value.as_str());
+            sheet
+                .get("violations")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+                .map(move |violation| parse_one(violation, path))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod erc_json_tests {
+    use super::parse_erc_json;
+    use serde_json::json;
+
+    #[test]
+    fn parses_kicad_10_sheet_scoped_violations() {
+        let report = json!({
+            "sheets": [
+                {
+                    "path": "/CAN/",
+                    "violations": [
+                        {
+                            "severity": "error",
+                            "description": "Input pin not driven",
+                            "items": [{"pos": {"x": 12.7, "y": 25.4}}]
+                        },
+                        {
+                            "severity": "warning",
+                            "description": "Label connected to only one pin",
+                            "items": []
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let violations = parse_erc_json(&report);
+        assert_eq!(violations.len(), 2);
+        assert_eq!(violations[0].sheet.as_deref(), Some("/CAN/"));
+        assert_eq!(violations[0].pos.as_ref().unwrap().x, 12.7);
+        assert_eq!(violations[1].severity, "warning");
+    }
+
+    #[test]
+    fn retains_legacy_flat_violation_support() {
+        let report = json!({
+            "violations": [{
+                "severity": "warning",
+                "description": "legacy",
+                "sheet": "/",
+                "pos": {"x": 1.0, "y": 2.0}
+            }]
+        });
+
+        let violations = parse_erc_json(&report);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].sheet.as_deref(), Some("/"));
+        assert_eq!(violations[0].description, "legacy");
+    }
 }
 
 // ─── DRC ─────────────────────────────────────────────────────────────────────
