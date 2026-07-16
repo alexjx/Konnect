@@ -172,7 +172,13 @@ pub fn tools() -> Vec<ToolDef> {
                     "x": { "type": "number", "description": "X position in mm" },
                     "y": { "type": "number", "description": "Y position in mm" },
                     "size": { "type": "number", "description": "Font size in mm", "default": 1.27 },
-                    "rotation": { "type": "number", "description": "Rotation in degrees", "default": 0 }
+                    "rotation": { "type": "number", "description": "Rotation in degrees", "default": 0 },
+                    "justify": {
+                        "type": "string",
+                        "enum": ["left", "center", "right"],
+                        "description": "Horizontal text alignment around the anchor",
+                        "default": "center"
+                    }
                 },
                 "required": ["schematic", "text", "x", "y"]
             }),
@@ -713,14 +719,25 @@ async fn handle_add_schematic_text(
     };
     let size = args["size"].as_f64().unwrap_or(1.27);
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
+    let justify = args["justify"].as_str().unwrap_or("center");
+    if !matches!(justify, "left" | "center" | "right") {
+        return Ok(CallToolResult::error(
+            "justify must be one of: left, center, right",
+        ));
+    }
     let uuid = new_uuid();
 
     // Escape quotes in text content
     let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
 
+    let justify_sexp = if justify == "center" {
+        String::new()
+    } else {
+        format!(" (justify {justify})")
+    };
     let text_sexp = format!(
         "\n  (text \"{escaped}\"\n    (at {x} {y} {rotation})\n    \
-         (effects (font (size {size} {size})))\n    (uuid \"{uuid}\")\n  )"
+         (effects (font (size {size} {size})){justify_sexp})\n    (uuid \"{uuid}\")\n  )"
     );
 
     let content = std::fs::read_to_string(&sch_path)?;
@@ -734,6 +751,7 @@ async fn handle_add_schematic_text(
         "x": x, "y": y,
         "size": size,
         "rotation": rotation,
+        "justify": justify,
         "uuid": uuid
     })))
 }
