@@ -73,6 +73,12 @@ pub fn tools() -> Vec<ToolDef> {
                     "value": { "type": "string", "description": "New value (optional)" },
                     "footprint": { "type": "string", "description": "New footprint (optional)" },
                     "datasheet": { "type": "string", "description": "New datasheet URL (optional)" },
+                    "reference_x": { "type": "number", "description": "Reference field X position (optional)" },
+                    "reference_y": { "type": "number", "description": "Reference field Y position (optional)" },
+                    "reference_rotation": { "type": "number", "description": "Reference field rotation (optional)" },
+                    "value_x": { "type": "number", "description": "Value field X position (optional)" },
+                    "value_y": { "type": "number", "description": "Value field Y position (optional)" },
+                    "value_rotation": { "type": "number", "description": "Value field rotation (optional)" },
                     "fields": {
                         "type": "object",
                         "description": "Additional property fields to set as key:value pairs"
@@ -283,10 +289,13 @@ async fn handle_create_schematic(
 ) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "path")?;
     // Build a minimal valid schematic and save via cse's atomic writer
-    let template = "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n";
+    let root_uuid = uuid::Uuid::new_v4().to_string();
+    let template = format!(
+        "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{root_uuid}\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n"
+    );
     // Write the template then immediately load/save through cse so the file
     // is normalised to cse's writer output format.
-    write_atomic(&path, template)?;
+    write_atomic(&path, &template)?;
     let sch = cse::Schematic::load(&path)?;
     sch.overwrite()?;
     Ok(CallToolResult::json(
@@ -323,6 +332,17 @@ async fn handle_add_schematic_component(
 
     // Load via konnect-schematic-editor
     let mut sch = cse::Schematic::load(&sch_path)?;
+    let root_uuid = sch.uuid.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Schematic '{}' has no root UUID; refusing to create an unsafe symbol instance",
+            sch_path.display()
+        )
+    })?;
+    let project_name = sch_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Schematic path has no valid file stem"))?;
+    let instance_path = format!("/{root_uuid}");
 
     // Embed the library symbol definition
     cse::library::ensure_lib_symbol(&mut sch, &lib_id);
@@ -389,15 +409,38 @@ async fn handle_add_schematic_component(
     ds_prop.sub_nodes.push(effects_node(true));
     sym.properties.push(ds_prop);
 
+    // Every placed symbol pin needs its own KIID.  Library pins do not carry
+    // instance UUIDs; KiCad expects them as child nodes of the placed symbol.
+    // Missing pin UUIDs are particularly dangerous because the schematic can
+    // still load, then crash in KIID::operator< when autosave runs after an
+    // interactive edit.
+    let pin_numbers = cse::library::resolve_lib_symbol_pin_numbers(&lib_id);
+    if pin_numbers.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "Could not resolve any pins for library symbol '{}'; refusing to create an unsafe symbol instance",
+            lib_id
+        )));
+    }
+    for number in &pin_numbers {
+        sym.raw_sub_nodes.push(cse::sexp::SexpNode::List(vec![
+            cse::sexp::atom("pin"),
+            cse::sexp::qstr(number),
+            cse::sexp::SexpNode::List(vec![
+                cse::sexp::atom("uuid"),
+                cse::sexp::qstr(uuid::Uuid::new_v4().to_string()),
+            ]),
+        ]));
+    }
+
     // Instances node
     let instances = cse::sexp::SexpNode::List(vec![
         cse::sexp::atom("instances"),
         cse::sexp::SexpNode::List(vec![
             cse::sexp::atom("project"),
-            cse::sexp::qstr(""),
+            cse::sexp::qstr(project_name),
             cse::sexp::SexpNode::List(vec![
                 cse::sexp::atom("path"),
-                cse::sexp::qstr("/"),
+                cse::sexp::qstr(instance_path),
                 cse::sexp::SexpNode::List(vec![
                     cse::sexp::atom("reference"),
                     cse::sexp::qstr(ref_str),
@@ -417,7 +460,8 @@ async fn handle_add_schematic_component(
         "reference": ref_str,
         "value": val_str,
         "x": x, "y": y,
-        "uuid": uuid
+        "uuid": uuid,
+        "pin_uuid_count": pin_numbers.len()
     })))
 }
 
@@ -530,6 +574,65 @@ async fn handle_edit_schematic_component(
     }
 
     write_atomic(&sch_path, &content)?;
+
+    let has_property_layout = [
+        "reference_x",
+        "reference_y",
+        "reference_rotation",
+        "value_x",
+        "value_y",
+        "value_rotation",
+    ]
+    .iter()
+    .any(|key| args.get(*key).and_then(|value| value.as_f64()).is_some());
+
+    if has_property_layout {
+        let active_reference = opt_str(args, "new_reference").unwrap_or(&reference);
+        let mut sch = cse::Schematic::load(&sch_path)?;
+        let sym = sch
+            .symbols
+            .by_reference_mut(active_reference)
+            .ok_or_else(|| anyhow::anyhow!("Component '{}' not found", active_reference))?;
+        let (symbol_x, symbol_y) = sym.position();
+
+        let mut update_layout = |name: &str, x_key: &str, y_key: &str, rotation_key: &str| {
+            let Some(property) = sym
+                .properties
+                .iter_mut()
+                .find(|property| property.name == name)
+            else {
+                return;
+            };
+            let x = opt_f64(args, x_key).unwrap_or(symbol_x);
+            let y = opt_f64(args, y_key).unwrap_or(symbol_y);
+            let rotation = opt_f64(args, rotation_key).unwrap_or(0.0);
+            let at = cse::sexp::SexpNode::List(vec![
+                cse::sexp::atom("at"),
+                cse::sexp::atom(cse::types::fmt_f64(x)),
+                cse::sexp::atom(cse::types::fmt_f64(y)),
+                cse::sexp::atom(cse::types::fmt_f64(rotation)),
+            ]);
+            if let Some(existing) = property
+                .sub_nodes
+                .iter_mut()
+                .find(|node| node.tag() == Some("at"))
+            {
+                *existing = at;
+            } else {
+                property.sub_nodes.insert(0, at);
+            }
+            changed.push(format!("{} layout", name));
+        };
+
+        update_layout(
+            "Reference",
+            "reference_x",
+            "reference_y",
+            "reference_rotation",
+        );
+        update_layout("Value", "value_x", "value_y", "value_rotation");
+        sch.overwrite()?;
+    }
 
     Ok(CallToolResult::json(&json!({
         "reference": reference,

@@ -11,6 +11,7 @@
 
 use crate::sexp::{parser, SexpNode};
 use crate::Schematic;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// Resolve a lib_id (e.g. "Device:R") to the full symbol S-expression string.
@@ -95,6 +96,53 @@ pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
 pub fn resolve_lib_symbol_node(lib_id: &str) -> Option<SexpNode> {
     let raw = resolve_lib_symbol(lib_id)?;
     parser::parse(&raw).ok()
+}
+
+/// Resolve the physical pin numbers that a schematic symbol instance must own.
+///
+/// KiCad stores an independent KIID for every pin on every placed symbol.  The
+/// library definition supplies pin numbers and geometry, but those UUIDs are
+/// instance data and therefore must be generated when the symbol is placed.
+/// Omitting the `(pin "N" (uuid "..."))` nodes leaves null KIIDs in eeschema;
+/// the file can load, but saving/autosaving after an edit can crash while KiCad
+/// orders those IDs.
+pub fn resolve_lib_symbol_pin_numbers(lib_id: &str) -> Vec<String> {
+    fn collect_symbol(lib_id: &str, pins: &mut BTreeSet<String>, visited: &mut BTreeSet<String>) {
+        if !visited.insert(lib_id.to_owned()) {
+            return;
+        }
+
+        let Some(node) = resolve_lib_symbol_node(lib_id) else {
+            return;
+        };
+
+        if let Some(parent) = node.get_value("extends") {
+            if parent.contains(':') {
+                collect_symbol(parent, pins, visited);
+            }
+        }
+
+        collect_pin_numbers(&node, pins);
+    }
+
+    let mut pins = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    collect_symbol(lib_id, &mut pins, &mut visited);
+    pins.into_iter().collect()
+}
+
+fn collect_pin_numbers(node: &SexpNode, pins: &mut BTreeSet<String>) {
+    for pin in node.find_all("pin") {
+        if let Some(number) = pin.get_value("number") {
+            if !number.is_empty() {
+                pins.insert(number.to_owned());
+            }
+        }
+    }
+
+    for child_symbol in node.find_all("symbol") {
+        collect_pin_numbers(child_symbol, pins);
+    }
 }
 
 /// Ensure a library symbol definition is present in the schematic's lib_symbols section.
@@ -203,6 +251,19 @@ pub fn find_symbol_dirs() -> Vec<PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            let user_install = PathBuf::from(local_app_data)
+                .join("Programs")
+                .join("KiCad")
+                .join("10.0")
+                .join("share")
+                .join("kicad")
+                .join("symbols");
+            if user_install.is_dir() && !dirs.contains(&user_install) {
+                dirs.push(user_install);
+            }
+        }
+
         let candidates = [
             r"C:\KiCad\10.0\share\kicad\symbols",
             r"C:\Program Files\KiCad\10.0\share\kicad\symbols",
@@ -229,4 +290,29 @@ pub fn find_symbol_dirs() -> Vec<PathBuf> {
     }
 
     dirs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collects_nested_pin_numbers_and_deduplicates_them() {
+        let node = parser::parse(
+            r#"(symbol "X"
+                (symbol "X_1_1"
+                    (pin input line (at 0 0 0) (length 2.54)
+                        (name "A") (number "1")))
+                (symbol "X_2_1"
+                    (pin output line (at 0 0 0) (length 2.54)
+                        (name "B") (number "2"))
+                    (pin output line (at 0 0 0) (length 2.54)
+                        (name "B_ALT") (number "2"))))"#,
+        )
+        .unwrap();
+
+        let mut pins = BTreeSet::new();
+        collect_pin_numbers(&node, &mut pins);
+        assert_eq!(pins.into_iter().collect::<Vec<_>>(), vec!["1", "2"]);
+    }
 }
