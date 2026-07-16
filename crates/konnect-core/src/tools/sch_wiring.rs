@@ -793,33 +793,44 @@ async fn handle_rotate_label(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
-    let search = format!(r#""{net}""#);
-    let found = content
-        .find(&search)
-        .ok_or_else(|| anyhow::anyhow!("Label '{}' not found", net))?;
-    let before = &content[..found];
-    let label_start = ["(net_label", "(global_label", "(hierarchical_label"]
-        .iter()
-        .filter_map(|s| before.rfind(s))
-        .max()
-        .ok_or_else(|| anyhow::anyhow!("Label block not found"))?;
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    let mut rotated = false;
+    let matches_position = |px: f64, py: f64| (px - x).abs() < 0.01 && (py - y).abs() < 0.01;
 
-    // Find the (at X Y ROT) in the label block
-    let at_search = "(at ";
-    let at_pos = content[label_start..]
-        .find(at_search)
-        .map(|o| label_start + o + at_search.len())
-        .ok_or_else(|| anyhow::anyhow!("No (at) in label block"))?;
-    let close_pos = content[at_pos..]
-        .find(')')
-        .map(|o| at_pos + o)
-        .ok_or_else(|| anyhow::anyhow!("Malformed (at)"))?;
-
-    let new_at = format!("{x} {y} {rotation}");
-    let edits = vec![SexpEdit::replace(at_pos, close_pos, new_at)];
-    let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    for label in &mut sch.labels {
+        if label.text == net && matches_position(label.at.x, label.at.y) {
+            label.at.rotation = Some(rotation);
+            rotated = true;
+            break;
+        }
+    }
+    if !rotated {
+        for label in &mut sch.global_labels {
+            if label.text == net && matches_position(label.at.x, label.at.y) {
+                label.at.rotation = Some(rotation);
+                rotated = true;
+                break;
+            }
+        }
+    }
+    if !rotated {
+        for label in &mut sch.hierarchical_labels {
+            if label.text == net && matches_position(label.at.x, label.at.y) {
+                label.at.rotation = Some(rotation);
+                rotated = true;
+                break;
+            }
+        }
+    }
+    if !rotated {
+        return Err(anyhow::anyhow!(
+            "Label '{}' not found at ({}, {})",
+            net,
+            x,
+            y
+        ));
+    }
+    sch.overwrite()?;
     Ok(CallToolResult::json(
         &json!({ "rotated_label": net, "rotation": rotation }),
     ))
