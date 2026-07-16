@@ -291,11 +291,59 @@ fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
 /// Compute the schematic-space pin endpoint (where wires connect) for a lib pin
 /// given a component's placement transform.
 pub fn pin_endpoint(pin: &LibPin, t: PinTransform) -> (f64, f64) {
-    // The wire-connection point is at pin_origin + length in pin direction
-    let angle_rad = pin.rotation.to_radians();
-    let tip_x = pin.local_x + pin.length * angle_rad.cos();
-    let tip_y = pin.local_y + pin.length * angle_rad.sin();
-    transform_pin(tip_x, tip_y, t)
+    // In KiCad's symbol format `(pin ... (at X Y ROT) (length L))`, `(at)` is
+    // already the external electrical connection point. `length` describes
+    // the graphical segment extending inward from that point to the body.
+    transform_pin(pin.local_x, pin.local_y, t)
+}
+
+#[cfg(test)]
+mod pin_endpoint_tests {
+    use super::*;
+
+    fn pin(x: f64, y: f64, rotation: f64, length: f64) -> LibPin {
+        LibPin {
+            number: "1".into(),
+            name: "P".into(),
+            local_x: x,
+            local_y: y,
+            rotation,
+            length,
+        }
+    }
+
+    fn transform(x: f64, y: f64, rotation: f64, mirror_x: bool, mirror_y: bool) -> PinTransform {
+        PinTransform {
+            comp_x: x,
+            comp_y: y,
+            rotation_deg: rotation,
+            mirror_x,
+            mirror_y,
+        }
+    }
+
+    #[test]
+    fn pin_at_is_the_electrical_endpoint_not_at_plus_length() {
+        let p = pin(0.0, 3.81, 270.0, 2.794);
+        assert_eq!(
+            pin_endpoint(&p, transform(100.0, 50.0, 0.0, false, false)),
+            (100.0, 46.19)
+        );
+    }
+
+    #[test]
+    fn endpoint_respects_symbol_rotation_and_mirroring() {
+        let p = pin(5.08, 2.54, 180.0, 2.54);
+        let expected = transform_pin(
+            p.local_x,
+            p.local_y,
+            transform(10.0, 20.0, 90.0, true, false),
+        );
+        assert_eq!(
+            pin_endpoint(&p, transform(10.0, 20.0, 90.0, true, false)),
+            expected
+        );
+    }
 }
 
 // ─── T-Junction detection ─────────────────────────────────────────────────────

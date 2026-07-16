@@ -9,7 +9,10 @@ use crate::tools::{get_path, opt_f64, require_f64, require_str, ToolContext, Too
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
-    schematic::{extract_labels, extract_symbol_instances, extract_wires, read_schematic, Wire},
+    schematic::{
+        extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires, pin_endpoint,
+        read_schematic, Wire,
+    },
 };
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -573,16 +576,34 @@ async fn handle_find_orphan_items(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let sch = cse::Schematic::load(&sch_path)?;
+    let (_, tree) = read_schematic(&sch_path)?;
     let wires = super::sch_bridge::all_wires_as_sexp(&sch);
     let labels = super::sch_bridge::all_labels_as_sexp(&sch);
     let label_pts: HashSet<(i64, i64)> = labels.iter().map(|l| pt_key(l.x, l.y)).collect();
+    let instances = extract_symbol_instances(&tree);
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    let mut pin_pts: HashSet<(i64, i64)> = HashSet::new();
+    for inst in &instances {
+        if let Some(lib_sym) = lib_syms
+            .iter()
+            .find(|node| node.get(1).and_then(|value| value.as_str()) == Some(&inst.lib_id))
+        {
+            for pin in extract_lib_pins(lib_sym) {
+                let (x, y) = pin_endpoint(&pin, inst.pin_transform());
+                pin_pts.insert(pt_key(x, y));
+            }
+        }
+    }
     let mut endpoint_counts: HashMap<(i64, i64), usize> = HashMap::new();
     for w in &wires {
         *endpoint_counts.entry(pt_key(w.x1, w.y1)).or_insert(0) += 1;
         *endpoint_counts.entry(pt_key(w.x2, w.y2)).or_insert(0) += 1;
     }
     let dangling: Vec<serde_json::Value> = endpoint_counts.iter()
-        .filter(|(k, &c)| c == 1 && !label_pts.contains(k))
+        .filter(|(k, &c)| c == 1 && !label_pts.contains(k) && !pin_pts.contains(k))
         .map(|(k, _)| json!({ "type": "dangling_wire_end", "x": k.0 as f64/1000.0, "y": k.1 as f64/1000.0 }))
         .collect();
     let floating: Vec<serde_json::Value> = labels
