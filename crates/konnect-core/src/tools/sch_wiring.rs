@@ -722,7 +722,14 @@ async fn handle_delete_net_label(
     // Find ALL label occurrences with this net name, then pick the closest to (target_x, target_y).
     // This handles the common case of multiple labels on the same net.
     let search = format!(r#""{net}""#);
-    let label_starts_patterns = ["(net_label", "(global_label", "(hierarchical_label"];
+    // KiCad's on-disk tag for a local net label is `(label ...)`.
+    // Retain `(net_label ...)` for compatibility with older fixtures.
+    let label_starts_patterns = [
+        "(label",
+        "(net_label",
+        "(global_label",
+        "(hierarchical_label",
+    ];
 
     let mut best_start = None;
     let mut best_dist = f64::MAX;
@@ -796,10 +803,32 @@ async fn handle_rotate_label(
     let mut sch = cse::Schematic::load(&sch_path)?;
     let mut rotated = false;
     let matches_position = |px: f64, py: f64| (px - x).abs() < 0.01 && (py - y).abs() < 0.01;
+    let label_effects = || {
+        // KiCad's label anchor semantics use justification together with
+        // rotation. 0/90 extend from a left-justified anchor; 180/270 extend
+        // from a right-justified anchor.
+        let justify = if rotation.rem_euclid(360.0) >= 180.0 {
+            "right"
+        } else {
+            "left"
+        };
+        cse::types::Effects(cse::sexp::SexpNode::List(vec![
+            cse::sexp::atom("effects"),
+            cse::sexp::tagged(
+                "font",
+                vec![cse::sexp::tagged(
+                    "size",
+                    vec![cse::sexp::atom("1.27"), cse::sexp::atom("1.27")],
+                )],
+            ),
+            cse::sexp::tagged("justify", vec![cse::sexp::atom(justify)]),
+        ]))
+    };
 
     for label in &mut sch.labels {
         if label.text == net && matches_position(label.at.x, label.at.y) {
             label.at.rotation = Some(rotation);
+            label.effects = Some(label_effects());
             rotated = true;
             break;
         }
@@ -808,6 +837,12 @@ async fn handle_rotate_label(
         for label in &mut sch.global_labels {
             if label.text == net && matches_position(label.at.x, label.at.y) {
                 label.at.rotation = Some(rotation);
+                // KiCad uses text justification as part of a global label's
+                // anchor/orientation semantics. Updating only (at ... ROT)
+                // leaves the outline attached by the wrong edge after a
+                // 180-degree rotation. Match KiCad's native convention so
+                // the pointed connection end rotates with the label.
+                label.effects = Some(label_effects());
                 rotated = true;
                 break;
             }
@@ -817,6 +852,7 @@ async fn handle_rotate_label(
         for label in &mut sch.hierarchical_labels {
             if label.text == net && matches_position(label.at.x, label.at.y) {
                 label.at.rotation = Some(rotation);
+                label.effects = Some(label_effects());
                 rotated = true;
                 break;
             }
@@ -1231,10 +1267,22 @@ fn resolve_pin_endpoint(
         .iter()
         .find(|i| i.reference == reference)
         .ok_or_else(|| anyhow::anyhow!("Component '{}' not found", reference))?;
-    let lib_sym = lib_syms
-        .iter()
-        .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
-        .ok_or_else(|| anyhow::anyhow!("Library symbol '{}' not found", inst.lib_id))?;
+    let mut current_lib_id = inst.lib_id.as_str();
+    let lib_sym = loop {
+        let symbol = lib_syms
+            .iter()
+            .copied()
+            .find(|node| node.get(1).and_then(|child| child.as_str()) == Some(current_lib_id))
+            .ok_or_else(|| anyhow::anyhow!("Library symbol '{}' not found", current_lib_id))?;
+        if !extract_lib_pins(symbol).is_empty() {
+            break symbol;
+        }
+        current_lib_id = symbol
+            .find("extends")
+            .and_then(|node| node.get(1))
+            .and_then(konnect_sexp::parser::SexpNode::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Library symbol '{}' has no pins", current_lib_id))?;
+    };
 
     let pins = extract_lib_pins(lib_sym);
     let lib_pin = pins

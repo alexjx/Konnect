@@ -113,7 +113,8 @@ pub fn extract_labels(tree: &SexpNode) -> Vec<Label> {
     let mut labels = Vec::new();
 
     for (kind_str, kind) in &[
-        ("net_label", LabelKind::NetLabel),
+        // KiCad stores ordinary local net labels as `(label ...)`.
+        ("label", LabelKind::NetLabel),
         ("global_label", LabelKind::GlobalLabel),
         ("hierarchical_label", LabelKind::HierarchicalLabel),
     ] {
@@ -402,11 +403,36 @@ pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
     let uuid = crate::writer::new_uuid();
     format!(
         r#"
-  (net_label "{net}"
+  (label "{net}"
     (at {x} {y} {rotation})
     (fields_autoplaced yes)
     (effects (font (size 1.27 1.27)) (justify left))
     (uuid "{uuid}")
   )"#
     )
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+    use crate::parser::parse_sexp;
+
+    #[test]
+    fn extracts_kicad_local_label_nodes() {
+        let tree =
+            parse_sexp(r#"(kicad_sch (label "USB_D_P" (at 10.16 20.32 180) (uuid "test")))"#)
+                .unwrap();
+        let labels = extract_labels(&tree);
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].kind, LabelKind::NetLabel);
+        assert_eq!(labels[0].net, "USB_D_P");
+        assert_eq!((labels[0].x, labels[0].y), (10.16, 20.32));
+    }
+
+    #[test]
+    fn formatter_emits_kicad_local_label_node() {
+        let formatted = format_net_label("USB_D_N", 1.0, 2.0, 0.0);
+        assert!(formatted.contains("(label \"USB_D_N\""));
+        assert!(!formatted.contains("(net_label"));
+    }
 }

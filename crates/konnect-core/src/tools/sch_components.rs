@@ -12,6 +12,7 @@ use konnect_sexp::{
     geometry::snap_point,
     schematic::{extract_lib_pins, extract_symbol_instances, pin_endpoint, read_schematic},
     writer::{apply_edits, find_block_with_leading_whitespace, new_uuid, write_atomic, SexpEdit},
+    SexpNode,
 };
 use serde_json::json;
 
@@ -514,9 +515,12 @@ async fn handle_edit_schematic_component(
             None => return (content.to_string(), false),
         };
         // Find the symbol block around this reference
-        let sym_start_str = "\n  (symbol";
         let before = &content[..ref_pos];
-        let sym_start = match before.rfind(sym_start_str) {
+        let sym_start = match ["\n  (symbol", "\n\t(symbol"]
+            .iter()
+            .filter_map(|pattern| before.rfind(pattern))
+            .max()
+        {
             Some(p) => p + 1,
             None => return (content.to_string(), false),
         };
@@ -874,9 +878,7 @@ async fn handle_get_schematic_pin_locations(
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let lib_sym = lib_syms
-        .iter()
-        .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+    let lib_sym = resolve_embedded_pin_symbol(&lib_syms, &inst.lib_id);
 
     let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
         let lib_pins = extract_lib_pins(sym);
@@ -934,9 +936,7 @@ async fn handle_batch_get_pin_locations(
                 Some(i) => i,
                 None => return json!({ "reference": reference, "error": "not found" }),
             };
-            let lib_sym = lib_syms
-                .iter()
-                .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+            let lib_sym = resolve_embedded_pin_symbol(&lib_syms, &inst.lib_id);
             let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
                 let t = inst.pin_transform();
                 extract_lib_pins(sym)
@@ -954,6 +954,37 @@ async fn handle_batch_get_pin_locations(
         .collect();
 
     Ok(CallToolResult::json(&json!({ "components": results })))
+}
+
+/// Resolve the embedded symbol that owns an instance's pin graphics.
+///
+/// KiCad aliases commonly contain only `(extends "Library:Parent")`; their
+/// pins live on the embedded parent symbol.  Returning the alias itself makes
+/// every pin-location query empty even though KiCad renders and connects the
+/// instance correctly.
+fn resolve_embedded_pin_symbol<'a>(
+    lib_syms: &[&'a SexpNode],
+    lib_id: &str,
+) -> Option<&'a SexpNode> {
+    let mut current = lib_id;
+    for _ in 0..16 {
+        let symbol = lib_syms
+            .iter()
+            .copied()
+            .find(|node| node.get(1).and_then(|child| child.as_str()) == Some(current))?;
+        if !extract_lib_pins(symbol).is_empty() {
+            return Some(symbol);
+        }
+        match symbol
+            .find("extends")
+            .and_then(|node| node.get(1))
+            .and_then(SexpNode::as_str)
+        {
+            Some(parent) => current = parent,
+            None => return Some(symbol),
+        }
+    }
+    None
 }
 
 async fn handle_get_schematic_view(
@@ -1014,7 +1045,11 @@ async fn handle_add_component_annotation(
     };
 
     let before = &content[..ref_pos];
-    let sym_start = match before.rfind("\n  (symbol") {
+    let sym_start = match ["\n  (symbol", "\n\t(symbol"]
+        .iter()
+        .filter_map(|pattern| before.rfind(pattern))
+        .max()
+    {
         Some(o) => o + 1,
         None => return Ok(CallToolResult::error("Could not find symbol block")),
     };
