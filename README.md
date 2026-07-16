@@ -224,3 +224,4 @@ is elsewhere.
 - Issues & feature requests: [GitHub Issues](https://github.com/mixelpixx/Konnect/issues)
 - Roadmap: [ROADMAP.md](ROADMAP.md)
 - Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
+- New to KiCad development: [Beginner Contributor Guide](docs/BEGINNER_CONTRIBUTOR_GUIDE.md)
