@@ -103,8 +103,68 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
         f.sync_all()?; // fsync — mandatory
     }
 
-    std::fs::rename(&tmp_path, path)?;
+    replace_file(&tmp_path, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::write_atomic;
+
+    #[test]
+    fn write_atomic_replaces_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "konnect-write-atomic-{}.kicad_sch",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "old").unwrap();
+
+        write_atomic(&path, "new").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // Rust's standard-library implementation can replace files that were
+    // opened with delete sharing (as tempfile does). Prefer it so callers
+    // holding such a handle continue to work, then fall back to MoveFileExW
+    // for ordinary existing KiCad files on systems where rename refuses to
+    // replace the destination.
+    if std::fs::rename(source, destination).is_ok() {
+        return Ok(());
+    }
+
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 // ─── Balanced-Paren Block Finder ─────────────────────────────────────────────
