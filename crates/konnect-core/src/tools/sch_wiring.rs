@@ -538,7 +538,13 @@ async fn handle_delete_wire(
 
     // Walk back to the (wire ...) block start
     let before = &content[..wire_offset];
-    let wire_start = before.rfind("\n  (wire").map(|p| p + 1).unwrap_or(0);
+    // KiCad follows the user's configured indentation (tabs in KiCad 10 by
+    // default), so never assume two leading spaces.  Falling back to byte 0
+    // here used to delete the whole schematic when indentation differed.
+    let wire_start = match before.rfind("(wire") {
+        Some(p) => p,
+        None => return Ok(CallToolResult::error("Cannot locate enclosing wire block")),
+    };
     let (del_start, del_end) = match find_block_with_leading_whitespace(&content, wire_start) {
         Some(r) => r,
         None => return Ok(CallToolResult::error("Cannot parse wire block")),
@@ -571,7 +577,7 @@ async fn handle_batch_delete_wire(
         let search = format!(r#"(uuid "{uuid}")"#);
         if let Some(offset) = content.find(&search) {
             let before = &content[..offset];
-            if let Some(wire_start) = before.rfind("\n  (wire").map(|p| p + 1) {
+            if let Some(wire_start) = before.rfind("(wire") {
                 if let Some(range) = find_block_with_leading_whitespace(&content, wire_start) {
                     ranges.push(range);
                     deleted += 1;
