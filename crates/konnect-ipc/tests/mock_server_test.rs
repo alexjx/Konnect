@@ -71,9 +71,17 @@ fn ok_response() -> kiapi::common::ApiResponse {
             status: kiapi::common::ApiStatusCode::AsOk as i32,
             error_message: String::new(),
         }),
-        header: None,
+        header: Some(kiapi::common::ApiResponseHeader {
+            kicad_token: "mock-kicad-token".to_string(),
+        }),
         message: None,
     }
+}
+
+fn ok_response_with(message: prost_types::Any) -> kiapi::common::ApiResponse {
+    let mut response = ok_response();
+    response.message = Some(message);
+    response
 }
 
 #[test]
@@ -97,6 +105,41 @@ fn ping_roundtrips_through_mock() {
 }
 
 #[test]
+fn board_binding_matches_the_full_canonical_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("board.kicad_pcb");
+    std::fs::write(&board, "(kicad_pcb)").unwrap();
+    let project_path = dir.path().to_string_lossy().to_string();
+    let mock = spawn_mock(move |_req| {
+        let document = kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                    "board.kicad_pcb".to_string(),
+                ),
+            ),
+            project: Some(kiapi::common::types::ProjectSpecifier {
+                name: "board".to_string(),
+                path: project_path.clone(),
+            }),
+        };
+        let body = kiapi::common::commands::GetOpenDocumentsResponse {
+            documents: vec![document],
+        };
+        Some(ok_response_with(konnect_ipc::builders::pack_any(
+            &body,
+            "kiapi.common.commands.GetOpenDocumentsResponse",
+        )))
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+    assert!(client.bind_board(&board).is_ok());
+
+    let other = dir.path().join("other.kicad_pcb");
+    std::fs::write(&other, "(kicad_pcb)").unwrap();
+    assert!(client.bind_board(&other).is_err());
+}
+
+#[test]
 fn kicad_error_status_maps_to_err() {
     let mock = spawn_mock(|_req| {
         Some(kiapi::common::ApiResponse {
@@ -104,7 +147,9 @@ fn kicad_error_status_maps_to_err() {
                 status: kiapi::common::ApiStatusCode::AsBadRequest as i32,
                 error_message: "no board open".to_string(),
             }),
-            header: None,
+            header: Some(kiapi::common::ApiResponseHeader {
+                kicad_token: "mock-kicad-token".to_string(),
+            }),
             message: None,
         })
     });

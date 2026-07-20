@@ -540,6 +540,16 @@ fn dist(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
 /// This ensures the schematic viewer's file-watcher sees a complete file.
 fn atomic_write(path: &Path, content: &str) -> crate::error::Result<()> {
     use std::io::Write;
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_sch"))
+    {
+        return Err(crate::error::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("schematic writes require a .kicad_sch path: {}", path.display()),
+        )));
+    }
     let tmp_path = path.with_extension("kicad_sch.tmp");
     let mut f = std::fs::File::create(&tmp_path).map_err(crate::error::Error::Io)?;
     f.write_all(content.as_bytes())

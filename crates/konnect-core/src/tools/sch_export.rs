@@ -290,6 +290,7 @@ async fn handle_run_erc(
     // Optionally write the report to a file
     if let Some(out_path) = args["output"].as_str() {
         let report = serde_json::to_string_pretty(&filtered)?;
+        crate::tools::pcb_access::validate_non_pcb_write(std::path::Path::new(out_path))?;
         std::fs::write(out_path, report)?;
     }
 

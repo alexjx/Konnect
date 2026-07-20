@@ -127,6 +127,108 @@ pub fn build_via(
     }
 }
 
+/// Build a minimal NPTH mounting-hole footprint for direct CreateItems IPC.
+pub fn build_mounting_hole(
+    reference: &str,
+    x: f64,
+    y: f64,
+    drill_mm: f64,
+) -> kiapi::board::types::FootprintInstance {
+    use kiapi::board::types::{
+        BoardLayer, DrillProperties, DrillShape, Field, FieldId, Footprint,
+        FootprintAttributes, FootprintInstance, Pad, PadStack, PadStackLayer,
+        PadStackShape, PadStackType, PadType, UnconnectedLayerRemoval,
+    };
+    use kiapi::common::types::{Angle, LibraryIdentifier, LockedState, Text};
+
+    let pad_size = drill_mm + 0.5;
+    let shape = |layer| PadStackLayer {
+        layer,
+        shape: PadStackShape::PssCircle as i32,
+        size: Some(vec2(pad_size, pad_size)),
+        ..Default::default()
+    };
+    let pad = Pad {
+        id: None,
+        locked: LockedState::LsUnlocked as i32,
+        number: String::new(),
+        net: None,
+        r#type: PadType::PtNpth as i32,
+        pad_stack: Some(PadStack {
+            r#type: PadStackType::PstNormal as i32,
+            layers: vec![BoardLayer::BlFCu as i32, BoardLayer::BlBCu as i32],
+            drill: Some(DrillProperties {
+                start_layer: BoardLayer::BlFCu as i32,
+                end_layer: BoardLayer::BlBCu as i32,
+                diameter: Some(vec2(drill_mm, drill_mm)),
+                shape: DrillShape::DsCircle as i32,
+                ..Default::default()
+            }),
+            unconnected_layer_removal: UnconnectedLayerRemoval::UlrKeep as i32,
+            copper_layers: vec![
+                shape(BoardLayer::BlFCu as i32),
+                shape(BoardLayer::BlBCu as i32),
+            ],
+            ..Default::default()
+        }),
+        // Despite the protobuf comment describing footprint child coordinates
+        // as relative, KiCad 10's board IPC currently consumes and returns
+        // footprint-definition children in board-absolute coordinates.
+        position: Some(vec2(x, y)),
+        ..Default::default()
+    };
+    let reference_field = Field {
+        id: Some(FieldId { id: 0 }),
+        name: "Reference".to_string(),
+        text: Some(kiapi::board::types::BoardText {
+            id: None,
+            text: Some(Text {
+                position: Some(vec2(0.0, drill_mm + 1.5)),
+                text: reference.to_string(),
+                ..Default::default()
+            }),
+            layer: BoardLayer::BlFSilkS as i32,
+            locked: LockedState::LsUnlocked as i32,
+            ..Default::default()
+        }),
+        visible: false,
+    };
+    let definition = Footprint {
+        id: Some(LibraryIdentifier {
+            library_nickname: "MountingHole".to_string(),
+            entry_name: format!("MountingHole_{drill_mm:.1}mm"),
+        }),
+        anchor: Some(vec2(0.0, 0.0)),
+        attributes: Some(FootprintAttributes {
+            not_in_schematic: true,
+            exclude_from_position_files: true,
+            exclude_from_bill_of_materials: true,
+            exempt_from_courtyard_requirement: true,
+            ..Default::default()
+        }),
+        reference_field: Some(reference_field.clone()),
+        items: vec![pack_any(&pad, "kiapi.board.types.Pad")],
+        ..Default::default()
+    };
+    FootprintInstance {
+        id: None,
+        position: Some(vec2(x, y)),
+        orientation: Some(Angle { value_degrees: 0.0 }),
+        layer: BoardLayer::BlFCu as i32,
+        locked: LockedState::LsUnlocked as i32,
+        definition: Some(definition),
+        reference_field: Some(reference_field),
+        attributes: Some(FootprintAttributes {
+            not_in_schematic: true,
+            exclude_from_position_files: true,
+            exclude_from_bill_of_materials: true,
+            exempt_from_courtyard_requirement: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// Pack a protobuf message into a prost_types::Any.
 pub fn pack_any<M: prost::Message>(msg: &M, type_name: &str) -> prost_types::Any {
     let mut buf = Vec::new();

@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 resolver = "2"
 members = [
     "crates/konnect",
@@ -8,11 +8,11 @@ members = [
     "crates/konnect-schematic-editor",
 ]
 exclude = [
-    "crates/schematic-viewer",  # Tauri app — built separately with `cargo tauri build`
+    "crates/schematic-viewer",  # Tauri app 鈥?built separately with `cargo tauri build`
 ]
 
 [workspace.package]
-version = "0.1.3-xinj.14"
+version = "0.1.3-xinj.33"
 edition = "2021"
 authors = ["Konnect contributors"]
 license = "AGPL-3.0-only"

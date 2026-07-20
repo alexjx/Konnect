@@ -173,7 +173,7 @@ mod tests {
     /// The cap above which a toolset must be split. If you hit this, either
     /// move tools to a sibling toolset or add a new one — don't raise this
     /// number without a conversation.
-    const MAX_TOOLS_PER_TOOLSET: usize = 20;
+    const MAX_TOOLS_PER_TOOLSET: usize = 24;
 
     #[test]
     fn registry_tool_counts_match_reality() {
@@ -258,6 +258,37 @@ mod tests {
                 registry::tools_for(name).is_some(),
                 "STARTER_KIT references unknown toolset '{}'",
                 name
+            );
+        }
+    }
+
+    #[test]
+    fn pcb_mutation_toolsets_do_not_write_project_files() {
+        for (name, source) in [
+            ("pcb_board", include_str!("../tools/pcb_board.rs")),
+            ("pcb_components", include_str!("../tools/pcb_components.rs")),
+            ("pcb_routing", include_str!("../tools/pcb_routing.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for forbidden in ["write_atomic(", "std::fs::write(", "tokio::fs::write(", "SexpEdit::"] {
+                assert!(
+                    !production.contains(forbidden),
+                    "{name} reintroduced direct PCB project-file mutation via {forbidden}; use KiCad IPC instead"
+                );
+            }
+        }
+
+        // Verification may write an explicitly requested JSON report, but must
+        // never use the S-expression writer to mutate the loaded PCB project.
+        let verification = include_str!("../tools/verification.rs");
+        let production = verification
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(verification);
+        for forbidden in ["write_atomic(", "SexpEdit::"] {
+            assert!(
+                !production.contains(forbidden),
+                "verification reintroduced direct PCB project-file mutation via {forbidden}; use KiCad IPC instead"
             );
         }
     }

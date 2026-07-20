@@ -158,8 +158,19 @@ message GetItemsByNet
   // List of one or more types of items to retreive
   repeated kiapi.common.types.KiCadObjectType types = 2;
 
-  // A list of net codes to filter items by
-  repeated kiapi.board.types.NetCode net_codes = 3;
+  // A list of nets to filter items by. Tag 3 was used by the 10.0.0 draft
+  // API for net codes and is intentionally not reused.
+  reserved 3;
+  repeated kiapi.board.types.Net nets = 4;
+}
+
+// Retrieve items electrically connected to any item in `items`.
+// Returns kiapi.common.commands.GetItemsResponse.
+message GetConnectedItems
+{
+  kiapi.common.types.ItemHeader header = 1;
+  repeated kiapi.common.types.KIID items = 2;
+  repeated kiapi.common.types.KiCadObjectType types = 3;
 }
 
 // Retrieve all the copper items belonging to a certain net class or set of net classes

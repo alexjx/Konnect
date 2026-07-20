@@ -14,13 +14,13 @@ use super::cli;
 
 // ─── IPC helpers (mirrors pcb_board / pcb_components) ───────────────────────
 
-async fn with_ipc<T, F>(addr: String, f: F) -> anyhow::Result<Result<T, String>>
+async fn with_ipc<T, F>(client: konnect_ipc::KiCadIpcClient, board: std::path::PathBuf, f: F) -> anyhow::Result<Result<T, String>>
 where
     T: Send + 'static,
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
     let result = task::spawn_blocking(move || {
-        let client = konnect_ipc::client::KiCadIpcClient::new(&addr);
+        let client = client.bind_board(board).map_err(|e| e.to_string())?;
         f(&client).map_err(|e| e.to_string())
     })
     .await
@@ -603,8 +603,7 @@ async fn handle_refill_zones(
     // but the proper command is kicad-cli pcb --refill-zones (not in all versions).
     // Use IPC refill_zones when available, otherwise fall back to file-level
     // zone fill marker update.
-    let addr = ctx.config.ipc_address.clone();
-    let result = with_ipc(addr, move |client| {
+    let result = with_ipc(ctx.ipc.clone(), board.clone(), move |client| {
         client.refill_zones()?;
         Ok(())
     })
@@ -649,6 +648,10 @@ async fn handle_get_drc_violations(
 
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
+        crate::tools::pcb_access::validate_artifact_path(
+            &board,
+            std::path::Path::new(out_path),
+        )?;
         let report = serde_json::to_string_pretty(&violations)?;
         tokio::fs::write(out_path, report).await?;
     }

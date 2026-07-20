@@ -12,6 +12,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, opt_str, require_str, ToolContext, ToolDef};
+use anyhow::Context;
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -56,12 +57,14 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "save_project",
-            "Save the currently open PCB board file via KiCAD IPC. \
+            "Save one exact, currently open PCB board file via KiCAD IPC. \
              Requires KiCAD to be running with IPC enabled.",
             json!({
                 "type": "object",
-                "properties": {},
-                "required": []
+                "properties": {
+                    "board": { "type": "string", "description": "Exact path to the open .kicad_pcb file" }
+                },
+                "required": ["board"]
             }),
             |args, ctx| async move { handle_save_project(args, ctx).await }
         ),
@@ -80,6 +83,18 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["path"]
             }),
             |args, ctx| async move { handle_get_project_info(args, ctx).await }
+        ),
+        tool!(
+            "read_pcb_document",
+            "Read the exact live PCB document from KiCad without writing or saving it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Exact path to an open .kicad_pcb file" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_read_pcb_document(args, ctx).await }
         ),
         tool!(
             "snapshot_project",
@@ -149,12 +164,36 @@ async fn handle_create_project(
     let sch_path = path.join(format!("{}.kicad_sch", name));
     let pcb_path = path.join(format!("{}.kicad_pcb", name));
 
-    // Write blank project file
-    tokio::fs::write(&pro_path, blank_kicad_pro(&name)).await?;
-    // Write blank schematic
-    tokio::fs::write(&sch_path, blank_kicad_sch()).await?;
-    // Write blank PCB
-    tokio::fs::write(&pcb_path, blank_kicad_pcb()).await?;
+    // Project creation is the sole direct-PCB-write exception. It is strictly
+    // create-new: never truncate an existing design, including during races.
+    let files = [
+        (pro_path.clone(), blank_kicad_pro(&name).to_string()),
+        (sch_path.clone(), blank_kicad_sch().to_string()),
+        (pcb_path.clone(), blank_kicad_pcb().to_string()),
+    ];
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut created = Vec::new();
+        for (file, content) in &files {
+            let result = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(file)
+                .and_then(|mut handle| handle.write_all(content.as_bytes()));
+            if let Err(error) = result {
+                for created_file in created {
+                    let _ = std::fs::remove_file(created_file);
+                }
+                return Err(error).with_context(|| {
+                    format!("refusing to overwrite project file {}", file.display())
+                });
+            }
+            created.push(file.clone());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("project creation worker failed: {error}"))??;
 
     Ok(CallToolResult::json(&json!({
         "created": true,
@@ -168,8 +207,8 @@ async fn handle_open_project(
     _args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let ipc = konnect_ipc::KiCadIpcClient::new(&ctx.config.ipc_address);
-    let connected = ipc.ping().unwrap_or(false);
+    let ipc = ctx.ipc.clone();
+    let connected = tokio::task::spawn_blocking(move || ipc.ping().unwrap_or(false)).await?;
 
     Ok(CallToolResult::json(&json!({
         "kicad_ui_running": connected,
@@ -183,11 +222,17 @@ async fn handle_open_project(
 }
 
 async fn handle_save_project(
-    _args: &serde_json::Value,
+    args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let ipc = konnect_ipc::KiCadIpcClient::new(&ctx.config.ipc_address);
-    ipc.save_board()?;
+    let board = get_path(args, "board")?;
+    let ipc = ctx.ipc.clone();
+    tokio::task::spawn_blocking(move || {
+        let ipc = ipc.bind_board(board)?;
+        ipc.save_board()
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("save worker failed: {error}"))??;
     Ok(CallToolResult::text("Board saved successfully."))
 }
 
@@ -237,6 +282,26 @@ async fn handle_get_project_info(
         "pcb_exists": pcb.exists(),
         "last_modified_unix": modified,
         "kicad_version": pro.get("meta").and_then(|m| m.get("filename")).and_then(|v| v.as_str())
+    })))
+}
+
+async fn handle_read_pcb_document(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let display_path = board.display().to_string();
+    let ipc = ctx.ipc.clone();
+    let contents = tokio::task::spawn_blocking(move || {
+        let ipc = ipc.bind_board(board)?;
+        ipc.read_live_board()
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("PCB read worker failed: {error}"))??;
+    Ok(CallToolResult::json(&json!({
+        "board": display_path,
+        "source": "kicad_ipc_live_document",
+        "contents": contents
     })))
 }
 
@@ -462,6 +527,26 @@ mod tests {
             .unwrap();
         let pro: serde_json::Value = serde_json::from_str(&pro_content).unwrap();
         assert_eq!(pro["meta"]["filename"], "widget.kicad_pro");
+    }
+
+    #[tokio::test]
+    async fn create_project_never_overwrites_an_existing_board() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board = dir.path().join("widget.kicad_pcb");
+        tokio::fs::write(&board, "valuable existing board").await.unwrap();
+        let ctx = test_ctx();
+        let args = json!({
+            "path": dir.path().to_str().unwrap(),
+            "name": "widget"
+        });
+
+        assert!(handle_create_project(&args, &ctx).await.is_err());
+        assert_eq!(
+            tokio::fs::read_to_string(&board).await.unwrap(),
+            "valuable existing board"
+        );
+        assert!(!dir.path().join("widget.kicad_pro").exists());
+        assert!(!dir.path().join("widget.kicad_sch").exists());
     }
 
     #[tokio::test]

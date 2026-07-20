@@ -22,7 +22,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "project",
         description: "Create, open, save, snapshot KiCAD projects, and launch the live schematic viewer",
         category: "project",
-        tool_count: 6,
+        tool_count: 7,
     },
     ToolsetMeta {
         name: "sch_components",
@@ -64,19 +64,19 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_board",
         description: "Board outline, layers, zones, mounting holes, board text, SVG logo import",
         category: "pcb",
-        tool_count: 11,
+        tool_count: 13,
     },
     ToolsetMeta {
         name: "pcb_components",
         description: "Place, move, rotate, align, and duplicate PCB footprints",
         category: "pcb",
-        tool_count: 18,
+        tool_count: 21,
     },
     ToolsetMeta {
         name: "pcb_routing",
         description: "Traces, vias, copper pours, net classes, differential pairs",
         category: "pcb",
-        tool_count: 12,
+        tool_count: 14,
     },
     ToolsetMeta {
         name: "pcb_export",

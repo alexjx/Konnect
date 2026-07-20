@@ -1,17 +1,14 @@
 //! `pcb_board` toolset — board setup, layers, outlines, zones, and board-level items.
 //!
-//! Most operations use S-expression file manipulation so they work without a running
-//! KiCAD instance. `get_board_extents` tries the IPC API first, falling back to
-//! parsing the file for coordinate bounds.
+//! Mutating operations are IPC-only so KiCad editor state and Undo remain authoritative.
+//! Read-only queries may parse the board file where IPC has no equivalent query.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
+use crate::tools::pcb_access::ReadOnlyBoardFile;
 use konnect_ipc::builders;
-use konnect_sexp::{
-    parser::parse_sexp,
-    writer::{apply_edits, new_uuid, write_atomic, SexpEdit},
-};
+use konnect_sexp::{parser::parse_sexp, writer::new_uuid};
 use serde_json::json;
 
 // Build the 4 Edge.Cuts segments forming a rectangle, packed as Any for create_items.
@@ -35,13 +32,13 @@ fn rect_outline_items(x1: f64, y1: f64, x2: f64, y2: f64, w: f64) -> Vec<prost_t
 
 // ─── IPC helper ───────────────────────────────────────────────────────────────
 
-async fn with_ipc<T, F>(addr: String, f: F) -> anyhow::Result<Result<T, String>>
+async fn with_ipc<T, F>(client: konnect_ipc::KiCadIpcClient, board: std::path::PathBuf, f: F) -> anyhow::Result<Result<T, String>>
 where
     T: Send + 'static,
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
     match tokio::task::spawn_blocking(move || {
-        let client = konnect_ipc::client::KiCadIpcClient::new(&addr);
+        let client = client.bind_board(board)?;
         f(&client)
     })
     .await
@@ -274,6 +271,33 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_add_board_text(args, ctx).await }
         ),
         tool!(
+            "query_board_texts",
+            "List free-standing board text through KiCad IPC, optionally filtered by exact text and layer.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "text": { "type": "string" },
+                    "layer": { "type": "string" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_query_board_texts(args, ctx).await }
+        ),
+        tool!(
+            "delete_board_text",
+            "Delete free-standing board text by UUID through KiCad IPC.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid": { "type": "string" }
+                },
+                "required": ["board", "uuid"]
+            }),
+            |args, ctx| async move { handle_delete_board_text(args, ctx).await }
+        ),
+        tool!(
             "add_zone",
             "Add a copper fill zone polygon on a specified layer and net.",
             json!({
@@ -299,7 +323,7 @@ pub fn tools() -> Vec<ToolDef> {
             "Import an SVG file as filled silkscreen or copper artwork (a logo, icon, or other \
              graphic). Curved paths are flattened into polygon outlines since KiCAD's board \
              format doesn't support Bezier curves in filled shapes. Tries KiCAD IPC first, \
-             falls back to a direct file edit if KiCAD isn't running.",
+             Requires a running KiCad PCB Editor and never writes the board file directly.",
             json!({
                 "type": "object",
                 "properties": {
@@ -323,7 +347,7 @@ async fn handle_set_board_size(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
+    let _board_path = get_path(args, "board")?;
     let width = match require_f64(args, "width") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -339,50 +363,25 @@ async fn handle_set_board_size(
     let y2 = oy + height;
     let w = 0.05_f64;
 
-    // Try IPC first (live board in KiCAD, undo-aware); fall through to file edit.
-    // ponytail: 4 segments over a single BoardRectangle keeps one builder path;
-    // switch to board_rectangle if a native rect proves less flaky.
-    let items = rect_outline_items(ox, oy, x2, y2, w);
-    if with_ipc(ctx.config.ipc_address.clone(), move |c| {
-        c.create_items(items)
-    })
-    .await?
-    .is_ok()
-    {
-        return Ok(CallToolResult::json(&json!({
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
+        c.replace_board_outline(ox, oy, x2, y2, 0.0, w)
+    }).await? {
+        Ok(()) => Ok(CallToolResult::json(&json!({
             "width": width, "height": height,
             "x1": ox, "y1": oy, "x2": x2, "y2": y2,
             "source": "ipc"
-        })));
+        }))),
+        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC set_board_size failed: {reason}"))),
     }
-
-    // Append 4 Edge.Cuts lines (top, right, bottom, left)
-    let lines = format!(
-        "{}{}{}{}",
-        format_gr_line(ox, oy, x2, oy, "Edge.Cuts", w),
-        format_gr_line(x2, oy, x2, y2, "Edge.Cuts", w),
-        format_gr_line(x2, y2, ox, y2, "Edge.Cuts", w),
-        format_gr_line(ox, y2, ox, oy, "Edge.Cuts", w),
-    );
-
-    let content = std::fs::read_to_string(&board_path)?;
-    let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, lines)]);
-    write_atomic(&board_path, &new_content)?;
-
-    Ok(CallToolResult::json(&json!({
-        "width": width, "height": height,
-        "x1": ox, "y1": oy, "x2": x2, "y2": y2,
-        "source": "file"
-    })))
 }
 
 async fn handle_get_board_info(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
-    let content = std::fs::read_to_string(&board_path)?;
+    let board = ReadOnlyBoardFile::open(get_path(args, "board")?)?;
+    let board_path = board.path();
+    let content = board.read_to_string()?;
     let tree = parse_sexp(&content)?;
 
     let tb = tree.find("title_block");
@@ -440,7 +439,7 @@ async fn handle_get_board_extents(
     let board_path = get_path(args, "board")?;
 
     // Try IPC first; fall through to file-based computation on error
-    if let Ok(ext) = with_ipc(ctx.config.ipc_address.clone(), |c| c.get_board_extents()).await? {
+    if let Ok(ext) = with_ipc(ctx.ipc.clone(), board_path.clone(), |c| c.get_board_extents()).await? {
         return Ok(CallToolResult::json(&json!({
             "x_min": ext.min.x, "y_min": ext.min.y,
             "x_max": ext.max.x, "y_max": ext.max.y,
@@ -451,7 +450,7 @@ async fn handle_get_board_extents(
     }
 
     // File-based fallback: collect all coordinates from gr_lines and footprint positions
-    let content = std::fs::read_to_string(&board_path)?;
+    let content = ReadOnlyBoardFile::open(&board_path)?.read_to_string()?;
     let tree = parse_sexp(&content)?;
 
     let (mut min_x, mut min_y) = (f64::MAX, f64::MAX);
@@ -500,8 +499,8 @@ async fn handle_get_layer_list(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
-    let content = std::fs::read_to_string(&board_path)?;
+    let board = ReadOnlyBoardFile::open(get_path(args, "board")?)?;
+    let content = board.read_to_string()?;
     let tree = parse_sexp(&content)?;
 
     let layers_node = match tree.find("layers") {
@@ -538,94 +537,38 @@ async fn handle_add_layer(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
+    let _board_path = get_path(args, "board")?;
     let layer_name = match require_str(args, "layer_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let layer_type = args["layer_type"].as_str().unwrap_or("signal");
-
-    let content = std::fs::read_to_string(&board_path)?;
-
-    // Find the (layers ...) block and insert before its closing paren
-    let layers_pos = match content.find("(layers") {
-        Some(p) => p,
-        None => return Ok(CallToolResult::error("No (layers) section found")),
-    };
-
-    // Determine the next available inner copper ID (first unused ID in 1-30 range)
-    let tree = parse_sexp(&content)?;
-    let used_ids: std::collections::HashSet<i32> = tree
-        .find("layers")
-        .map(|n| {
-            n.find_all("")
-                .iter()
-                .filter_map(|node| node.get_f64(1).map(|n| n as i32))
-                .collect()
-        })
-        .unwrap_or_default();
-    let new_id = (1..=30).find(|id| !used_ids.contains(id)).unwrap_or(1);
-
-    // Find close of the layers block
-    let layers_block = &content[layers_pos..];
-    let close_rel = layers_block
-        .find("\n  )")
-        .or_else(|| layers_block.find(')'))
-        .unwrap_or(layers_block.len().saturating_sub(1));
-    let insert_pos = layers_pos + close_rel;
-
-    let new_layer = format!("\n    ({new_id} \"{layer_name}\" {layer_type})");
-    let new_content = apply_edits(content, vec![SexpEdit::insert(insert_pos, new_layer)]);
-    write_atomic(&board_path, &new_content)?;
-
-    Ok(CallToolResult::json(&json!({
-        "added_layer": layer_name, "id": new_id, "type": layer_type
-    })))
+    Ok(CallToolResult::error(format!(
+        "add_layer is disabled: no verified KiCad IPC implementation for layer-stack mutation ({layer_name})"
+    )))
 }
 
 async fn handle_set_active_layer(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
+    let _board_path = get_path(args, "board")?;
     let layer = match require_str(args, "layer") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&board_path)?;
-    let new_content = if let Some(pos) = content.find("(active_layer ") {
-        let after = pos + "(active_layer ".len();
-        let close = content[after..].find(')').unwrap_or(0);
-        let layer_end = after + close;
-        apply_edits(
-            content,
-            vec![SexpEdit::replace(after, layer_end, format!("\"{layer}\""))],
-        )
-    } else {
-        // Insert into setup block
-        let setup_close = content
-            .find("(setup")
-            .and_then(|p| content[p..].find('\n').map(|off| p + off))
-            .unwrap_or(content.rfind(')').unwrap_or(content.len()));
-        apply_edits(
-            content,
-            vec![SexpEdit::insert(
-                setup_close,
-                format!("\n    (active_layer \"{layer}\")"),
-            )],
-        )
-    };
-    write_atomic(&board_path, &new_content)?;
-
-    Ok(CallToolResult::json(&json!({ "active_layer": layer })))
+    let layer_ipc = layer.clone();
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| c.set_active_layer(&layer_ipc)).await? {
+        Ok(()) => Ok(CallToolResult::json(&json!({ "active_layer": layer, "source": "ipc" }))),
+        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC set_active_layer failed: {reason}"))),
+    }
 }
 
 async fn handle_add_board_outline(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
+    let _board_path = get_path(args, "board")?;
     let x1 = match require_f64(args, "x1") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -643,47 +586,28 @@ async fn handle_add_board_outline(
         Err(e) => return Ok(e),
     };
     let w = 0.05_f64;
+    let corner_radius = args["corner_radius"].as_f64().unwrap_or(0.0);
 
-    // Try IPC first; fall through to file edit if KiCAD is not reachable.
-    let items = rect_outline_items(x1, y1, x2, y2, w);
-    if with_ipc(ctx.config.ipc_address.clone(), move |c| {
-        c.create_items(items)
-    })
-    .await?
-    .is_ok()
-    {
-        return Ok(CallToolResult::json(&json!({
+    // Replace the existing outline through KiCad IPC so the editor, Undo stack,
+    // and on-disk document remain consistent.
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
+        c.replace_board_outline(x1, y1, x2, y2, corner_radius, w)
+    }).await? {
+        Ok(()) => Ok(CallToolResult::json(&json!({
             "x1": x1, "y1": y1, "x2": x2, "y2": y2,
             "width": (x2-x1).abs(), "height": (y2-y1).abs(),
+            "corner_radius": corner_radius,
             "source": "ipc"
-        })));
+        }))),
+        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC add_board_outline failed: {reason}"))),
     }
-
-    let lines = format!(
-        "{}{}{}{}",
-        format_gr_line(x1, y1, x2, y1, "Edge.Cuts", w),
-        format_gr_line(x2, y1, x2, y2, "Edge.Cuts", w),
-        format_gr_line(x2, y2, x1, y2, "Edge.Cuts", w),
-        format_gr_line(x1, y2, x1, y1, "Edge.Cuts", w),
-    );
-
-    let content = std::fs::read_to_string(&board_path)?;
-    let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, lines)]);
-    write_atomic(&board_path, &new_content)?;
-
-    Ok(CallToolResult::json(&json!({
-        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-        "width": (x2-x1).abs(), "height": (y2-y1).abs(),
-        "source": "file"
-    })))
 }
 
 async fn handle_add_mounting_hole(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
+    let _board_path = get_path(args, "board")?;
     let x = match require_f64(args, "x") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -695,22 +619,26 @@ async fn handle_add_mounting_hole(
     let drill_d = args["drill_diameter"].as_f64().unwrap_or(3.2);
     let reference = args["reference"].as_str().unwrap_or("H1");
 
-    let fp_sexp = format_npth_footprint(x, y, drill_d, reference);
-    let content = std::fs::read_to_string(&board_path)?;
-    let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, fp_sexp)]);
-    write_atomic(&board_path, &new_content)?;
-
-    Ok(CallToolResult::json(&json!({
-        "reference": reference, "x": x, "y": y, "drill_diameter": drill_d
-    })))
+    let reference_ipc = reference.to_string();
+    let ipc_result = with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
+        c.add_mounting_hole(&reference_ipc, x, y, drill_d)
+    }).await?;
+    match ipc_result {
+        Ok(()) => Ok(CallToolResult::json(&json!({
+            "reference": reference, "x": x, "y": y,
+            "drill_diameter": drill_d, "source": "ipc"
+        }))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC could not create mounting hole: {reason}"
+        ))),
+    }
 }
 
 async fn handle_add_board_text(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
+    let _board_path = get_path(args, "board")?;
     let text = match require_str(args, "text") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -727,40 +655,64 @@ async fn handle_add_board_text(
     let size = args["size"].as_f64().unwrap_or(1.0);
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
 
-    // Try IPC first; fall through to file edit if KiCAD isn't reachable.
+    // IPC-only: surface failures instead of mutating the board file.
     let text_ipc = text.clone();
     let layer_ipc = layer.clone();
-    if with_ipc(ctx.config.ipc_address.clone(), move |c| {
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
         let bt = builders::board_text(&layer_ipc, &text_ipc, x, y, size, rotation, false);
         let any = builders::pack_any(&bt, "kiapi.board.types.BoardText");
         c.create_items(vec![any])
-    })
-    .await?
-    .is_ok()
-    {
-        return Ok(CallToolResult::json(&json!({
+    }).await? {
+        Ok(()) => Ok(CallToolResult::json(&json!({
             "text": text, "x": x, "y": y, "layer": layer, "size": size,
             "source": "ipc"
-        })));
+        }))),
+        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC add_board_text failed: {reason}"))),
     }
+}
 
-    let gr_text = format_gr_text(&text, x, y, rotation, &layer, size);
-    let content = std::fs::read_to_string(&board_path)?;
-    let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, gr_text)]);
-    write_atomic(&board_path, &new_content)?;
+async fn handle_query_board_texts(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let text_filter = args["text"].as_str().map(String::from);
+    let layer_filter = args["layer"].as_str().map(String::from);
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
+        c.get_board_texts(text_filter.as_deref(), layer_filter.as_deref())
+    }).await? {
+        Ok(texts) => Ok(CallToolResult::json(&json!({
+            "count": texts.len(),
+            "texts": texts.iter().map(|t| json!({
+                "uuid": t.uuid, "text": t.text, "layer": t.layer,
+                "x": t.position.x, "y": t.position.y
+            })).collect::<Vec<_>>()
+        }))),
+        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC query_board_texts failed: {reason}"))),
+    }
+}
 
-    Ok(CallToolResult::json(&json!({
-        "text": text, "x": x, "y": y, "layer": layer, "size": size,
-        "source": "file"
-    })))
+async fn handle_delete_board_text(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let uuid = match require_str(args, "uuid") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let uuid_ipc = uuid.clone();
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| c.delete_board_text(&uuid_ipc)).await? {
+        Ok(()) => Ok(CallToolResult::json(&json!({ "deleted_uuid": uuid }))),
+        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC delete_board_text failed: {reason}"))),
+    }
 }
 
 async fn handle_add_zone(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
+    let _board_path = get_path(args, "board")?;
     let net_name = match require_str(args, "net_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -785,26 +737,24 @@ async fn handle_add_zone(
         return Ok(CallToolResult::error("Zone requires at least 3 points"));
     }
 
-    let content = std::fs::read_to_string(&board_path)?;
-    let net_id = find_net_id(&content, &net_name).unwrap_or(0);
-    let zone_sexp = format_zone_polygon(net_id, &net_name, &layer, clearance, min_width, &points);
-
-    let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, zone_sexp)]);
-    write_atomic(&board_path, &new_content)?;
-
-    Ok(CallToolResult::json(&json!({
-        "net": net_name, "layer": layer,
-        "point_count": points.len(),
-        "net_id": net_id
-    })))
+    let net_ipc = net_name.clone();
+    let layer_ipc = layer.clone();
+    let points_ipc = points.clone();
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
+        c.add_copper_zone(&net_ipc, &layer_ipc, clearance, min_width, &points_ipc)
+    }).await? {
+        Ok(()) => Ok(CallToolResult::json(&json!({
+            "net": net_name, "layer": layer, "point_count": points.len(), "source": "ipc"
+        }))),
+        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC add_zone failed: {reason}"))),
+    }
 }
 
 async fn handle_import_svg_logo(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
+    let _board_path = get_path(args, "board")?;
     let svg_path = get_path(args, "svg")?;
     let width_mm = match require_f64(args, "width_mm") {
         Ok(v) => v,
@@ -825,40 +775,22 @@ async fn handle_import_svg_logo(
     let placed =
         crate::tools::svg_import::scale_and_place(&logo.polygons, logo.width, width_mm, x, y);
 
-    // Try IPC first; fall through to a direct file edit if KiCAD isn't reachable.
+    // IPC-only: surface failures instead of mutating the board file.
     let layer_ipc = layer.clone();
     let placed_ipc = placed.clone();
-    if with_ipc(ctx.config.ipc_address.clone(), move |c| {
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
         let shape = builders::board_polygon(&layer_ipc, true, &placed_ipc);
         let any = builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape");
         c.create_items(vec![any])
-    })
-    .await?
-    .is_ok()
-    {
-        return Ok(CallToolResult::json(&json!({
+    }).await? {
+        Ok(()) => Ok(CallToolResult::json(&json!({
             "polygon_count": placed.len(),
             "layer": layer,
             "width_mm": width_mm,
             "source": "ipc"
-        })));
+        }))),
+        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC import_svg_logo failed: {reason}"))),
     }
-
-    let mut sexp = String::new();
-    for polygon in &placed {
-        sexp.push_str(&format_gr_poly(polygon, &layer));
-    }
-    let content = std::fs::read_to_string(&board_path)?;
-    let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, sexp)]);
-    write_atomic(&board_path, &new_content)?;
-
-    Ok(CallToolResult::json(&json!({
-        "polygon_count": placed.len(),
-        "layer": layer,
-        "width_mm": width_mm,
-        "source": "file"
-    })))
 }
 
 #[cfg(test)]
@@ -903,7 +835,7 @@ mod svg_logo_tests {
     }
 
     #[tokio::test]
-    async fn import_svg_logo_file_fallback_places_polygon() {
+    async fn import_svg_logo_refuses_file_fallback_when_ipc_is_unavailable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let board_path = dir.path().join("board.kicad_pcb");
         let svg_path = dir.path().join("logo.svg");
@@ -920,19 +852,10 @@ mod svg_logo_tests {
         let result = handle_import_svg_logo(&args, &ctx)
             .await
             .expect("handler should succeed");
-        assert!(!result.is_error);
-
-        let body = match &result.content[0] {
-            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
-            _ => panic!("expected text content"),
-        };
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["polygon_count"], json!(1));
-        assert_eq!(parsed["source"], json!("file"));
-        assert_eq!(parsed["layer"], json!("F.SilkS"));
+        assert!(result.is_error);
 
         let updated = std::fs::read_to_string(&board_path).unwrap();
-        assert!(updated.contains("(gr_poly"));
+        assert_eq!(updated, blank_board());
     }
 
     #[tokio::test]

@@ -288,7 +288,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "reference": { "type": "string", "description": "Component reference designator (e.g. 'U1')" },
-                    "new_lib_id": { "type": "string", "description": "New Library:Symbol identifier (e.g. 'Device:C')" }
+                    "new_lib_id": { "type": "string", "description": "New Library:Symbol identifier (e.g. 'Device:C')" },
+                    "source_schematic": { "type": "string", "description": "Optional verified schematic whose complete embedded symbol definition should be reused" }
                 },
                 "required": ["schematic", "reference", "new_lib_id"]
             }),
@@ -1732,7 +1733,11 @@ async fn handle_replace_component(
     };
 
     let before = &content[..ref_pos];
-    let sym_start = match before.rfind("\n  (symbol") {
+    let sym_start = match ["\n  (symbol", "\n\t(symbol"]
+        .iter()
+        .filter_map(|pattern| before.rfind(pattern))
+        .max()
+    {
         Some(o) => o + 1,
         None => return Ok(CallToolResult::error("Could not find symbol block")),
     };
@@ -1768,6 +1773,20 @@ async fn handle_replace_component(
 
     // Ensure the new library symbol definition is present
     super::ensure_lib_symbol_in_schematic(&mut content, &new_lib_id);
+
+    // A verified project may contain a flattened or project-qualified embedded
+    // definition that is more authoritative than the installed library alias.
+    // Reuse that complete definition when explicitly requested.
+    if let Some(source_path) = args["source_schematic"].as_str() {
+        let source = std::fs::read_to_string(source_path)?;
+        let source_def = super::extract_symbol_block(&source, &new_lib_id)
+            .ok_or_else(|| anyhow::anyhow!("Symbol '{}' not found in source schematic", new_lib_id))?;
+        let target_start = content.find(&format!("(symbol \"{}\"", new_lib_id))
+            .ok_or_else(|| anyhow::anyhow!("Embedded symbol '{}' not found in target schematic", new_lib_id))?;
+        let target_def = super::extract_symbol_block(&content[target_start..], &new_lib_id)
+            .ok_or_else(|| anyhow::anyhow!("Could not parse embedded symbol '{}'", new_lib_id))?;
+        content.replace_range(target_start..target_start + target_def.len(), &source_def);
+    }
     write_atomic(&sch_path, &content)?;
 
     Ok(CallToolResult::json(&json!({

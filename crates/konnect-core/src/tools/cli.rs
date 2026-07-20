@@ -216,7 +216,8 @@ mod erc_json_tests {
 /// Run DRC on a PCB and return parsed violations.
 /// KiCAD 10: `pcb drc --output <path> --format json [--refill-zones] <input>`
 pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<Vec<DrcViolation>> {
-    let out_path = pcb.with_extension("drc.json");
+    let temp_dir = tempfile::tempdir().context("failed to create DRC scratch directory")?;
+    let out_path = temp_dir.path().join("report.json");
     let mut args = vec![
         "pcb",
         "drc",
@@ -235,8 +236,6 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<Vec<Dr
         .await
         .context("DRC output file not found")?;
     let raw: serde_json::Value = serde_json::from_str(&json_str)?;
-    let _ = tokio::fs::remove_file(&out_path).await;
-
     Ok(raw
         .get("violations")
         .and_then(|v| v.as_array())
@@ -261,6 +260,16 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<Vec<Dr
 /// We implement annotation ourselves by parsing the schematic and assigning
 /// sequential reference designators to unannotated symbols (those with "?" suffix).
 pub async fn annotate_schematic(_cli: &str, schematic: &Path) -> Result<()> {
+    if !schematic
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_sch"))
+    {
+        anyhow::bail!(
+            "annotation writes require a .kicad_sch path: {}",
+            schematic.display()
+        );
+    }
     use std::collections::HashMap;
 
     let content = tokio::fs::read_to_string(schematic).await?;
@@ -408,6 +417,7 @@ pub async fn export_netlist(
 
 /// KiCAD 10: `pcb export gerbers --output <dir> <input>` (PLURAL!)
 pub async fn export_gerber(cli: &str, pcb: &Path, output_dir: &Path) -> Result<()> {
+    super::pcb_access::validate_artifact_path(pcb, output_dir)?;
     let args = [
         "pcb",
         "export",
@@ -422,6 +432,7 @@ pub async fn export_gerber(cli: &str, pcb: &Path, output_dir: &Path) -> Result<(
 
 /// KiCAD 10: `pcb export drill --output <dir> <input>`
 pub async fn export_drill(cli: &str, pcb: &Path, output: &Path) -> Result<()> {
+    super::pcb_access::validate_artifact_path(pcb, output)?;
     let args = [
         "pcb",
         "export",
@@ -436,6 +447,7 @@ pub async fn export_drill(cli: &str, pcb: &Path, output: &Path) -> Result<()> {
 
 /// KiCAD 10: `pcb export pdf --output <path> [--layers <layer>]... <input>`
 pub async fn export_pdf(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
+    super::pcb_access::validate_artifact_path(pcb, output)?;
     let mut args = vec!["pcb", "export", "pdf", "--output", output.to_str().unwrap()];
     for layer in layers {
         args.push("--layers");
@@ -448,6 +460,7 @@ pub async fn export_pdf(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -
 
 /// KiCAD 10: `pcb export svg --output <path> [--layers <layer>]... <input>`
 pub async fn export_svg_pcb(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
+    super::pcb_access::validate_artifact_path(pcb, output)?;
     let mut args = vec!["pcb", "export", "svg", "--output", output.to_str().unwrap()];
     for layer in layers {
         args.push("--layers");
@@ -461,6 +474,7 @@ pub async fn export_svg_pcb(cli: &str, pcb: &Path, output: &Path, layers: &[&str
 /// KiCAD 10: `pcb export <format> --output <path> <input>`
 /// Supported 3D formats: step, vrml, glb, brep, stl, ply, stpz, u3d, xao, 3dpdf
 pub async fn export_3d(cli: &str, pcb: &Path, output: &Path, format: &str) -> Result<()> {
+    super::pcb_access::validate_artifact_path(pcb, output)?;
     let subcommand = match format.to_lowercase().as_str() {
         "step" | "stp" => "step",
         "vrml" | "wrl" => "vrml",
@@ -497,6 +511,7 @@ pub async fn export_position_file(
     output: &Path,
     format: &str,
 ) -> Result<()> {
+    super::pcb_access::validate_artifact_path(pcb, output)?;
     let args = [
         "pcb",
         "export",
@@ -513,6 +528,7 @@ pub async fn export_position_file(
 
 /// KiCAD 10: `pcb export ipcd356 --output <path> <input>`
 pub async fn export_ipcd356(cli: &str, pcb: &Path, output: &Path) -> Result<()> {
+    super::pcb_access::validate_artifact_path(pcb, output)?;
     let args = [
         "pcb",
         "export",
@@ -531,6 +547,7 @@ pub async fn export_ipcd356(cli: &str, pcb: &Path, output: &Path) -> Result<()> 
 /// rather than a repeatable flag, and one file per requested layer is written
 /// into `output_dir` (verified against KiCAD 10.0).
 pub async fn export_dxf(cli: &str, pcb: &Path, output_dir: &Path, layers: &[&str]) -> Result<()> {
+    super::pcb_access::validate_artifact_path(pcb, output_dir)?;
     let output_str = output_dir.to_str().unwrap();
     let pcb_str = pcb.to_str().unwrap();
     let layers_csv = layers.join(",");
@@ -549,6 +566,7 @@ pub async fn export_dxf(cli: &str, pcb: &Path, output_dir: &Path, layers: &[&str
 
 /// KiCAD 10: `pcb export gencad --output <path> <input>`
 pub async fn export_gencad(cli: &str, pcb: &Path, output: &Path) -> Result<()> {
+    super::pcb_access::validate_artifact_path(pcb, output)?;
     let args = [
         "pcb",
         "export",
@@ -569,6 +587,7 @@ pub async fn export_ipc2581(
     units: &str,
     compress: bool,
 ) -> Result<()> {
+    super::pcb_access::validate_artifact_path(pcb, output)?;
     let output_str = output.to_str().unwrap();
     let pcb_str = pcb.to_str().unwrap();
 
@@ -593,6 +612,7 @@ pub async fn export_odb(
     units: &str,
     compression: &str,
 ) -> Result<()> {
+    super::pcb_access::validate_artifact_path(pcb, output)?;
     let args = [
         "pcb",
         "export",
@@ -620,6 +640,7 @@ pub async fn render_schematic_svg(cli: &str, schematic: &Path, output: &Path) ->
 
 /// KiCAD 10: `pcb render --output <path> [--layers <layer>]... <input>`
 pub async fn render_pcb_png(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
+    super::pcb_access::validate_artifact_path(pcb, output)?;
     let mut args = vec!["pcb", "render", "--output", output.to_str().unwrap()];
     for layer in layers {
         args.push("--layers");

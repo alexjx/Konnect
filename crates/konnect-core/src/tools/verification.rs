@@ -1,12 +1,12 @@
 //! `verification` toolset — DRC, design rules, KiCAD UI management, routing utilities.
 //!
-//! DRC delegates to `kicad-cli`. Design rules are read/written as S-expressions.
+//! DRC delegates to `kicad-cli`. PCB mutations are IPC-only; operations for which
+//! KiCad exposes no verified IPC command fail explicitly instead of editing files.
 //! KiCAD UI management uses process inspection + subprocess spawning.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
-use konnect_sexp::writer::write_atomic;
 use serde_json::json;
 use tokio::task;
 
@@ -44,7 +44,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_design_rules",
-            "Set board-level design rules (clearance, trace width, via size) in the PCB file.",
+            "Set board-level design rules through KiCad IPC (currently unsupported by the verified IPC surface).",
             json!({
                 "type": "object",
                 "properties": {
@@ -111,7 +111,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "copy_routing_pattern",
-            "Copy a routing pattern (traces and vias) from one region of the board to another.",
+            "Copy a routing pattern through KiCad IPC (currently unsupported until item cloning is verified).",
             json!({
                 "type": "object",
                 "properties": {
@@ -133,7 +133,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_layer_constraints",
-            "Set per-layer design constraints (e.g. min trace width, clearance) in the board setup section.",
+            "Set per-layer design constraints through KiCad IPC (currently unsupported by the verified IPC surface).",
             json!({
                 "type": "object",
                 "properties": {
@@ -186,6 +186,10 @@ async fn handle_run_drc(
 
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
+        crate::tools::pcb_access::validate_artifact_path(
+            &board,
+            std::path::Path::new(out_path),
+        )?;
         let report = serde_json::to_string_pretty(&violations)?;
         tokio::fs::write(out_path, report).await?;
     }
@@ -288,39 +292,11 @@ fn set_constraint(content: &str, key: &str, value: f64) -> String {
 }
 
 async fn handle_set_design_rules(
-    args: &serde_json::Value,
+    _args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board = get_path(args, "board")?;
-    let mut content = tokio::fs::read_to_string(&board).await?;
-
-    let mut changed = Vec::new();
-
-    let rules: &[(&str, &str)] = &[
-        ("min_clearance", "min_clearance"),
-        ("min_track_width", "min_trace_width"),
-        ("min_via_drill", "min_via_drill"),
-        ("min_via_size", "min_via_size"),
-        ("min_hole_to_hole", "min_hole_to_hole"),
-    ];
-
-    for (sexp_key, arg_key) in rules {
-        if let Some(val) = args[arg_key].as_f64() {
-            content = set_constraint(&content, sexp_key, val);
-            changed.push(format!("{} = {}", sexp_key, val));
-        }
-    }
-
-    if !changed.is_empty() {
-        write_atomic(&board, &content)?;
-    }
-
-    Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
-            "success": true,
-            "changed": changed
-        }))
-        .unwrap(),
+    Ok(CallToolResult::error(
+        "set_design_rules is disabled: the current KiCad IPC API has no verified command for board constraints; direct .kicad_pcb edits are forbidden",
     ))
 }
 
@@ -428,12 +404,8 @@ async fn handle_check_kicad_ui(
     }
 
     // Try IPC ping
-    let addr = ctx.config.ipc_address.clone();
-    let ipc_ok = task::spawn_blocking(move || {
-        konnect_ipc::client::KiCadIpcClient::new(&addr)
-            .ping()
-            .unwrap_or(false)
-    })
+    let ipc = ctx.ipc.clone();
+    let ipc_ok = task::spawn_blocking(move || ipc.ping().unwrap_or(false))
     .await
     .unwrap_or(false);
 
@@ -464,18 +436,14 @@ async fn handle_launch_kicad_ui(
         Ok(_child) => {
             if wait_ready {
                 // Poll IPC until responsive or timeout
-                let addr = ctx.config.ipc_address.clone();
+                let ipc = ctx.ipc.clone();
                 let deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let addr2 = addr.clone();
-                    let ok = task::spawn_blocking(move || {
-                        konnect_ipc::client::KiCadIpcClient::new(&addr2)
-                            .ping()
-                            .unwrap_or(false)
-                    })
+                    let ipc = ipc.clone();
+                    let ok = task::spawn_blocking(move || ipc.ping().unwrap_or(false))
                     .await
                     .unwrap_or(false);
 
@@ -519,76 +487,11 @@ async fn handle_launch_kicad_ui(
 // ─── Copy routing pattern ─────────────────────────────────────────────────────
 
 async fn handle_copy_routing_pattern(
-    args: &serde_json::Value,
+    _args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board = get_path(args, "board")?;
-    let src_x1 = args["src_x1"].as_f64().unwrap_or(0.0);
-    let src_y1 = args["src_y1"].as_f64().unwrap_or(0.0);
-    let src_x2 = args["src_x2"].as_f64().unwrap_or(0.0);
-    let src_y2 = args["src_y2"].as_f64().unwrap_or(0.0);
-    let dest_x = args["dest_x"].as_f64().unwrap_or(0.0);
-    let dest_y = args["dest_y"].as_f64().unwrap_or(0.0);
-
-    let dx = dest_x - src_x1;
-    let dy = dest_y - src_y1;
-
-    let net_map: std::collections::HashMap<String, String> =
-        if let Some(obj) = args["net_map"].as_object() {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
-
-    let content = tokio::fs::read_to_string(&board).await?;
-    let mut new_tracks = Vec::new();
-
-    // Find all (segment ...) and (via ...) blocks within the bounding box
-    // and collect translated copies.
-    for (block_start, block_end, _block_type) in find_routing_blocks(&content) {
-        let block = &content[block_start..block_end];
-        if let Some((bx, by)) = extract_start_xy(block) {
-            if bx >= src_x1 && bx <= src_x2 && by >= src_y1 && by <= src_y2 {
-                let translated = translate_block(block, dx, dy, &net_map);
-                new_tracks.push(translated);
-            }
-        }
-    }
-
-    if new_tracks.is_empty() {
-        return Ok(CallToolResult::text(
-            serde_json::to_string_pretty(&json!({
-                "copied": 0,
-                "note": "No routing elements found in the specified source region"
-            }))
-            .unwrap(),
-        ));
-    }
-
-    // Insert all new blocks before the final `)` of the file
-    let insert_pos = content.rfind(')').unwrap_or(content.len());
-    let insertion = new_tracks.join("\n");
-    let new_content = format!(
-        "{}\n{}\n{}",
-        &content[..insert_pos],
-        insertion,
-        &content[insert_pos..]
-    );
-
-    // Assign new UUIDs to inserted blocks (replace uuid "ORIGINAL" with new ones)
-    let new_content = reassign_uuids(&new_content, insert_pos);
-
-    write_atomic(&board, &new_content)?;
-
-    Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
-            "copied": new_tracks.len(),
-            "dx": dx,
-            "dy": dy
-        }))
-        .unwrap(),
+    Ok(CallToolResult::error(
+        "copy_routing_pattern is disabled until track/via cloning is verified through KiCad IPC; direct .kicad_pcb edits are forbidden",
     ))
 }
 
@@ -719,93 +622,11 @@ fn reassign_uuids(content: &str, insert_boundary: usize) -> String {
 // ─── Layer constraints ───────────────────────────────────────────────────────
 
 async fn handle_set_layer_constraints(
-    args: &serde_json::Value,
+    _args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board = get_path(args, "board")?;
-    let layer = match require_str(args, "layer") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let mut content = tokio::fs::read_to_string(&board).await?;
-    let mut changed = Vec::new();
-
-    // Build a layer constraint rule block to insert into (setup ...)
-    // KiCAD uses `(rule "name" (constraint ...) (condition "A.Layer == 'LAYER'"))` inside setup
-    let rule_name = format!("{}_constraints", layer.replace('.', "_"));
-
-    if let Some(clearance) = args["min_clearance"].as_f64() {
-        let rule_sexp = format!(
-            "\n    (rule \"{rule_name}_clearance\"\n      (constraint clearance (min {clearance}))\n      (condition \"A.Layer == '{layer}'\")\n    )"
-        );
-        // Insert into setup block
-        if let Some(setup_pos) = content.find("(setup") {
-            let mut depth = 0i32;
-            let mut setup_end = setup_pos;
-            for (i, ch) in content[setup_pos..].char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            setup_end = setup_pos + i;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            content = format!(
-                "{}{}{}",
-                &content[..setup_end],
-                rule_sexp,
-                &content[setup_end..]
-            );
-            changed.push(format!("clearance = {} on {}", clearance, layer));
-        }
-    }
-
-    if let Some(trace_width) = args["min_trace_width"].as_f64() {
-        let rule_sexp = format!(
-            "\n    (rule \"{rule_name}_trace_width\"\n      (constraint track_width (min {trace_width}))\n      (condition \"A.Layer == '{layer}'\")\n    )"
-        );
-        if let Some(setup_pos) = content.find("(setup") {
-            let mut depth = 0i32;
-            let mut setup_end = setup_pos;
-            for (i, ch) in content[setup_pos..].char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            setup_end = setup_pos + i;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            content = format!(
-                "{}{}{}",
-                &content[..setup_end],
-                rule_sexp,
-                &content[setup_end..]
-            );
-            changed.push(format!("min_trace_width = {} on {}", trace_width, layer));
-        }
-    }
-
-    if !changed.is_empty() {
-        write_atomic(&board, &content)?;
-    }
-
-    Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
-            "success": true,
-            "layer": layer,
-            "changed": changed
-        }))
-        .unwrap(),
+    Ok(CallToolResult::error(
+        "set_layer_constraints is disabled: the current KiCad IPC API has no verified command for custom board rules; direct .kicad_pcb edits are forbidden",
     ))
 }
 

@@ -7,6 +7,7 @@ pub mod integration;
 pub mod library;
 pub mod manufacturing;
 pub mod pcb_board;
+pub mod pcb_access;
 pub mod pcb_components;
 pub mod pcb_export;
 pub mod pcb_routing;
@@ -81,6 +82,8 @@ pub struct ToolContext {
     pub config: ServerConfig,
     pub router: Arc<ToolRouter>,
     pub observer: crate::observability::CallObserver,
+    /// Shared KiCad session state (instance token + serialized request gate).
+    pub ipc: konnect_ipc::KiCadIpcClient,
     /// In-memory TTL cache for repeated JLCPCB parts-database queries.
     pub jlcpcb_cache: QueryCache,
 }
@@ -89,10 +92,12 @@ impl ToolContext {
     /// Construct a context with an in-memory-only observer (no JSONL). Used by
     /// tests and by callers that don't need persistent call logs.
     pub fn new(config: ServerConfig, router: Arc<ToolRouter>) -> Self {
+        let ipc = konnect_ipc::KiCadIpcClient::new(config.ipc_address.clone());
         ToolContext {
             config,
             router,
             observer: crate::observability::CallObserver::new(None),
+            ipc,
             jlcpcb_cache: QueryCache::default(),
         }
     }
@@ -104,10 +109,12 @@ impl ToolContext {
         router: Arc<ToolRouter>,
         observer: crate::observability::CallObserver,
     ) -> Self {
+        let ipc = konnect_ipc::KiCadIpcClient::new(config.ipc_address.clone());
         ToolContext {
             config,
             router,
             observer,
+            ipc,
             jlcpcb_cache: QueryCache::default(),
         }
     }
@@ -379,6 +386,23 @@ fn kicad_config_base() -> std::path::PathBuf {
 /// Resolve a lib_id like "Device:R" to the full symbol S-expression definition.
 /// KiCAD 10 stores symbols in .kicad_symdir directories, one .kicad_sym file per symbol.
 /// Returns the symbol block with the lib_id prefix (e.g. "Device:R") as the symbol name.
+fn qualify_embedded_extends(mut symbol: String, library_name: &str) -> String {
+    let marker = "(extends \"";
+    if let Some(start) = symbol.find(marker) {
+        let value_start = start + marker.len();
+        if let Some(end) = symbol[value_start..].find('"') {
+            let parent = symbol[value_start..value_start + end].to_string();
+            if !parent.contains(':') {
+                symbol.replace_range(
+                    value_start..value_start + end,
+                    &format!("{}:{}", library_name, parent),
+                );
+            }
+        }
+    }
+    symbol
+}
+
 pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
     let parts: Vec<&str> = lib_id.splitn(2, ':').collect();
     if parts.len() != 2 {
@@ -407,7 +431,7 @@ pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
                             &format!("(symbol \"{}:{}\"", library_name, symbol_name),
                             1,
                         );
-                        return Some(renamed);
+                        return Some(qualify_embedded_extends(renamed, library_name));
                     }
                 }
                 Err(e) => tracing::warn!("[BETA] Failed to read {}: {}", sym_file.display(), e),
@@ -425,7 +449,7 @@ pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
                             &format!("(symbol \"{}:{}\"", library_name, symbol_name),
                             1,
                         );
-                        return Some(renamed);
+                        return Some(qualify_embedded_extends(renamed, library_name));
                     }
                 }
                 Err(e) => tracing::warn!("[BETA] Failed to read {}: {}", legacy_path.display(), e),
@@ -472,6 +496,16 @@ pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) {
     // Check if already present
     let lib_id_check = format!("(symbol \"{}\"", lib_id);
     if content.contains(&lib_id_check) {
+        if let Some((library_name, _)) = lib_id.split_once(':') {
+            if let Some(sym_start) = content.find(&lib_id_check) {
+                if let Some(sym_block) = extract_symbol_block(&content[sym_start..], lib_id) {
+                    let qualified = qualify_embedded_extends(sym_block.clone(), library_name);
+                    if qualified != sym_block {
+                        content.replace_range(sym_start..sym_start + sym_block.len(), &qualified);
+                    }
+                }
+            }
+        }
         return;
     }
 
@@ -531,6 +565,20 @@ fn find_kicad_symbol_dirs() -> Vec<std::path::PathBuf> {
     }
     #[cfg(target_os = "windows")]
     {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            for version in ["10.0", "9.0"] {
+                let p = std::path::PathBuf::from(&local_app_data)
+                    .join("Programs")
+                    .join("KiCad")
+                    .join(version)
+                    .join("share")
+                    .join("kicad")
+                    .join("symbols");
+                if p.is_dir() && !dirs.contains(&p) {
+                    dirs.push(p);
+                }
+            }
+        }
         let candidates = [
             r"C:\KiCad\10.0\share\kicad\symbols",
             r"C:\Program Files\KiCad\10.0\share\kicad\symbols",

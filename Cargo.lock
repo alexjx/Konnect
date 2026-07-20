@@ -890,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "konnect"
-version = "0.1.3-xinj.14"
+version = "0.1.3-xinj.33"
 dependencies = [
  "anyhow",
  "axum",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "konnect-core"
-version = "0.1.3-xinj.14"
+version = "0.1.3-xinj.33"
 dependencies = [
  "anyhow",
  "axum",
@@ -934,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "konnect-ipc"
-version = "0.1.3-xinj.14"
+version = "0.1.3-xinj.33"
 dependencies = [
  "anyhow",
  "nng",
@@ -943,6 +943,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -950,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "konnect-schematic-editor"
-version = "0.1.3-xinj.14"
+version = "0.1.3-xinj.33"
 dependencies = [
  "konnect-sexp",
  "tempfile",
@@ -960,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "konnect-sexp"
-version = "0.1.3-xinj.14"
+version = "0.1.3-xinj.33"
 dependencies = [
  "anyhow",
  "nom",

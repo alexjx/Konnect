@@ -94,6 +94,16 @@ pub fn apply_edits(mut content: String, mut edits: Vec<SexpEdit>) -> String {
 /// protocol requires that reads immediately after writes see the new data,
 /// so fsync is mandatory.
 pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pcb"))
+    {
+        return Err(SexpError::InvalidValue(format!(
+            "direct writes to PCB documents are forbidden; use KiCad IPC: {}",
+            path.display()
+        )));
+    }
     let tmp_path = path.with_extension("kicad_tmp");
 
     {
@@ -122,6 +132,19 @@ mod atomic_write_tests {
         write_atomic(&path, "new").unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn write_atomic_rejects_pcb_documents_but_allows_reads() {
+        let path = std::env::temp_dir().join(format!(
+            "konnect-write-atomic-{}.kicad_pcb",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "original").unwrap();
+        let error = write_atomic(&path, "changed").expect_err("PCB write must be blocked");
+        assert!(error.to_string().contains("direct writes"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
         std::fs::remove_file(path).unwrap();
     }
 }
