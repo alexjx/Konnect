@@ -960,6 +960,17 @@ async fn handle_add_power_symbol(
     let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
 
     let mut sch = cse::Schematic::load(&sch_path)?;
+    let root_uuid = sch.uuid.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Schematic '{}' has no root UUID; refusing to create an unsafe power symbol instance",
+            sch_path.display()
+        )
+    })?;
+    let project_name = sch_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Schematic path has no valid file stem"))?;
+    let instance_path = format!("/{root_uuid}");
 
     // Auto-number the #PWR reference by counting existing power symbols
     let pwr_count = sch
@@ -1004,20 +1015,7 @@ async fn handle_add_power_symbol(
     append_instance_pin_uuids(&mut sym, &pin_numbers);
 
     // Add instances raw node
-    use cse::sexp::{atom, qstr, SexpNode};
-    let instances = SexpNode::List(vec![
-        atom("instances"),
-        SexpNode::List(vec![
-            atom("project"),
-            qstr(""),
-            SexpNode::List(vec![
-                atom("path"),
-                qstr("/"),
-                SexpNode::List(vec![atom("reference"), qstr(&pwr_ref)]),
-                SexpNode::List(vec![atom("unit"), atom("1")]),
-            ]),
-        ]),
-    ]);
+    let instances = power_symbol_instances_node(project_name, &instance_path, &pwr_ref);
     sym.raw_sub_nodes.push(instances);
 
     sch.add_symbol(sym);
@@ -1040,6 +1038,27 @@ fn append_instance_pin_uuids(sym: &mut cse::Symbol, pin_numbers: &[String]) {
             SexpNode::List(vec![atom("uuid"), qstr(uuid::Uuid::new_v4().to_string())]),
         ]));
     }
+}
+
+fn power_symbol_instances_node(
+    project_name: &str,
+    instance_path: &str,
+    reference: &str,
+) -> cse::sexp::SexpNode {
+    use cse::sexp::{atom, qstr, SexpNode};
+    SexpNode::List(vec![
+        atom("instances"),
+        SexpNode::List(vec![
+            atom("project"),
+            qstr(project_name),
+            SexpNode::List(vec![
+                atom("path"),
+                qstr(instance_path),
+                SexpNode::List(vec![atom("reference"), qstr(reference)]),
+                SexpNode::List(vec![atom("unit"), atom("1")]),
+            ]),
+        ]),
+    ])
 }
 
 async fn handle_add_no_connect(
@@ -1385,5 +1404,20 @@ mod power_symbol_pin_uuid_tests {
         assert!(!first.is_empty());
         assert!(!second.is_empty());
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn power_symbol_instances_bind_to_project_and_root_sheet() {
+        let node = power_symbol_instances_node(
+            "07_measurement",
+            "/2be77a0b-dc3f-40e9-ae62-b70766de575a",
+            "#PWR007",
+        );
+        let rendered = format!("{node:?}");
+        assert!(rendered.contains("07_measurement"));
+        assert!(rendered.contains("/2be77a0b-dc3f-40e9-ae62-b70766de575a"));
+        assert!(rendered.contains("#PWR007"));
+        assert!(!rendered.contains("(project \"\""));
+        assert!(!rendered.contains("(path \"/\""));
     }
 }

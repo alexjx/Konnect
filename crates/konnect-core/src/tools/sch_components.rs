@@ -296,6 +296,18 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_replace_component(args, ctx).await }
         ),
         tool!(
+            "repair_schematic_instance_paths",
+            "Repair every placed symbol's instances/project/path identity to match the current schematic file and root UUID without changing symbol geometry, fields, pins, or connectivity.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_repair_schematic_instance_paths(args, ctx).await }
+        ),
+        tool!(
             "get_schematic_view",
             "Render the schematic to a PNG image (base64-encoded) via kicad-cli.",
             json!({
@@ -311,6 +323,76 @@ pub fn tools() -> Vec<ToolDef> {
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
+
+async fn handle_repair_schematic_instance_paths(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    let root_uuid = sch.uuid.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Schematic '{}' has no root UUID; refusing to repair symbol instances",
+            sch_path.display()
+        )
+    })?;
+    let project_name = sch_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Schematic path has no valid file stem"))?;
+    let instance_path = format!("/{root_uuid}");
+    let mut repaired = Vec::new();
+
+    for symbol in sch.symbols.iter_mut() {
+        let Some(reference) = symbol.reference().map(str::to_owned) else {
+            continue;
+        };
+        let expected = symbol_instances_node(project_name, &instance_path, &reference);
+        let current = symbol
+            .raw_sub_nodes
+            .iter()
+            .find(|node| node.tag() == Some("instances"));
+        if current == Some(&expected) {
+            continue;
+        }
+        symbol
+            .raw_sub_nodes
+            .retain(|node| node.tag() != Some("instances"));
+        symbol.raw_sub_nodes.push(expected);
+        repaired.push(reference);
+    }
+
+    if !repaired.is_empty() {
+        sch.overwrite()?;
+    }
+    Ok(CallToolResult::json(&json!({
+        "project": project_name,
+        "path": instance_path,
+        "repaired_count": repaired.len(),
+        "references": repaired
+    })))
+}
+
+fn symbol_instances_node(
+    project_name: &str,
+    instance_path: &str,
+    reference: &str,
+) -> cse::sexp::SexpNode {
+    use cse::sexp::{atom, qstr, SexpNode};
+    SexpNode::List(vec![
+        atom("instances"),
+        SexpNode::List(vec![
+            atom("project"),
+            qstr(project_name),
+            SexpNode::List(vec![
+                atom("path"),
+                qstr(instance_path),
+                SexpNode::List(vec![atom("reference"), qstr(reference)]),
+                SexpNode::List(vec![atom("unit"), atom("1")]),
+            ]),
+        ]),
+    ])
+}
 
 async fn handle_create_schematic(
     args: &serde_json::Value,
