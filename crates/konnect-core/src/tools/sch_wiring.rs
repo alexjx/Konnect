@@ -990,6 +990,19 @@ async fn handle_add_power_symbol(
     sym.properties.push(cse::Property::new("Footprint", ""));
     sym.properties.push(cse::Property::new("Datasheet", ""));
 
+    // KiCad requires an independent KIID for every pin on every placed symbol,
+    // including power symbols.  Omitting these nodes leaves a null KIID that
+    // can survive loading and rendering, then crash eeschema in
+    // KIID::operator< when local-history/autosave processes an edited sheet.
+    let pin_numbers = cse::library::resolve_lib_symbol_pin_numbers(&lib_id);
+    if pin_numbers.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "Could not resolve any pins for power symbol '{}'; refusing to create an unsafe symbol instance",
+            lib_id
+        )));
+    }
+    append_instance_pin_uuids(&mut sym, &pin_numbers);
+
     // Add instances raw node
     use cse::sexp::{atom, qstr, SexpNode};
     let instances = SexpNode::List(vec![
@@ -1013,8 +1026,20 @@ async fn handle_add_power_symbol(
     Ok(CallToolResult::json(&json!({
         "added_power": power_net,
         "reference": pwr_ref,
+        "pin_uuid_count": pin_numbers.len(),
         "x": x, "y": y
     })))
+}
+
+fn append_instance_pin_uuids(sym: &mut cse::Symbol, pin_numbers: &[String]) {
+    use cse::sexp::{atom, qstr, SexpNode};
+    for number in pin_numbers {
+        sym.raw_sub_nodes.push(SexpNode::List(vec![
+            atom("pin"),
+            qstr(number),
+            SexpNode::List(vec![atom("uuid"), qstr(uuid::Uuid::new_v4().to_string())]),
+        ]));
+    }
 }
 
 async fn handle_add_no_connect(
@@ -1338,4 +1363,27 @@ async fn handle_add_schematic_connection(
     Ok(CallToolResult::json(&json!({
         "connected": { "from": [x1, y1], "to": [x2, y2] }
     })))
+}
+
+#[cfg(test)]
+mod power_symbol_pin_uuid_tests {
+    use super::*;
+
+    #[test]
+    fn power_symbol_instance_pins_receive_nonempty_unique_uuids() {
+        let mut symbol = cse::Symbol::new("power:GND", 10.0, 20.0);
+        append_instance_pin_uuids(&mut symbol, &["1".to_string(), "2".to_string()]);
+
+        let pins: Vec<_> = symbol
+            .raw_sub_nodes
+            .iter()
+            .filter(|node| node.tag() == Some("pin"))
+            .collect();
+        assert_eq!(pins.len(), 2);
+        let first = pins[0].get_value("uuid").expect("pin 1 uuid");
+        let second = pins[1].get_value("uuid").expect("pin 2 uuid");
+        assert!(!first.is_empty());
+        assert!(!second.is_empty());
+        assert_ne!(first, second);
+    }
 }
