@@ -15,15 +15,11 @@ async fn main() -> Result<()> {
     // ─── CLI argument parsing (minimal, no clap dependency) ─────────
     let args: Vec<String> = std::env::args().collect();
 
-    // ─── Subcommand dispatch (install, uninstall, status, skill) ────
+    // ─── Subcommand dispatch (install, uninstall, status) ───────────
     match args.get(1).map(String::as_str) {
         Some("init") => return install::run_install(),
         Some("uninstall") => return install::run_uninstall(),
         Some("status") => return install::print_status(),
-        Some("skill") => {
-            let name = args.get(2).map(String::as_str).unwrap_or("");
-            return install::print_skill_content(name);
-        }
         Some("--version") | Some("-V") => {
             println!("konnect {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
@@ -112,13 +108,12 @@ async fn main() -> Result<()> {
 
 fn print_help() {
     println!("Konnect v{}", env!("CARGO_PKG_VERSION"));
-    println!("MCP server for KiCAD EDA with embedded skills and agents.\n");
+    println!("MCP server for KiCAD EDA with bundled Codex skills.\n");
     println!("USAGE:");
     println!("  konnect                  Start MCP server (pipe) or install (TTY)");
-    println!("  konnect init             Install skills, agents, and hooks");
-    println!("  konnect uninstall        Remove all installed files");
+    println!("  konnect init             Install bundled Codex skills");
+    println!("  konnect uninstall        Remove bundled Codex skills");
     println!("  konnect status           Show install state");
-    println!("  konnect skill <name>     Print skill content (for hooks)");
     println!("  konnect --config <path>  Start server with config file");
     println!("  konnect --version        Print version");
     println!("  konnect --help           This message");

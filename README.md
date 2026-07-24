@@ -13,8 +13,8 @@ through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
 **185 tools across 18 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, Freerouting, reference
-circuits, and a full manufacturing export pipeline — with bundled skills and agents
-that teach Claude KiCAD conventions out of the box.
+circuits, and a full manufacturing export pipeline. Two bundled Codex skills add
+datasheet-driven schematic, placement, routing, review, and fabrication workflows.
 
 > **Status: beta.** The core toolchain is tested and working, but this is a young
 > release and it wants real-world mileage and review. Issues and PRs are welcome —
@@ -129,6 +129,19 @@ Verify: open the **PCB Editor** → **Tools → External Plugins** → you shoul
 cargo build --release -p konnect
 ```
 
+## Setup with Codex
+
+Run the server once from a terminal or install the skills explicitly:
+
+```powershell
+konnect.exe init
+```
+
+Konnect installs `konnect-kicad-schematic` and `konnect-kicad-pcb-layout` under
+`$CODEX_HOME/skills`. If `CODEX_HOME` is unset, it uses `~/.codex/skills`.
+Register the same executable as the `konnect` MCP server in Codex, then restart
+Codex so it discovers the skills.
+
 ## Setup with Claude Desktop
 
 After a PCM install, the server binary lives in your KiCAD documents folder:
@@ -204,7 +217,7 @@ the architecture it proved, rebuilt for production:
 | PCB backend | SWIG (deprecated by KiCAD) + experimental IPC | KiCAD 10 IPC API |
 | Schematic backend | kicad-skip + custom loaders | Native S-expression engine, atomic writes |
 | Context cost | Router pattern | Load/unload toolsets + observability |
-| Skills / agents | — | 6 skills + 2 agents bundled |
+| Codex skills | — | 2 workflow skills bundled |
 | License | MIT | AGPL-3.0 + commercial |
 
 ## Troubleshooting

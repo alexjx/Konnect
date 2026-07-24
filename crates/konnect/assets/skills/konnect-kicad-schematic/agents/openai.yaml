@@ -1,0 +1,10 @@
+interface:
+  display_name: "Konnect KiCad Schematic"
+  short_description: "Build and review KiCad schematics safely with Konnect"
+  default_prompt: "Use $konnect-kicad-schematic to create, modify, or review this KiCad schematic through Konnect MCP."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "kicad"
+      description: "Konnect KiCad MCP server"

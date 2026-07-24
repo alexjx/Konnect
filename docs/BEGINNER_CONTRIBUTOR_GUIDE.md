@@ -95,7 +95,7 @@ Useful files:
 - `src/config.rs`: server configuration and defaults
 - `src/transport/stdio.rs`: newline-delimited JSON-RPC
 - `src/transport/http.rs`: Streamable HTTP and SSE
-- `src/install.rs`: local installation of bundled skills and agents
+- `src/install.rs`: local installation of bundled Codex skills
 - `tests/protocol_*.rs`: transport-level behavior
 
 ### `crates/konnect-core`: MCP routing and tool behavior
