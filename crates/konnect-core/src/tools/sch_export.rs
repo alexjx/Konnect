@@ -210,9 +210,7 @@ async fn handle_export_netlist_summary(
     let components: Vec<serde_json::Value> = instances
         .iter()
         .map(|inst| {
-            let lib_sym = lib_syms
-                .iter()
-                .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+            let lib_sym = super::resolve_embedded_pin_symbol(&lib_syms, &inst.lib_id);
 
             let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
                 let t = inst.pin_transform();
@@ -330,9 +328,7 @@ async fn handle_fix_connectivity(
     let mut snap_targets: Vec<(f64, f64)> = Vec::new();
 
     for inst in &instances {
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = super::resolve_embedded_pin_symbol(&lib_syms, &inst.lib_id);
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
             for pin in extract_lib_pins(sym) {

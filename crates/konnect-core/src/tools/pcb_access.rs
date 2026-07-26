@@ -20,7 +20,10 @@ impl ReadOnlyBoardFile {
         let canonical_path = std::fs::canonicalize(path)
             .with_context(|| format!("cannot open PCB for reading: {}", path.display()))?;
         if !canonical_path.is_file() {
-            anyhow::bail!("PCB path is not a regular file: {}", canonical_path.display());
+            anyhow::bail!(
+                "PCB path is not a regular file: {}",
+                canonical_path.display()
+            );
         }
         Ok(Self { canonical_path })
     }
@@ -45,14 +48,20 @@ pub fn validate_artifact_path(board: &Path, output: &Path) -> Result<()> {
     let board = normalize_existing_or_absolute(board)?;
     let output = normalize_existing_or_absolute(output)?;
     if comparable(&board) == comparable(&output) {
-        anyhow::bail!("artifact output may not overwrite PCB input: {}", board.display());
+        anyhow::bail!(
+            "artifact output may not overwrite PCB input: {}",
+            board.display()
+        );
     }
     Ok(())
 }
 
 pub fn validate_non_pcb_write(output: &Path) -> Result<()> {
     if has_extension(output, "kicad_pcb") {
-        anyhow::bail!("artifact output may not be a .kicad_pcb path: {}", output.display());
+        anyhow::bail!(
+            "artifact output may not be a .kicad_pcb path: {}",
+            output.display()
+        );
     }
     if output.exists() {
         let canonical = std::fs::canonicalize(output)?;
@@ -86,7 +95,10 @@ fn comparable(path: &Path) -> String {
     let value = path.to_string_lossy().replace('\\', "/");
     #[cfg(windows)]
     let value = value.to_ascii_lowercase();
-    value.trim_start_matches("//?/").trim_end_matches('/').to_string()
+    value
+        .trim_start_matches("//?/")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 #[cfg(test)]

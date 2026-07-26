@@ -109,7 +109,10 @@ fn normalized_path(path: &Path) -> String {
     let value = path.to_string_lossy().replace('\\', "/");
     #[cfg(windows)]
     let value = value.to_ascii_lowercase();
-    value.trim_start_matches("//?/").trim_end_matches('/').to_string()
+    value
+        .trim_start_matches("//?/")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {
@@ -235,14 +238,13 @@ impl KiCadIpcClient {
             .context("Failed to set NNG receive timeout")?;
 
         // Build the dial URL
-        let dial_url =
-            if self.session.socket_path.starts_with("ipc://")
-                || self.session.socket_path.starts_with("tcp://")
-            {
-                self.session.socket_path.clone()
-            } else {
-                format!("ipc://{}", self.session.socket_path)
-            };
+        let dial_url = if self.session.socket_path.starts_with("ipc://")
+            || self.session.socket_path.starts_with("tcp://")
+        {
+            self.session.socket_path.clone()
+        } else {
+            format!("ipc://{}", self.session.socket_path)
+        };
 
         socket
             .dial(&dial_url)
@@ -255,11 +257,9 @@ impl KiCadIpcClient {
             .map_err(|(_, e)| anyhow::anyhow!("NNG send failed: {}", e))?;
 
         // Receive response
-        let reply = socket.recv().map_err(|e| {
-            IpcError::OutcomeUnknown {
-                command: type_name.to_string(),
-                source: anyhow::anyhow!("NNG recv failed: {}", e),
-            }
+        let reply = socket.recv().map_err(|e| IpcError::OutcomeUnknown {
+            command: type_name.to_string(),
+            source: anyhow::anyhow!("NNG recv failed: {}", e),
         })?;
 
         let response = kiapi::common::ApiResponse::decode(reply.as_slice())
@@ -277,10 +277,9 @@ impl KiCadIpcClient {
             .map_err(|_| anyhow::anyhow!("KiCad IPC token state was poisoned"))?;
         if session_token.is_empty() {
             if response_token.is_empty() {
-                return Err(IpcError::InvalidResponse(
-                    "missing KiCad instance token".to_string(),
-                )
-                .into());
+                return Err(
+                    IpcError::InvalidResponse("missing KiCad instance token".to_string()).into(),
+                );
             }
             *session_token = response_token.to_string();
         } else if response_token != session_token.as_str() {
@@ -380,8 +379,7 @@ impl KiCadIpcClient {
         self.get_open_documents()?
             .into_iter()
             .find(|doc| {
-                document_path(doc)
-                    .is_some_and(|path| paths_equal(&path, &bound.canonical_path))
+                document_path(doc).is_some_and(|path| paths_equal(&path, &bound.canonical_path))
             })
             .map(|doc| {
                 // Prefer KiCad's current specifier, but preserve the originally
@@ -497,7 +495,13 @@ impl KiCadIpcClient {
                 let definition_item_types = fp
                     .definition
                     .as_ref()
-                    .map(|definition| definition.items.iter().map(|item| item.type_url.clone()).collect())
+                    .map(|definition| {
+                        definition
+                            .items
+                            .iter()
+                            .map(|item| item.type_url.clone())
+                            .collect()
+                    })
                     .unwrap_or_default();
                 footprints.push(IpcFootprint {
                     reference: ref_text,
@@ -511,7 +515,10 @@ impl KiCadIpcClient {
                         .definition
                         .as_ref()
                         .and_then(|d| d.anchor.as_ref())
-                        .map(|p| IpcVector2 { x: nm_to_mm(p.x_nm), y: nm_to_mm(p.y_nm) })
+                        .map(|p| IpcVector2 {
+                            x: nm_to_mm(p.x_nm),
+                            y: nm_to_mm(p.y_nm),
+                        })
                         .unwrap_or(IpcVector2 { x: 0.0, y: 0.0 }),
                     definition_item_samples,
                     definition_item_types,
@@ -534,25 +541,53 @@ impl KiCadIpcClient {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
         let mut result = Vec::new();
         for item in items {
-            let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) else { continue };
-            let reference = fp.reference_field.as_ref()
-                .and_then(|f| f.text.as_ref()).and_then(|t| t.text.as_ref())
-                .map(|t| t.text.clone()).unwrap_or_default();
-            let mut by_layer: std::collections::BTreeMap<String, Vec<IpcCourtyardPrimitive>> = Default::default();
+            let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let reference = fp
+                .reference_field
+                .as_ref()
+                .and_then(|f| f.text.as_ref())
+                .and_then(|t| t.text.as_ref())
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
+            let mut by_layer: std::collections::BTreeMap<String, Vec<IpcCourtyardPrimitive>> =
+                Default::default();
             if let Some(definition) = fp.definition {
                 for child in definition.items {
-                    if !child.type_url.ends_with("kiapi.board.types.BoardGraphicShape") { continue; }
-                    let Ok(graphic) = kiapi::board::types::BoardGraphicShape::decode(child.value.as_slice()) else { continue; };
+                    if !child
+                        .type_url
+                        .ends_with("kiapi.board.types.BoardGraphicShape")
+                    {
+                        continue;
+                    }
+                    let Ok(graphic) =
+                        kiapi::board::types::BoardGraphicShape::decode(child.value.as_slice())
+                    else {
+                        continue;
+                    };
                     let layer = layer_enum_to_name(graphic.layer).to_string();
-                    if layer != "F.CrtYd" && layer != "B.CrtYd" { continue; }
+                    if layer != "F.CrtYd" && layer != "B.CrtYd" {
+                        continue;
+                    }
                     if let Some(shape) = graphic.shape {
-                        append_courtyard_shape(&layer, &shape, by_layer.entry(layer.clone()).or_default());
+                        append_courtyard_shape(
+                            &layer,
+                            &shape,
+                            by_layer.entry(layer.clone()).or_default(),
+                        );
                     }
                 }
             }
             for (layer, primitives) in by_layer {
                 let bounds = bounds_for_primitives(&primitives);
-                result.push(IpcFootprintCourtyard { reference: reference.clone(), layer, bounds, primitives });
+                result.push(IpcFootprintCourtyard {
+                    reference: reference.clone(),
+                    layer,
+                    bounds,
+                    primitives,
+                });
             }
         }
         Ok(result)
@@ -572,24 +607,39 @@ impl KiCadIpcClient {
     ) -> Result<()> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
         for item in items {
-            let mut fp = match kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) {
+            let mut fp = match kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            {
                 Ok(fp) => fp,
                 Err(_) => continue,
             };
-            let fp_ref = fp.reference_field.as_ref()
-                .and_then(|f| f.text.as_ref()).and_then(|t| t.text.as_ref())
-                .map(|t| t.text.as_str()).unwrap_or("");
-            if fp_ref != reference { continue; }
-            let definition = fp.definition.as_mut()
+            let fp_ref = fp
+                .reference_field
+                .as_ref()
+                .and_then(|f| f.text.as_ref())
+                .and_then(|t| t.text.as_ref())
+                .map(|t| t.text.as_str())
+                .unwrap_or("");
+            if fp_ref != reference {
+                continue;
+            }
+            let definition = fp
+                .definition
+                .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no definition", reference))?;
             let circle = crate::builders::board_circle(
-                layer, width_mm, center_x_mm, center_y_mm, diameter_mm / 2.0,
+                layer,
+                width_mm,
+                center_x_mm,
+                center_y_mm,
+                diameter_mm / 2.0,
             );
             definition.items.push(crate::builders::pack_any(
-                &circle, "kiapi.board.types.BoardGraphicShape",
+                &circle,
+                "kiapi.board.types.BoardGraphicShape",
             ));
             return self.update_items(vec![crate::builders::pack_any(
-                &fp, "kiapi.board.types.FootprintInstance",
+                &fp,
+                "kiapi.board.types.FootprintInstance",
             )]);
         }
         anyhow::bail!("Footprint '{}' not found", reference)
@@ -604,7 +654,8 @@ impl KiCadIpcClient {
             items,
             container: None,
         };
-        let response = self.send_command(&cmd, "kiapi.common.commands.CreateItems")?
+        let response = self
+            .send_command(&cmd, "kiapi.common.commands.CreateItems")?
             .ok_or_else(|| anyhow::anyhow!("CreateItems returned no response"))?;
         let response: kiapi::common::commands::CreateItemsResponse = unpack_any(&response)?;
         if response.status != kiapi::common::types::ItemRequestStatus::IrsOk as i32 {
@@ -618,11 +669,16 @@ impl KiCadIpcClient {
             );
         }
         for (index, result) in response.created_items.iter().enumerate() {
-            let status = result.status.as_ref().ok_or_else(|| anyhow::anyhow!(
-                "CreateItems result {} has no item status", index
-            ))?;
+            let status = result.status.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("CreateItems result {} has no item status", index)
+            })?;
             if status.code != kiapi::common::commands::ItemStatusCode::IscOk as i32 {
-                anyhow::bail!("CreateItems item {} failed with status {}: {}", index, status.code, status.error_message);
+                anyhow::bail!(
+                    "CreateItems item {} failed with status {}: {}",
+                    index,
+                    status.code,
+                    status.error_message
+                );
             }
         }
         Ok(())
@@ -674,25 +730,32 @@ impl KiCadIpcClient {
             document: Some(doc),
             contents,
         };
-        let response = self.send_command(
-            &cmd,
-            "kiapi.common.commands.ParseAndCreateItemsFromString",
-        )?.ok_or_else(|| anyhow::anyhow!("ParseAndCreateItemsFromString returned no response"))?;
+        let response = self
+            .send_command(&cmd, "kiapi.common.commands.ParseAndCreateItemsFromString")?
+            .ok_or_else(|| anyhow::anyhow!("ParseAndCreateItemsFromString returned no response"))?;
         let response: kiapi::common::commands::CreateItemsResponse = unpack_any(&response)?;
         if response.status != kiapi::common::types::ItemRequestStatus::IrsOk as i32 {
-            anyhow::bail!("ParseAndCreateItemsFromString failed with request status {}", response.status);
+            anyhow::bail!(
+                "ParseAndCreateItemsFromString failed with request status {}",
+                response.status
+            );
         }
         if response.created_items.is_empty() {
             anyhow::bail!("ParseAndCreateItemsFromString created no items");
         }
         for (index, result) in response.created_items.iter().enumerate() {
-            let status = result.status.as_ref().ok_or_else(|| anyhow::anyhow!(
-                "ParseAndCreateItemsFromString result {} has no status", index
-            ))?;
+            let status = result.status.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ParseAndCreateItemsFromString result {} has no status",
+                    index
+                )
+            })?;
             if status.code != kiapi::common::commands::ItemStatusCode::IscOk as i32 {
                 anyhow::bail!(
                     "ParseAndCreateItemsFromString item {} failed with status {}: {}",
-                    index, status.code, status.error_message
+                    index,
+                    status.code,
+                    status.error_message
                 );
             }
         }
@@ -712,14 +775,20 @@ impl KiCadIpcClient {
         let shapes = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbShape)?;
         let mut old_ids = Vec::new();
         for item in shapes {
-            if let Ok(shape) = kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()) {
+            if let Ok(shape) = kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+            {
                 if shape.layer == kiapi::board::types::BoardLayer::BlEdgeCuts as i32 {
-                    if let Some(id) = shape.id { old_ids.push(id.value); }
+                    if let Some(id) = shape.id {
+                        old_ids.push(id.value);
+                    }
                 }
             }
         }
 
-        let r = radius.max(0.0).min((x2 - x1).abs() / 2.0).min((y2 - y1).abs() / 2.0);
+        let r = radius
+            .max(0.0)
+            .min((x2 - x1).abs() / 2.0)
+            .min((y2 - y1).abs() / 2.0);
         let mut items = Vec::new();
         let mut add_segment = |ax, ay, bx, by| {
             items.push(crate::builders::pack_any(
@@ -728,8 +797,10 @@ impl KiCadIpcClient {
             ));
         };
         if r == 0.0 {
-            add_segment(x1, y1, x2, y1); add_segment(x2, y1, x2, y2);
-            add_segment(x2, y2, x1, y2); add_segment(x1, y2, x1, y1);
+            add_segment(x1, y1, x2, y1);
+            add_segment(x2, y1, x2, y2);
+            add_segment(x2, y2, x1, y2);
+            add_segment(x1, y2, x1, y1);
         } else {
             add_segment(x1 + r, y1, x2 - r, y1);
             add_segment(x2, y1 + r, x2, y2 - r);
@@ -737,10 +808,10 @@ impl KiCadIpcClient {
             add_segment(x1, y2 - r, x1, y1 + r);
             let q = r / 2.0_f64.sqrt();
             for (sx, sy, mx, my, ex, ey) in [
-                (x2-r,y1, x2-r+q,y1+r-q, x2,y1+r),
-                (x2,y2-r, x2-r+q,y2-r+q, x2-r,y2),
-                (x1+r,y2, x1+r-q,y2-r+q, x1,y2-r),
-                (x1,y1+r, x1+r-q,y1+r-q, x1+r,y1),
+                (x2 - r, y1, x2 - r + q, y1 + r - q, x2, y1 + r),
+                (x2, y2 - r, x2 - r + q, y2 - r + q, x2 - r, y2),
+                (x1 + r, y2, x1 + r - q, y2 - r + q, x1, y2 - r),
+                (x1, y1 + r, x1 + r - q, y1 + r - q, x1 + r, y1),
             ] {
                 items.push(crate::builders::pack_any(
                     &crate::builders::board_arc("Edge.Cuts", width, sx, sy, mx, my, ex, ey),
@@ -751,11 +822,15 @@ impl KiCadIpcClient {
 
         let commit = self.begin_commit()?;
         let result = (|| {
-            if !old_ids.is_empty() { self.delete_items(old_ids)?; }
+            if !old_ids.is_empty() {
+                self.delete_items(old_ids)?;
+            }
             self.create_items(items)?;
             self.push_commit(&commit, "Replace board outline")
         })();
-        if result.is_err() { let _ = self.drop_commit(&commit); }
+        if result.is_err() {
+            let _ = self.drop_commit(&commit);
+        }
         result
     }
 
@@ -1007,7 +1082,11 @@ impl KiCadIpcClient {
                 let start = track.start.as_ref();
                 let end = track.end.as_ref();
                 tracks.push(IpcTrack {
-                    uuid: track.id.as_ref().map(|id| id.value.clone()).unwrap_or_default(),
+                    uuid: track
+                        .id
+                        .as_ref()
+                        .map(|id| id.value.clone())
+                        .unwrap_or_default(),
                     net_name: net_name.to_string(),
                     layer: layer_name.to_string(),
                     width: track
@@ -1045,15 +1124,25 @@ impl KiCadIpcClient {
             if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
                 let net_name = via.net.as_ref().map(|n| n.name.as_str()).unwrap_or("");
                 if let Some(nf) = net_filter {
-                    if net_name != nf { continue; }
+                    if net_name != nf {
+                        continue;
+                    }
                 }
                 let position = via.position.as_ref();
                 vias.push(IpcVia {
-                    uuid: via.id.as_ref().map(|id| id.value.clone()).unwrap_or_default(),
+                    uuid: via
+                        .id
+                        .as_ref()
+                        .map(|id| id.value.clone())
+                        .unwrap_or_default(),
                     net_name: net_name.to_string(),
                     position: IpcVector2 {
-                        x: position.map(|p| crate::builders::nm_to_mm(p.x_nm)).unwrap_or(0.0),
-                        y: position.map(|p| crate::builders::nm_to_mm(p.y_nm)).unwrap_or(0.0),
+                        x: position
+                            .map(|p| crate::builders::nm_to_mm(p.x_nm))
+                            .unwrap_or(0.0),
+                        y: position
+                            .map(|p| crate::builders::nm_to_mm(p.y_nm))
+                            .unwrap_or(0.0),
                     },
                 });
             }
@@ -1071,18 +1160,36 @@ impl KiCadIpcClient {
         let mut texts = Vec::new();
         for item in &items {
             if let Ok(board_text) = kiapi::board::types::BoardText::decode(item.value.as_slice()) {
-                let Some(text) = board_text.text.as_ref() else { continue; };
+                let Some(text) = board_text.text.as_ref() else {
+                    continue;
+                };
                 let layer = layer_enum_to_name(board_text.layer);
-                if let Some(tf) = text_filter { if text.text != tf { continue; } }
-                if let Some(lf) = layer_filter { if layer != lf { continue; } }
+                if let Some(tf) = text_filter {
+                    if text.text != tf {
+                        continue;
+                    }
+                }
+                if let Some(lf) = layer_filter {
+                    if layer != lf {
+                        continue;
+                    }
+                }
                 let position = text.position.as_ref();
                 texts.push(IpcBoardText {
-                    uuid: board_text.id.as_ref().map(|id| id.value.clone()).unwrap_or_default(),
+                    uuid: board_text
+                        .id
+                        .as_ref()
+                        .map(|id| id.value.clone())
+                        .unwrap_or_default(),
                     text: text.text.clone(),
                     layer: layer.to_string(),
                     position: IpcVector2 {
-                        x: position.map(|p| crate::builders::nm_to_mm(p.x_nm)).unwrap_or(0.0),
-                        y: position.map(|p| crate::builders::nm_to_mm(p.y_nm)).unwrap_or(0.0),
+                        x: position
+                            .map(|p| crate::builders::nm_to_mm(p.x_nm))
+                            .unwrap_or(0.0),
+                        y: position
+                            .map(|p| crate::builders::nm_to_mm(p.y_nm))
+                            .unwrap_or(0.0),
                     },
                 });
             }
@@ -1100,9 +1207,7 @@ impl KiCadIpcClient {
         // Find the footprint, update position, send UpdateItems
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
         for item in &items {
-            if let Ok(fp) =
-                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
-            {
+            if let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) {
                 let ref_text = fp
                     .reference_field
                     .as_ref()
@@ -1126,17 +1231,14 @@ impl KiCadIpcClient {
                     let dy_nm = crate::builders::mm_to_nm(y) - old_position.y_nm;
                     translate_footprint_definition(&mut update, dx_nm, dy_nm)?;
                     update.position = Some(crate::builders::vec2(x, y));
-                    let any = crate::builders::pack_any(
-                        &update,
-                        "kiapi.board.types.FootprintInstance",
-                    );
+                    let any =
+                        crate::builders::pack_any(&update, "kiapi.board.types.FootprintInstance");
                     let commit = self.begin_commit()?;
                     match self.update_items(vec![any]) {
                         Ok(()) => {
-                            if let Err(error) = self.push_commit(
-                                &commit,
-                                &format!("Move footprint {reference}"),
-                            ) {
+                            if let Err(error) =
+                                self.push_commit(&commit, &format!("Move footprint {reference}"))
+                            {
                                 let _ = self.drop_commit(&commit);
                                 return Err(error);
                             }
@@ -1157,9 +1259,7 @@ impl KiCadIpcClient {
     pub fn rotate_footprint(&self, reference: &str, angle: f64) -> Result<()> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
         for item in &items {
-            if let Ok(fp) =
-                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
-            {
+            if let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) {
                 let ref_text = fp
                     .reference_field
                     .as_ref()
@@ -1169,17 +1269,35 @@ impl KiCadIpcClient {
                     .unwrap_or("");
                 if ref_text == reference {
                     let mut update = fp.clone();
-                    let center = update.position.as_ref().ok_or_else(|| anyhow::anyhow!(
-                        "Footprint '{}' has no position", reference
-                    ))?.clone();
-                    let old_angle = update.orientation.as_ref().map(|a| a.value_degrees).unwrap_or(0.0);
-                    rotate_footprint_definition(&mut update, center.x_nm, center.y_nm, angle - old_angle)?;
-                    update.orientation = Some(kiapi::common::types::Angle { value_degrees: angle });
-                    let any = crate::builders::pack_any(&update, "kiapi.board.types.FootprintInstance");
+                    let center = update
+                        .position
+                        .as_ref()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Footprint '{}' has no position", reference)
+                        })?
+                        .clone();
+                    let old_angle = update
+                        .orientation
+                        .as_ref()
+                        .map(|a| a.value_degrees)
+                        .unwrap_or(0.0);
+                    rotate_footprint_definition(
+                        &mut update,
+                        center.x_nm,
+                        center.y_nm,
+                        angle - old_angle,
+                    )?;
+                    update.orientation = Some(kiapi::common::types::Angle {
+                        value_degrees: angle,
+                    });
+                    let any =
+                        crate::builders::pack_any(&update, "kiapi.board.types.FootprintInstance");
                     let commit = self.begin_commit()?;
                     match self.update_items(vec![any]) {
                         Ok(()) => {
-                            if let Err(error) = self.push_commit(&commit, &format!("Rotate footprint {reference}")) {
+                            if let Err(error) =
+                                self.push_commit(&commit, &format!("Rotate footprint {reference}"))
+                            {
                                 let _ = self.drop_commit(&commit);
                                 return Err(error);
                             }
@@ -1200,10 +1318,13 @@ impl KiCadIpcClient {
     pub fn get_footprint_pads(&self, reference: &str) -> Result<Vec<IpcFootprintPad>> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
         for item in &items {
-            let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) else {
+            let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
                 continue;
             };
-            let ref_text = fp.reference_field.as_ref()
+            let ref_text = fp
+                .reference_field
+                .as_ref()
                 .and_then(|f| f.text.as_ref())
                 .and_then(|t| t.text.as_ref())
                 .map(|t| t.text.as_str())
@@ -1219,7 +1340,9 @@ impl KiCadIpcClient {
                         continue;
                     }
                     let pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
-                    let Some(local) = pad.position.as_ref() else { continue };
+                    let Some(local) = pad.position.as_ref() else {
+                        continue;
+                    };
                     pads.push(IpcFootprintPad {
                         number: pad.number,
                         // GetItems currently supplies these in board coordinates.
@@ -1234,6 +1357,242 @@ impl KiCadIpcClient {
                 }
             }
             return Ok(pads);
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// Atomically reassign selected pads of one footprint to existing board nets.
+    ///
+    /// This updates only the nested Pad.net fields in the live footprint
+    /// instance. Footprint placement, graphics, pads, tracks, vias and zones are
+    /// otherwise preserved.
+    pub fn set_footprint_pad_nets(
+        &self,
+        reference: &str,
+        pad_nets: &[(String, String)],
+    ) -> Result<()> {
+        let resolved: std::collections::HashMap<&str, kiapi::board::types::Net> = pad_nets
+            .iter()
+            .map(|(pad_number, net_name)| {
+                Ok((
+                    pad_number.as_str(),
+                    kiapi::board::types::Net {
+                        code: Some(kiapi::board::types::NetCode {
+                            value: self.resolve_net_code(net_name)?,
+                        }),
+                        name: net_name.clone(),
+                    },
+                ))
+            })
+            .collect::<Result<_>>()?;
+
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in items {
+            let Ok(mut footprint) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let ref_text = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            if ref_text != reference {
+                continue;
+            }
+
+            let definition = footprint
+                .definition
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no definition", reference))?;
+            let mut changed = std::collections::HashSet::new();
+            for item in &mut definition.items {
+                if !item.type_url.ends_with("kiapi.board.types.Pad") {
+                    continue;
+                }
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+                let Some(net) = resolved.get(pad.number.as_str()) else {
+                    continue;
+                };
+                pad.net = Some(net.clone());
+                *item = crate::builders::pack_any(&pad, "kiapi.board.types.Pad");
+                changed.insert(pad.number);
+            }
+
+            let missing: Vec<_> = resolved
+                .keys()
+                .filter(|pad_number| !changed.contains(**pad_number))
+                .copied()
+                .collect();
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "Footprint '{}' does not contain requested pad(s): {}",
+                    reference,
+                    missing.join(", ")
+                );
+            }
+
+            let update =
+                crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+            let commit = self.begin_commit()?;
+            match self.update_items(vec![update]) {
+                Ok(()) => {
+                    if let Err(error) = self.push_commit(
+                        &commit,
+                        &format!("Reassign footprint pad nets for {reference}"),
+                    ) {
+                        let _ = self.drop_commit(&commit);
+                        return Err(error);
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    let _ = self.drop_commit(&commit);
+                    return Err(error);
+                }
+            }
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// Return the 3-D model transforms embedded in one live footprint instance.
+    pub fn get_footprint_3d_models(&self, reference: &str) -> Result<Vec<IpcFootprint3DModel>> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in items {
+            let Ok(footprint) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let ref_text = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            if ref_text != reference {
+                continue;
+            }
+            let definition = footprint
+                .definition
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no definition", reference))?;
+            let mut models = Vec::new();
+            for item in &definition.items {
+                if !item
+                    .type_url
+                    .ends_with("kiapi.board.types.Footprint3DModel")
+                {
+                    continue;
+                }
+                let model = kiapi::board::types::Footprint3DModel::decode(item.value.as_slice())?;
+                let scale = model.scale.unwrap_or_default();
+                let rotation = model.rotation.unwrap_or_default();
+                let offset = model.offset.unwrap_or_default();
+                models.push(IpcFootprint3DModel {
+                    filename: model.filename,
+                    scale: [scale.x_nm, scale.y_nm, scale.z_nm],
+                    rotation: [rotation.x_nm, rotation.y_nm, rotation.z_nm],
+                    // KiCad's Footprint3DModel reuses Vector3D but stores model
+                    // offsets directly in millimetres, despite the generated
+                    // protobuf field names ending in `_nm`.
+                    offset_mm: [offset.x_nm, offset.y_nm, offset.z_nm],
+                    visible: model.visible,
+                    opacity: model.opacity,
+                });
+            }
+            return Ok(models);
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// Update only one embedded 3-D model transform in a live footprint.
+    pub fn set_footprint_3d_model_transform(
+        &self,
+        reference: &str,
+        model_index: usize,
+        offset_mm: [f64; 3],
+        rotation: [f64; 3],
+    ) -> Result<()> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in items {
+            let Ok(mut footprint) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let ref_text = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            if ref_text != reference {
+                continue;
+            }
+            let definition = footprint
+                .definition
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no definition", reference))?;
+            let mut current_index = 0usize;
+            let mut changed = false;
+            for item in &mut definition.items {
+                if !item
+                    .type_url
+                    .ends_with("kiapi.board.types.Footprint3DModel")
+                {
+                    continue;
+                }
+                if current_index == model_index {
+                    let mut model =
+                        kiapi::board::types::Footprint3DModel::decode(item.value.as_slice())?;
+                    model.offset = Some(kiapi::common::types::Vector3D {
+                        x_nm: offset_mm[0],
+                        y_nm: offset_mm[1],
+                        z_nm: offset_mm[2],
+                    });
+                    model.rotation = Some(kiapi::common::types::Vector3D {
+                        x_nm: rotation[0],
+                        y_nm: rotation[1],
+                        z_nm: rotation[2],
+                    });
+                    *item = crate::builders::pack_any(&model, "kiapi.board.types.Footprint3DModel");
+                    changed = true;
+                    break;
+                }
+                current_index += 1;
+            }
+            if !changed {
+                anyhow::bail!(
+                    "Footprint '{}' does not contain 3-D model index {}",
+                    reference,
+                    model_index
+                );
+            }
+            let update =
+                crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+            let commit = self.begin_commit()?;
+            match self.update_items(vec![update]) {
+                Ok(()) => {
+                    if let Err(error) = self.push_commit(
+                        &commit,
+                        &format!("Update 3-D model transform for {reference}"),
+                    ) {
+                        let _ = self.drop_commit(&commit);
+                        return Err(error);
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    let _ = self.drop_commit(&commit);
+                    return Err(error);
+                }
+            }
         }
         anyhow::bail!("Footprint '{}' not found", reference)
     }
@@ -1514,30 +1873,74 @@ impl KiCadIpcClient {
 }
 
 fn point(v: &kiapi::common::types::Vector2) -> IpcVector2 {
-    IpcVector2 { x: nm_to_mm(v.x_nm), y: nm_to_mm(v.y_nm) }
+    IpcVector2 {
+        x: nm_to_mm(v.x_nm),
+        y: nm_to_mm(v.y_nm),
+    }
 }
 
 fn tessellate_arc(a: &kiapi::common::types::ArcStartMidEnd) -> Vec<IpcVector2> {
-    let (Some(s), Some(m), Some(e)) = (&a.start, &a.mid, &a.end) else { return vec![] };
-    let (x1,y1,x2,y2,x3,y3)=(s.x_nm as f64,s.y_nm as f64,m.x_nm as f64,m.y_nm as f64,e.x_nm as f64,e.y_nm as f64);
-    let d=2.0*(x1*(y2-y3)+x2*(y3-y1)+x3*(y1-y2));
-    if d.abs() < 1.0 { return vec![point(s), point(m), point(e)]; }
-    let ux=((x1*x1+y1*y1)*(y2-y3)+(x2*x2+y2*y2)*(y3-y1)+(x3*x3+y3*y3)*(y1-y2))/d;
-    let uy=((x1*x1+y1*y1)*(x3-x2)+(x2*x2+y2*y2)*(x1-x3)+(x3*x3+y3*y3)*(x2-x1))/d;
-    let start=(y1-uy).atan2(x1-ux); let mid=(y2-uy).atan2(x2-ux); let end=(y3-uy).atan2(x3-ux);
-    let tau=std::f64::consts::TAU;
-    let ccw=(end-start).rem_euclid(tau);
-    let mid_ccw=(mid-start).rem_euclid(tau);
-    let sweep=if mid_ccw <= ccw { ccw } else { ccw-tau };
-    let radius=((x1-ux).powi(2)+(y1-uy).powi(2)).sqrt();
-    let steps=((sweep.abs()/std::f64::consts::FRAC_PI_2)*16.0).ceil().max(2.0) as usize;
-    let mut points:Vec<_>=(0..=steps).map(|i| { let t=start+sweep*i as f64/steps as f64; IpcVector2{x:(ux+radius*t.cos())/1e6,y:(uy+radius*t.sin())/1e6} }).collect();
+    let (Some(s), Some(m), Some(e)) = (&a.start, &a.mid, &a.end) else {
+        return vec![];
+    };
+    let (x1, y1, x2, y2, x3, y3) = (
+        s.x_nm as f64,
+        s.y_nm as f64,
+        m.x_nm as f64,
+        m.y_nm as f64,
+        e.x_nm as f64,
+        e.y_nm as f64,
+    );
+    let d = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
+    if d.abs() < 1.0 {
+        return vec![point(s), point(m), point(e)];
+    }
+    let ux = ((x1 * x1 + y1 * y1) * (y2 - y3)
+        + (x2 * x2 + y2 * y2) * (y3 - y1)
+        + (x3 * x3 + y3 * y3) * (y1 - y2))
+        / d;
+    let uy = ((x1 * x1 + y1 * y1) * (x3 - x2)
+        + (x2 * x2 + y2 * y2) * (x1 - x3)
+        + (x3 * x3 + y3 * y3) * (x2 - x1))
+        / d;
+    let start = (y1 - uy).atan2(x1 - ux);
+    let mid = (y2 - uy).atan2(x2 - ux);
+    let end = (y3 - uy).atan2(x3 - ux);
+    let tau = std::f64::consts::TAU;
+    let ccw = (end - start).rem_euclid(tau);
+    let mid_ccw = (mid - start).rem_euclid(tau);
+    let sweep = if mid_ccw <= ccw { ccw } else { ccw - tau };
+    let radius = ((x1 - ux).powi(2) + (y1 - uy).powi(2)).sqrt();
+    let steps = ((sweep.abs() / std::f64::consts::FRAC_PI_2) * 16.0)
+        .ceil()
+        .max(2.0) as usize;
+    let mut points: Vec<_> = (0..=steps)
+        .map(|i| {
+            let t = start + sweep * i as f64 / steps as f64;
+            IpcVector2 {
+                x: (ux + radius * t.cos()) / 1e6,
+                y: (uy + radius * t.sin()) / 1e6,
+            }
+        })
+        .collect();
     // Include exact cardinal extrema so the returned AABB remains exact rather
     // than being slightly smaller than the curve's true bounds.
-    for t in [0.0,std::f64::consts::FRAC_PI_2,std::f64::consts::PI,3.0*std::f64::consts::FRAC_PI_2] {
-        let delta=if sweep>=0.0 {(t-start).rem_euclid(tau)} else {-((start-t).rem_euclid(tau))};
-        if (sweep>=0.0 && delta<=sweep) || (sweep<0.0 && delta>=sweep) {
-            points.push(IpcVector2{x:(ux+radius*t.cos())/1e6,y:(uy+radius*t.sin())/1e6});
+    for t in [
+        0.0,
+        std::f64::consts::FRAC_PI_2,
+        std::f64::consts::PI,
+        3.0 * std::f64::consts::FRAC_PI_2,
+    ] {
+        let delta = if sweep >= 0.0 {
+            (t - start).rem_euclid(tau)
+        } else {
+            -((start - t).rem_euclid(tau))
+        };
+        if (sweep >= 0.0 && delta <= sweep) || (sweep < 0.0 && delta >= sweep) {
+            points.push(IpcVector2 {
+                x: (ux + radius * t.cos()) / 1e6,
+                y: (uy + radius * t.sin()) / 1e6,
+            });
         }
     }
     points
@@ -1545,32 +1948,110 @@ fn tessellate_arc(a: &kiapi::common::types::ArcStartMidEnd) -> Vec<IpcVector2> {
 
 fn polyline_points(line: &kiapi::common::types::PolyLine) -> Vec<IpcVector2> {
     use kiapi::common::types::poly_line_node::Geometry;
-    line.nodes.iter().flat_map(|n| match &n.geometry {
-        Some(Geometry::Point(v)) => vec![point(v)],
-        Some(Geometry::Arc(a)) => tessellate_arc(a),
-        None => vec![],
-    }).collect()
+    line.nodes
+        .iter()
+        .flat_map(|n| match &n.geometry {
+            Some(Geometry::Point(v)) => vec![point(v)],
+            Some(Geometry::Arc(a)) => tessellate_arc(a),
+            None => vec![],
+        })
+        .collect()
 }
 
-fn append_courtyard_shape(layer: &str, shape: &kiapi::common::types::GraphicShape, out: &mut Vec<IpcCourtyardPrimitive>) {
+fn append_courtyard_shape(
+    layer: &str,
+    shape: &kiapi::common::types::GraphicShape,
+    out: &mut Vec<IpcCourtyardPrimitive>,
+) {
     use kiapi::common::types::graphic_shape::Geometry;
-    let mut push=|kind:&str, points:Vec<IpcVector2>| if !points.is_empty(){out.push(IpcCourtyardPrimitive{kind:kind.into(),layer:layer.into(),points})};
+    let mut push = |kind: &str, points: Vec<IpcVector2>| {
+        if !points.is_empty() {
+            out.push(IpcCourtyardPrimitive {
+                kind: kind.into(),
+                layer: layer.into(),
+                points,
+            })
+        }
+    };
     match &shape.geometry {
-        Some(Geometry::Segment(v)) => if let (Some(a),Some(b))=(&v.start,&v.end){push("segment",vec![point(a),point(b)])},
-        Some(Geometry::Rectangle(v)) => if let (Some(a),Some(b))=(&v.top_left,&v.bottom_right){let(a,b)=(point(a),point(b));push("rectangle",vec![IpcVector2{x:a.x,y:a.y},IpcVector2{x:b.x,y:a.y},IpcVector2{x:b.x,y:b.y},IpcVector2{x:a.x,y:b.y}])},
-        Some(Geometry::Arc(v)) => push("arc",tessellate_arc(&kiapi::common::types::ArcStartMidEnd{start:v.start.clone(),mid:v.mid.clone(),end:v.end.clone()})),
-        Some(Geometry::Circle(v)) => if let (Some(c),Some(rp))=(&v.center,&v.radius_point){let(c,rp)=(point(c),point(rp));let r=((rp.x-c.x).powi(2)+(rp.y-c.y).powi(2)).sqrt();push("circle",(0..64).map(|i|{let t=std::f64::consts::TAU*i as f64/64.0;IpcVector2{x:c.x+r*t.cos(),y:c.y+r*t.sin()}}).collect())},
-        Some(Geometry::Polygon(v)) => for p in &v.polygons { if let Some(line)=&p.outline {push("polygon",polyline_points(line))} },
-        Some(Geometry::Bezier(v)) => { let pts=[&v.start,&v.control1,&v.control2,&v.end].into_iter().filter_map(|p|p.as_ref()).map(point).collect();push("bezier",pts) },
+        Some(Geometry::Segment(v)) => {
+            if let (Some(a), Some(b)) = (&v.start, &v.end) {
+                push("segment", vec![point(a), point(b)])
+            }
+        }
+        Some(Geometry::Rectangle(v)) => {
+            if let (Some(a), Some(b)) = (&v.top_left, &v.bottom_right) {
+                let (a, b) = (point(a), point(b));
+                push(
+                    "rectangle",
+                    vec![
+                        IpcVector2 { x: a.x, y: a.y },
+                        IpcVector2 { x: b.x, y: a.y },
+                        IpcVector2 { x: b.x, y: b.y },
+                        IpcVector2 { x: a.x, y: b.y },
+                    ],
+                )
+            }
+        }
+        Some(Geometry::Arc(v)) => push(
+            "arc",
+            tessellate_arc(&kiapi::common::types::ArcStartMidEnd {
+                start: v.start.clone(),
+                mid: v.mid.clone(),
+                end: v.end.clone(),
+            }),
+        ),
+        Some(Geometry::Circle(v)) => {
+            if let (Some(c), Some(rp)) = (&v.center, &v.radius_point) {
+                let (c, rp) = (point(c), point(rp));
+                let r = ((rp.x - c.x).powi(2) + (rp.y - c.y).powi(2)).sqrt();
+                push(
+                    "circle",
+                    (0..64)
+                        .map(|i| {
+                            let t = std::f64::consts::TAU * i as f64 / 64.0;
+                            IpcVector2 {
+                                x: c.x + r * t.cos(),
+                                y: c.y + r * t.sin(),
+                            }
+                        })
+                        .collect(),
+                )
+            }
+        }
+        Some(Geometry::Polygon(v)) => {
+            for p in &v.polygons {
+                if let Some(line) = &p.outline {
+                    push("polygon", polyline_points(line))
+                }
+            }
+        }
+        Some(Geometry::Bezier(v)) => {
+            let pts = [&v.start, &v.control1, &v.control2, &v.end]
+                .into_iter()
+                .filter_map(|p| p.as_ref())
+                .map(point)
+                .collect();
+            push("bezier", pts)
+        }
         None => {}
     }
 }
 
-fn bounds_for_primitives(items:&[IpcCourtyardPrimitive])->Option<IpcBounds>{
-    let mut it=items.iter().flat_map(|p|p.points.iter()); let first=it.next()?;
-    let(mut minx,mut miny,mut maxx,mut maxy)=(first.x,first.y,first.x,first.y);
-    for p in it {minx=minx.min(p.x);miny=miny.min(p.y);maxx=maxx.max(p.x);maxy=maxy.max(p.y)}
-    Some(IpcBounds{min:IpcVector2{x:minx,y:miny},max:IpcVector2{x:maxx,y:maxy}})
+fn bounds_for_primitives(items: &[IpcCourtyardPrimitive]) -> Option<IpcBounds> {
+    let mut it = items.iter().flat_map(|p| p.points.iter());
+    let first = it.next()?;
+    let (mut minx, mut miny, mut maxx, mut maxy) = (first.x, first.y, first.x, first.y);
+    for p in it {
+        minx = minx.min(p.x);
+        miny = miny.min(p.y);
+        maxx = maxx.max(p.x);
+        maxy = maxy.max(p.y)
+    }
+    Some(IpcBounds {
+        min: IpcVector2 { x: minx, y: miny },
+        max: IpcVector2 { x: maxx, y: maxy },
+    })
 }
 
 #[cfg(test)]
@@ -1578,11 +2059,30 @@ mod courtyard_geometry_tests {
     use super::*;
     #[test]
     fn absolute_rectangle_bounds_are_not_transformed_again() {
-        use kiapi::common::types::{graphic_shape::Geometry,GraphicRectangleAttributes,GraphicShape,Vector2};
-        let shape=GraphicShape{geometry:Some(Geometry::Rectangle(GraphicRectangleAttributes{top_left:Some(Vector2{x_nm:10_000_000,y_nm:20_000_000}),bottom_right:Some(Vector2{x_nm:14_000_000,y_nm:23_000_000}),corner_radius:None})),..Default::default()};
-        let mut primitives=vec![]; append_courtyard_shape("F.CrtYd",&shape,&mut primitives);
-        let bounds=bounds_for_primitives(&primitives).unwrap();
-        assert_eq!((bounds.min.x,bounds.min.y,bounds.max.x,bounds.max.y),(10.0,20.0,14.0,23.0));
+        use kiapi::common::types::{
+            graphic_shape::Geometry, GraphicRectangleAttributes, GraphicShape, Vector2,
+        };
+        let shape = GraphicShape {
+            geometry: Some(Geometry::Rectangle(GraphicRectangleAttributes {
+                top_left: Some(Vector2 {
+                    x_nm: 10_000_000,
+                    y_nm: 20_000_000,
+                }),
+                bottom_right: Some(Vector2 {
+                    x_nm: 14_000_000,
+                    y_nm: 23_000_000,
+                }),
+                corner_radius: None,
+            })),
+            ..Default::default()
+        };
+        let mut primitives = vec![];
+        append_courtyard_shape("F.CrtYd", &shape, &mut primitives);
+        let bounds = bounds_for_primitives(&primitives).unwrap();
+        assert_eq!(
+            (bounds.min.x, bounds.min.y, bounds.max.x, bounds.max.y),
+            (10.0, 20.0, 14.0, 23.0)
+        );
     }
 }
 
@@ -1594,7 +2094,12 @@ mod footprint_transform_tests {
     #[test]
     fn absolute_definition_pad_tracks_translation() {
         let mut fp = footprint_with_absolute_pad(45.0, 40.0, 43.8625, 39.05);
-        translate_footprint_definition(&mut fp, crate::builders::mm_to_nm(2.0), crate::builders::mm_to_nm(-3.5)).unwrap();
+        translate_footprint_definition(
+            &mut fp,
+            crate::builders::mm_to_nm(2.0),
+            crate::builders::mm_to_nm(-3.5),
+        )
+        .unwrap();
         let pad = first_pad(&fp);
         let p = pad.position.unwrap();
         assert!((crate::builders::nm_to_mm(p.x_nm) - 45.8625).abs() < 1e-9);
@@ -1609,13 +2114,19 @@ mod footprint_transform_tests {
             crate::builders::mm_to_nm(45.0),
             crate::builders::mm_to_nm(40.0),
             90.0,
-        ).unwrap();
+        )
+        .unwrap();
         let p = first_pad(&fp).position.unwrap();
         assert!((crate::builders::nm_to_mm(p.x_nm) - 46.0).abs() < 1e-9);
         assert!((crate::builders::nm_to_mm(p.y_nm) - 38.0).abs() < 1e-9);
     }
 
-    fn footprint_with_absolute_pad(fp_x: f64, fp_y: f64, pad_x: f64, pad_y: f64) -> kiapi::board::types::FootprintInstance {
+    fn footprint_with_absolute_pad(
+        fp_x: f64,
+        fp_y: f64,
+        pad_x: f64,
+        pad_y: f64,
+    ) -> kiapi::board::types::FootprintInstance {
         let pad = kiapi::board::types::Pad {
             position: Some(crate::builders::vec2(pad_x, pad_y)),
             ..Default::default()
@@ -1639,7 +2150,12 @@ mod footprint_transform_tests {
     }
 }
 
-fn rotate_vector(vector: &mut Option<kiapi::common::types::Vector2>, cx: i64, cy: i64, degrees: f64) {
+fn rotate_vector(
+    vector: &mut Option<kiapi::common::types::Vector2>,
+    cx: i64,
+    cy: i64,
+    degrees: f64,
+) {
     if let Some(point) = vector {
         let radians = degrees.to_radians();
         let (sin, cos) = radians.sin_cos();
@@ -1655,65 +2171,137 @@ fn rotate_polyline(line: &mut kiapi::common::types::PolyLine, cx: i64, cy: i64, 
     for node in &mut line.nodes {
         match &mut node.geometry {
             Some(Geometry::Point(point)) => {
-                let mut p = Some(point.clone()); rotate_vector(&mut p, cx, cy, degrees); *point = p.unwrap();
+                let mut p = Some(point.clone());
+                rotate_vector(&mut p, cx, cy, degrees);
+                *point = p.unwrap();
             }
             Some(Geometry::Arc(arc)) => {
-                rotate_vector(&mut arc.start,cx,cy,degrees); rotate_vector(&mut arc.mid,cx,cy,degrees); rotate_vector(&mut arc.end,cx,cy,degrees);
+                rotate_vector(&mut arc.start, cx, cy, degrees);
+                rotate_vector(&mut arc.mid, cx, cy, degrees);
+                rotate_vector(&mut arc.end, cx, cy, degrees);
             }
             None => {}
         }
     }
 }
 
-fn rotate_graphic_shape(shape: &mut kiapi::common::types::GraphicShape, cx: i64, cy: i64, degrees: f64) {
+fn rotate_graphic_shape(
+    shape: &mut kiapi::common::types::GraphicShape,
+    cx: i64,
+    cy: i64,
+    degrees: f64,
+) {
     use kiapi::common::types::graphic_shape::Geometry;
     match &mut shape.geometry {
-        Some(Geometry::Segment(v)) => { rotate_vector(&mut v.start,cx,cy,degrees); rotate_vector(&mut v.end,cx,cy,degrees); }
-        Some(Geometry::Rectangle(v)) => { rotate_vector(&mut v.top_left,cx,cy,degrees); rotate_vector(&mut v.bottom_right,cx,cy,degrees); }
-        Some(Geometry::Arc(v)) => { rotate_vector(&mut v.start,cx,cy,degrees); rotate_vector(&mut v.mid,cx,cy,degrees); rotate_vector(&mut v.end,cx,cy,degrees); }
-        Some(Geometry::Circle(v)) => { rotate_vector(&mut v.center,cx,cy,degrees); rotate_vector(&mut v.radius_point,cx,cy,degrees); }
-        Some(Geometry::Polygon(v)) => for polygon in &mut v.polygons { if let Some(line)=&mut polygon.outline { rotate_polyline(line,cx,cy,degrees); } for line in &mut polygon.holes { rotate_polyline(line,cx,cy,degrees); } },
-        Some(Geometry::Bezier(v)) => { rotate_vector(&mut v.start,cx,cy,degrees); rotate_vector(&mut v.control1,cx,cy,degrees); rotate_vector(&mut v.control2,cx,cy,degrees); rotate_vector(&mut v.end,cx,cy,degrees); }
+        Some(Geometry::Segment(v)) => {
+            rotate_vector(&mut v.start, cx, cy, degrees);
+            rotate_vector(&mut v.end, cx, cy, degrees);
+        }
+        Some(Geometry::Rectangle(v)) => {
+            rotate_vector(&mut v.top_left, cx, cy, degrees);
+            rotate_vector(&mut v.bottom_right, cx, cy, degrees);
+        }
+        Some(Geometry::Arc(v)) => {
+            rotate_vector(&mut v.start, cx, cy, degrees);
+            rotate_vector(&mut v.mid, cx, cy, degrees);
+            rotate_vector(&mut v.end, cx, cy, degrees);
+        }
+        Some(Geometry::Circle(v)) => {
+            rotate_vector(&mut v.center, cx, cy, degrees);
+            rotate_vector(&mut v.radius_point, cx, cy, degrees);
+        }
+        Some(Geometry::Polygon(v)) => {
+            for polygon in &mut v.polygons {
+                if let Some(line) = &mut polygon.outline {
+                    rotate_polyline(line, cx, cy, degrees);
+                }
+                for line in &mut polygon.holes {
+                    rotate_polyline(line, cx, cy, degrees);
+                }
+            }
+        }
+        Some(Geometry::Bezier(v)) => {
+            rotate_vector(&mut v.start, cx, cy, degrees);
+            rotate_vector(&mut v.control1, cx, cy, degrees);
+            rotate_vector(&mut v.control2, cx, cy, degrees);
+            rotate_vector(&mut v.end, cx, cy, degrees);
+        }
         None => {}
     }
 }
 
-fn rotate_field(field: &mut Option<kiapi::board::types::Field>, cx:i64, cy:i64, degrees:f64) {
-    if let Some(text)=field.as_mut().and_then(|f|f.text.as_mut()).and_then(|t|t.text.as_mut()) { rotate_vector(&mut text.position,cx,cy,degrees); }
+fn rotate_field(field: &mut Option<kiapi::board::types::Field>, cx: i64, cy: i64, degrees: f64) {
+    if let Some(text) = field
+        .as_mut()
+        .and_then(|f| f.text.as_mut())
+        .and_then(|t| t.text.as_mut())
+    {
+        rotate_vector(&mut text.position, cx, cy, degrees);
+    }
 }
 
-fn rotate_footprint_definition(footprint:&mut kiapi::board::types::FootprintInstance,cx:i64,cy:i64,degrees:f64)->Result<()> {
-    for field in [&mut footprint.reference_field,&mut footprint.value_field,&mut footprint.datasheet_field,&mut footprint.description_field] { rotate_field(field,cx,cy,degrees); }
-    let Some(definition)=footprint.definition.as_mut() else { return Ok(()); };
-    for field in [&mut definition.reference_field,&mut definition.value_field,&mut definition.datasheet_field,&mut definition.description_field] { rotate_field(field,cx,cy,degrees); }
+fn rotate_footprint_definition(
+    footprint: &mut kiapi::board::types::FootprintInstance,
+    cx: i64,
+    cy: i64,
+    degrees: f64,
+) -> Result<()> {
+    for field in [
+        &mut footprint.reference_field,
+        &mut footprint.value_field,
+        &mut footprint.datasheet_field,
+        &mut footprint.description_field,
+    ] {
+        rotate_field(field, cx, cy, degrees);
+    }
+    let Some(definition) = footprint.definition.as_mut() else {
+        return Ok(());
+    };
+    for field in [
+        &mut definition.reference_field,
+        &mut definition.value_field,
+        &mut definition.datasheet_field,
+        &mut definition.description_field,
+    ] {
+        rotate_field(field, cx, cy, degrees);
+    }
     for item in &mut definition.items {
-        if item.type_url.ends_with("kiapi.board.types.Pad") { let mut v=kiapi::board::types::Pad::decode(item.value.as_slice())?; rotate_vector(&mut v.position,cx,cy,degrees); item.value=v.encode_to_vec(); }
-        else if item.type_url.ends_with("kiapi.board.types.BoardGraphicShape") { let mut v=kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())?; if let Some(shape)=&mut v.shape { rotate_graphic_shape(shape,cx,cy,degrees); } item.value=v.encode_to_vec(); }
-        else if item.type_url.ends_with("kiapi.board.types.BoardText") { let mut v=kiapi::board::types::BoardText::decode(item.value.as_slice())?; if let Some(text)=&mut v.text { rotate_vector(&mut text.position,cx,cy,degrees); } item.value=v.encode_to_vec(); }
+        if item.type_url.ends_with("kiapi.board.types.Pad") {
+            let mut v = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+            rotate_vector(&mut v.position, cx, cy, degrees);
+            item.value = v.encode_to_vec();
+        } else if item
+            .type_url
+            .ends_with("kiapi.board.types.BoardGraphicShape")
+        {
+            let mut v = kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())?;
+            if let Some(shape) = &mut v.shape {
+                rotate_graphic_shape(shape, cx, cy, degrees);
+            }
+            item.value = v.encode_to_vec();
+        } else if item.type_url.ends_with("kiapi.board.types.BoardText") {
+            let mut v = kiapi::board::types::BoardText::decode(item.value.as_slice())?;
+            if let Some(text) = &mut v.text {
+                rotate_vector(&mut text.position, cx, cy, degrees);
+            }
+            item.value = v.encode_to_vec();
+        }
     }
     Ok(())
 }
 
-fn translate_vector(
-    vector: &mut Option<kiapi::common::types::Vector2>,
-    dx_nm: i64,
-    dy_nm: i64,
-) {
+fn translate_vector(vector: &mut Option<kiapi::common::types::Vector2>, dx_nm: i64, dy_nm: i64) {
     if let Some(vector) = vector {
         vector.x_nm += dx_nm;
         vector.y_nm += dy_nm;
     }
-
 }
 
 impl KiCadIpcClient {
     /// Add an NPTH mounting-hole footprint through a normal KiCad IPC commit.
     pub fn add_mounting_hole(&self, reference: &str, x: f64, y: f64, drill: f64) -> Result<()> {
         let footprint = crate::builders::build_mounting_hole(reference, x, y, drill);
-        let item = crate::builders::pack_any(
-            &footprint,
-            "kiapi.board.types.FootprintInstance",
-        );
+        let item = crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
         let commit = self.begin_commit()?;
         match self.create_items(vec![item]) {
             Ok(()) => self.push_commit(&commit, "Add mounting hole"),
@@ -1746,10 +2334,7 @@ impl KiCadIpcClient {
             document: Some(doc),
         };
         let response = self
-            .send_command(
-                &cmd,
-                "kiapi.common.commands.SaveDocumentToString",
-            )?
+            .send_command(&cmd, "kiapi.common.commands.SaveDocumentToString")?
             .ok_or_else(|| anyhow::anyhow!("SaveDocumentToString returned no response"))?;
         let response: kiapi::common::commands::SavedDocumentResponse = unpack_any(&response)?;
         Ok(response.contents)
@@ -1764,9 +2349,8 @@ impl KiCadIpcClient {
         via_drill: f64,
         via_diameter: f64,
     ) -> Result<()> {
-        let via_stack = crate::builders::build_via(
-            "", 0, 0.0, 0.0, via_drill, via_diameter,
-        ).pad_stack;
+        let via_stack =
+            crate::builders::build_via("", 0, 0.0, 0.0, via_drill, via_diameter).pad_stack;
         let netclass = kiapi::common::project::NetClass {
             name: name.to_string(),
             priority: None,
@@ -1801,7 +2385,9 @@ impl KiCadIpcClient {
             zone, CopperZoneSettings, IslandRemovalMode, Zone, ZoneConnectionSettings,
             ZoneConnectionStyle, ZoneFillMode, ZoneType,
         };
-        use kiapi::common::types::{poly_line_node, PolyLine, PolyLineNode, PolySet, PolygonWithHoles};
+        use kiapi::common::types::{
+            poly_line_node, PolyLine, PolyLineNode, PolySet, PolygonWithHoles,
+        };
         let code = self.resolve_net_code(net_name)?;
         let layer = crate::builders::layer_from_name(layer);
         if layer == kiapi::board::types::BoardLayer::BlUndefined {
@@ -1810,9 +2396,14 @@ impl KiCadIpcClient {
         let outline = PolySet {
             polygons: vec![PolygonWithHoles {
                 outline: Some(PolyLine {
-                    nodes: points.iter().map(|&(x, y)| PolyLineNode {
-                        geometry: Some(poly_line_node::Geometry::Point(crate::builders::vec2(x, y))),
-                    }).collect(),
+                    nodes: points
+                        .iter()
+                        .map(|&(x, y)| PolyLineNode {
+                            geometry: Some(poly_line_node::Geometry::Point(crate::builders::vec2(
+                                x, y,
+                            ))),
+                        })
+                        .collect(),
                     closed: true,
                 }),
                 holes: vec![],
@@ -1859,11 +2450,7 @@ impl KiCadIpcClient {
     }
 }
 
-fn translate_polyline(
-    line: &mut kiapi::common::types::PolyLine,
-    dx_nm: i64,
-    dy_nm: i64,
-) {
+fn translate_polyline(line: &mut kiapi::common::types::PolyLine, dx_nm: i64, dy_nm: i64) {
     use kiapi::common::types::poly_line_node::Geometry;
     for node in &mut line.nodes {
         match &mut node.geometry {
@@ -1881,11 +2468,7 @@ fn translate_polyline(
     }
 }
 
-fn translate_graphic_shape(
-    shape: &mut kiapi::common::types::GraphicShape,
-    dx_nm: i64,
-    dy_nm: i64,
-) {
+fn translate_graphic_shape(shape: &mut kiapi::common::types::GraphicShape, dx_nm: i64, dy_nm: i64) {
     use kiapi::common::types::graphic_shape::Geometry;
     match &mut shape.geometry {
         Some(Geometry::Segment(segment)) => {
@@ -1925,11 +2508,7 @@ fn translate_graphic_shape(
     }
 }
 
-fn translate_field(
-    field: &mut Option<kiapi::board::types::Field>,
-    dx_nm: i64,
-    dy_nm: i64,
-) {
+fn translate_field(field: &mut Option<kiapi::board::types::Field>, dx_nm: i64, dy_nm: i64) {
     if let Some(text) = field
         .as_mut()
         .and_then(|field| field.text.as_mut())
@@ -1968,7 +2547,10 @@ fn translate_footprint_definition(
             let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
             translate_vector(&mut pad.position, dx_nm, dy_nm);
             item.value = pad.encode_to_vec();
-        } else if item.type_url.ends_with("kiapi.board.types.BoardGraphicShape") {
+        } else if item
+            .type_url
+            .ends_with("kiapi.board.types.BoardGraphicShape")
+        {
             let mut graphic =
                 kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())?;
             if let Some(shape) = &mut graphic.shape {

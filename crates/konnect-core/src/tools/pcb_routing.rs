@@ -12,7 +12,11 @@ use serde_json::json;
 
 // ─── IPC helper ───────────────────────────────────────────────────────────────
 
-async fn with_ipc<T, F>(client: KiCadIpcClient, board: std::path::PathBuf, f: F) -> anyhow::Result<Result<T, String>>
+async fn with_ipc<T, F>(
+    client: KiCadIpcClient,
+    board: std::path::PathBuf,
+    f: F,
+) -> anyhow::Result<Result<T, String>>
 where
     T: Send + 'static,
     F: FnOnce(&KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
@@ -20,7 +24,9 @@ where
     match tokio::task::spawn_blocking(move || {
         let client = client.bind_board(board)?;
         f(&client)
-    }).await {
+    })
+    .await
+    {
         Ok(Ok(r)) => Ok(Ok(r)),
         Ok(Err(e)) => Ok(Err(e.to_string())),
         Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
@@ -531,11 +537,15 @@ async fn handle_add_copper_pour(
     let pts_ipc = pts.clone();
     match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
         c.add_copper_zone(&net_ipc, &layer_ipc, clearance, min_w, &pts_ipc)
-    }).await? {
+    })
+    .await?
+    {
         Ok(()) => Ok(CallToolResult::json(&json!({
             "net": net_name, "layer": layer, "points": pts.len(), "source": "ipc"
         }))),
-        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC add_copper_pour failed: {reason}"))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC add_copper_pour failed: {reason}"
+        ))),
     }
 }
 
@@ -560,7 +570,9 @@ async fn handle_query_traces(
     let net = args["net_name"].as_str().map(String::from);
     let layer = args["layer"].as_str().map(String::from);
 
-    let tracks = ipc!(ctx, args, |c| { c.get_tracks(net.as_deref(), layer.as_deref()) });
+    let tracks = ipc!(ctx, args, |c| {
+        c.get_tracks(net.as_deref(), layer.as_deref())
+    });
 
     let items: Vec<serde_json::Value> = tracks
         .iter()
@@ -598,10 +610,17 @@ async fn handle_query_vias(
 ) -> anyhow::Result<CallToolResult> {
     let net = args["net_name"].as_str().map(String::from);
     let vias = ipc!(ctx, args, |c| c.get_vias(net.as_deref()));
-    let items: Vec<serde_json::Value> = vias.iter().map(|v| json!({
-        "uuid": v.uuid, "net": v.net_name, "x": v.position.x, "y": v.position.y
-    })).collect();
-    Ok(CallToolResult::json(&json!({ "count": items.len(), "vias": items })))
+    let items: Vec<serde_json::Value> = vias
+        .iter()
+        .map(|v| {
+            json!({
+                "uuid": v.uuid, "net": v.net_name, "x": v.position.x, "y": v.position.y
+            })
+        })
+        .collect();
+    Ok(CallToolResult::json(
+        &json!({ "count": items.len(), "vias": items }),
+    ))
 }
 
 async fn handle_get_nets_list(
@@ -682,13 +701,17 @@ async fn handle_create_netclass(
     let name_ipc = name.clone();
     match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
         c.create_netclass(&name_ipc, clearance, trace_width, via_drill, via_diameter)
-    }).await? {
+    })
+    .await?
+    {
         Ok(()) => Ok(CallToolResult::json(&json!({
             "created_netclass": name, "clearance": clearance,
             "trace_width": trace_width, "via_drill": via_drill,
             "via_diameter": via_diameter, "source": "ipc"
         }))),
-        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC create_netclass failed: {reason}"))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC create_netclass failed: {reason}"
+        ))),
     }
 }
 

@@ -14,7 +14,11 @@ use super::cli;
 
 // ─── IPC helpers (mirrors pcb_board / pcb_components) ───────────────────────
 
-async fn with_ipc<T, F>(client: konnect_ipc::KiCadIpcClient, board: std::path::PathBuf, f: F) -> anyhow::Result<Result<T, String>>
+async fn with_ipc<T, F>(
+    client: konnect_ipc::KiCadIpcClient,
+    board: std::path::PathBuf,
+    f: F,
+) -> anyhow::Result<Result<T, String>>
 where
     T: Send + 'static,
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
@@ -648,10 +652,7 @@ async fn handle_get_drc_violations(
 
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
-        crate::tools::pcb_access::validate_artifact_path(
-            &board,
-            std::path::Path::new(out_path),
-        )?;
+        crate::tools::pcb_access::validate_artifact_path(&board, std::path::Path::new(out_path))?;
         let report = serde_json::to_string_pretty(&violations)?;
         tokio::fs::write(out_path, report).await?;
     }

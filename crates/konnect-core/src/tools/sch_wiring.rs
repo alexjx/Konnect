@@ -117,12 +117,29 @@ pub fn tools() -> Vec<ToolDef> {
                     "shape": {
                         "type": "string",
                         "description": "Shape for global/hierarchical labels (input/output/bidirectional/etc.)",
+                        "enum": ["input", "output", "bidirectional", "tri_state", "passive"],
                         "default": "input"
                     }
                 },
                 "required": ["schematic", "net", "x", "y"]
             }),
             |args, ctx| async move { handle_add_net_label(args, ctx).await }
+        ),
+        tool!(
+            "set_all_global_label_shapes",
+            "Set every global label in one schematic to a single shape while preserving UUIDs, positions, rotations, effects, names, and connectivity.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "shape": {
+                        "type": "string",
+                        "enum": ["input", "output", "bidirectional", "tri_state", "passive"]
+                    }
+                },
+                "required": ["schematic", "shape"]
+            }),
+            |args, ctx| async move { handle_set_all_global_label_shapes(args, ctx).await }
         ),
         tool!(
             "delete_schematic_net_label",
@@ -309,6 +326,24 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "pin_x", "pin_y", "net"]
             }),
             |args, ctx| async move { handle_connect_to_net(args, ctx).await }
+        ),
+        tool!(
+            "extend_schematic_label_stub",
+            "Move one existing label away from its connected pin and extend its single straight \
+             wire stub to the requested length. Preserves label UUID, type, shape, rotation, \
+             justification, and net name.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "net": { "type": "string" },
+                    "x": { "type": "number", "description": "Current label anchor X" },
+                    "y": { "type": "number", "description": "Current label anchor Y" },
+                    "stub_length": { "type": "number", "description": "New straight stub length in mm" }
+                },
+                "required": ["schematic", "net", "x", "y", "stub_length"]
+            }),
+            |args, ctx| async move { handle_extend_label_stub(args, ctx).await }
         ),
         tool!(
             "connect_pins",
@@ -673,6 +708,19 @@ async fn handle_add_net_label(
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
     let shape = opt_str(args, "shape").unwrap_or("input");
 
+    const VALID_LABEL_SHAPES: [&str; 5] =
+        ["input", "output", "bidirectional", "tri_state", "passive"];
+    if matches!(label_type, "global_label" | "hierarchical_label")
+        && !VALID_LABEL_SHAPES.contains(&shape)
+    {
+        return Ok(CallToolResult::error(format!(
+            "Invalid {} shape '{}'; expected one of: {}",
+            label_type,
+            shape,
+            VALID_LABEL_SHAPES.join(", ")
+        )));
+    }
+
     let mut sch = cse::Schematic::load(&sch_path)?;
 
     match label_type {
@@ -703,6 +751,77 @@ async fn handle_add_net_label(
     Ok(CallToolResult::json(
         &json!({ "added_label": net, "type": label_type, "x": x, "y": y }),
     ))
+}
+
+async fn handle_set_all_global_label_shapes(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let shape = match require_str(args, "shape") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    const VALID_LABEL_SHAPES: [&str; 5] =
+        ["input", "output", "bidirectional", "tri_state", "passive"];
+    if !VALID_LABEL_SHAPES.contains(&shape) {
+        return Ok(CallToolResult::error(format!(
+            "Invalid global label shape '{}'; expected one of: {}",
+            shape,
+            VALID_LABEL_SHAPES.join(", ")
+        )));
+    }
+
+    let content = std::fs::read_to_string(&sch_path)?;
+    let mut changed = Vec::new();
+    let mut edits = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(offset) = content[search_from..].find("(global_label ") {
+        let label_start = search_from + offset;
+        let next_start = content[label_start + 1..]
+            .find("(global_label ")
+            .map(|next| label_start + 1 + next)
+            .unwrap_or(content.len());
+        let block = &content[label_start..next_start];
+        let Some(shape_offset) = block.find("(shape ") else {
+            return Ok(CallToolResult::error(format!(
+                "Global label at byte {} has no shape node; refusing partial update",
+                label_start
+            )));
+        };
+        let value_start = label_start + shape_offset + "(shape ".len();
+        let Some(value_length) = content[value_start..].find(')') else {
+            return Ok(CallToolResult::error(format!(
+                "Global label shape at byte {} is not terminated",
+                value_start
+            )));
+        };
+        let value_end = value_start + value_length;
+        let old_shape = &content[value_start..value_end];
+        if old_shape != shape {
+            let net = block
+                .strip_prefix("(global_label \"")
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or("<unknown>");
+            changed.push(json!({
+                "net": net,
+                "old_shape": old_shape,
+                "new_shape": shape
+            }));
+            edits.push(SexpEdit::replace(value_start, value_end, shape));
+        }
+        search_from = next_start;
+    }
+    if !edits.is_empty() {
+        let new_content = apply_edits(content, edits);
+        write_atomic(&sch_path, &new_content)?;
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "shape": shape,
+        "changed_count": changed.len(),
+        "changed": changed
+    })))
 }
 
 async fn handle_delete_net_label(
@@ -1098,9 +1217,30 @@ async fn handle_delete_no_connect(
     };
 
     let content = std::fs::read_to_string(&sch_path)?;
-    let search = format!("(no_connect (at {x} {y})");
-    let pos = match content.find(&search) {
-        Some(p) => p,
+    let mut search_from = 0usize;
+    let mut found = None;
+    while let Some(offset) = content[search_from..].find("(no_connect") {
+        let pos = search_from + offset;
+        let block = &content[pos..];
+        if let Some(at_pos) = block.find("(at ") {
+            let values = &block[at_pos + 4..];
+            let parts: Vec<&str> = values
+                .split([' ', ')', '\n', '\r', '\t'])
+                .filter(|v| !v.is_empty())
+                .collect();
+            if parts.len() >= 2 {
+                let nx = parts[0].parse::<f64>().unwrap_or(f64::NAN);
+                let ny = parts[1].parse::<f64>().unwrap_or(f64::NAN);
+                if (nx - x).abs() < 0.01 && (ny - y).abs() < 0.01 {
+                    found = Some(pos);
+                    break;
+                }
+            }
+        }
+        search_from = pos + "(no_connect".len();
+    }
+    let pos = match found {
+        Some(pos) => pos,
         None => {
             return Ok(CallToolResult::error(
                 "No-connect not found at that position",
@@ -1196,11 +1336,32 @@ async fn handle_connect_to_net(
     // Compute label endpoint and label rotation based on direction.
     // Label rotation follows KiCAD convention: 0° = text reads left-to-right,
     // label anchor is at the wire connection end.
-    let (label_x, label_y, label_rot) = match direction {
+    let (label_x, label_y, label_rot): (f64, f64, f64) = match direction {
         "left" => (pin_x - stub_length, pin_y, 180.0),
         "up" => (pin_x, pin_y - stub_length, 90.0),
         "down" => (pin_x, pin_y + stub_length, 270.0),
         _ => (pin_x + stub_length, pin_y, 0.0), // "right" default
+    };
+    let label_effects = || {
+        // Rotation alone is insufficient in KiCad: 180/270 degree labels
+        // also need right justification or their text grows back across the
+        // wire and into the symbol connection envelope.
+        let justify = if label_rot.rem_euclid(360.0) >= 180.0 {
+            "right"
+        } else {
+            "left"
+        };
+        cse::types::Effects(cse::sexp::SexpNode::List(vec![
+            cse::sexp::atom("effects"),
+            cse::sexp::tagged(
+                "font",
+                vec![cse::sexp::tagged(
+                    "size",
+                    vec![cse::sexp::atom("1.27"), cse::sexp::atom("1.27")],
+                )],
+            ),
+            cse::sexp::tagged("justify", vec![cse::sexp::atom(justify)]),
+        ]))
     };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
@@ -1229,11 +1390,13 @@ async fn handle_connect_to_net(
             let idx = sch.global_labels.len() - 1;
             if let Some(gl) = sch.global_labels.get_mut(idx) {
                 gl.at.rotation = Some(label_rot);
+                gl.effects = Some(label_effects());
             }
         }
         _ => {
             let label = sch.add_label(&net, label_x, label_y);
             label.at.rotation = Some(label_rot);
+            label.effects = Some(label_effects());
         }
     }
 
@@ -1244,6 +1407,144 @@ async fn handle_connect_to_net(
         "direction": direction,
         "wire": { "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y },
         "label": { "x": label_x, "y": label_y, "rotation": label_rot }
+    })))
+}
+
+async fn handle_extend_label_stub(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let net = match require_str(args, "net") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let x = match require_f64(args, "x") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let y = match require_f64(args, "y") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let stub_length = match require_f64(args, "stub_length") {
+        Ok(value) if value > 0.0 => value,
+        Ok(_) => return Ok(CallToolResult::error("stub_length must be positive")),
+        Err(error) => return Ok(error),
+    };
+    let matches_position = |px: f64, py: f64| (px - x).abs() < 0.01 && (py - y).abs() < 0.01;
+    let mut schematic = cse::Schematic::load(&sch_path)?;
+
+    let mut selected: Option<(&'static str, String)> = None;
+    for label in schematic.labels.iter() {
+        if label.text == net && matches_position(label.at.x, label.at.y) {
+            selected = Some(("NetLabel", label.uuid.clone()));
+            break;
+        }
+    }
+    if selected.is_none() {
+        for label in schematic.global_labels.iter() {
+            if label.text == net && matches_position(label.at.x, label.at.y) {
+                selected = Some(("GlobalLabel", label.uuid.clone()));
+                break;
+            }
+        }
+    }
+    if selected.is_none() {
+        for label in schematic.hierarchical_labels.iter() {
+            if label.text == net && matches_position(label.at.x, label.at.y) {
+                selected = Some(("HierarchicalLabel", label.uuid.clone()));
+                break;
+            }
+        }
+    }
+    let Some((label_type, label_uuid)) = selected else {
+        return Ok(CallToolResult::error(format!(
+            "Label '{}' not found at ({}, {})",
+            net, x, y
+        )));
+    };
+
+    let touching: Vec<usize> = schematic
+        .wires
+        .iter()
+        .enumerate()
+        .filter(|(_, wire)| {
+            matches_position(wire.start.0, wire.start.1) || matches_position(wire.end.0, wire.end.1)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if touching.len() != 1 {
+        return Ok(CallToolResult::error(format!(
+            "Label '{}' at ({}, {}) must touch exactly one wire endpoint; found {}",
+            net,
+            x,
+            y,
+            touching.len()
+        )));
+    }
+    let wire_index = touching[0];
+    let wire = schematic
+        .wires
+        .get(wire_index)
+        .expect("validated wire index");
+    let label_is_start = matches_position(wire.start.0, wire.start.1);
+    let pin = if label_is_start { wire.end } else { wire.start };
+    let dx = x - pin.0;
+    let dy = y - pin.1;
+    let axis_tolerance = 0.01;
+    let (new_x, new_y) = if dy.abs() < axis_tolerance && dx.abs() >= axis_tolerance {
+        (pin.0 + dx.signum() * stub_length, pin.1)
+    } else if dx.abs() < axis_tolerance && dy.abs() >= axis_tolerance {
+        (pin.0, pin.1 + dy.signum() * stub_length)
+    } else {
+        return Ok(CallToolResult::error(format!(
+            "Label '{}' is not attached by one straight horizontal or vertical stub",
+            net
+        )));
+    };
+
+    let wire = schematic
+        .wires
+        .get_mut(wire_index)
+        .expect("validated wire index");
+    if label_is_start {
+        wire.start = (new_x, new_y);
+    } else {
+        wire.end = (new_x, new_y);
+    }
+    let offset_x = new_x - x;
+    let offset_y = new_y - y;
+    match label_type {
+        "NetLabel" => schematic
+            .labels
+            .iter_mut()
+            .find(|label| label.uuid == label_uuid)
+            .expect("selected label exists")
+            .translate(offset_x, offset_y),
+        "GlobalLabel" => schematic
+            .global_labels
+            .iter_mut()
+            .find(|label| label.uuid == label_uuid)
+            .expect("selected label exists")
+            .translate(offset_x, offset_y),
+        _ => schematic
+            .hierarchical_labels
+            .iter_mut()
+            .find(|label| label.uuid == label_uuid)
+            .expect("selected label exists")
+            .translate(offset_x, offset_y),
+    }
+    schematic.overwrite()?;
+
+    Ok(CallToolResult::json(&json!({
+        "net": net,
+        "type": label_type,
+        "uuid": label_uuid,
+        "old_anchor": {"x": x, "y": y},
+        "new_anchor": {"x": new_x, "y": new_y},
+        "pin_endpoint": {"x": pin.0, "y": pin.1},
+        "stub_length": stub_length
     })))
 }
 

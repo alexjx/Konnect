@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::sexp::{atom, qstr, tagged, SexpNode};
-use crate::types::{At, Property};
+use crate::types::{fmt_f64, At, Property};
 
 fn bool_kw(v: bool) -> &'static str {
     if v {
@@ -267,6 +267,35 @@ impl Symbol {
     pub fn translate(&mut self, dx: f64, dy: f64) {
         self.at.x += dx;
         self.at.y += dy;
+        // KiCad stores symbol field anchors in absolute schematic coordinates.
+        // Moving only the symbol origin leaves Reference/Value behind, so move
+        // every property `(at X Y [rotation])` by the same offset.
+        for property in &mut self.properties {
+            for node in &mut property.sub_nodes {
+                if node.tag() != Some("at") {
+                    continue;
+                }
+                let SexpNode::List(children) = node else {
+                    continue;
+                };
+                let Some(x) = children
+                    .get(1)
+                    .and_then(SexpNode::text)
+                    .and_then(|v| v.parse::<f64>().ok())
+                else {
+                    continue;
+                };
+                let Some(y) = children
+                    .get(2)
+                    .and_then(SexpNode::text)
+                    .and_then(|v| v.parse::<f64>().ok())
+                else {
+                    continue;
+                };
+                children[1] = atom(fmt_f64(x + dx));
+                children[2] = atom(fmt_f64(y + dy));
+            }
+        }
     }
 
     pub fn set_rotation(&mut self, rot: f64) {
@@ -446,4 +475,27 @@ impl<'a> IntoIterator for &'a mut SymbolCollection {
 fn dist(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
     let (dx, dy) = (ax - bx, ay - by);
     (dx * dx + dy * dy).sqrt()
+}
+
+#[cfg(test)]
+mod translate_tests {
+    use super::*;
+
+    #[test]
+    fn translating_symbol_also_translates_absolute_property_anchors() {
+        let mut symbol = Symbol::new("Device:R", 10.0, 20.0);
+        let mut reference = Property::new("Reference", "R1");
+        reference
+            .sub_nodes
+            .push(tagged("at", vec![atom("11"), atom("18"), atom("0")]));
+        symbol.properties.push(reference);
+
+        symbol.translate(2.54, -1.27);
+
+        assert_eq!(symbol.position(), (12.54, 18.73));
+        let at = symbol.properties[0].sub_nodes[0].children();
+        assert_eq!(at[1].text(), Some("13.54"));
+        assert_eq!(at[2].text(), Some("16.73"));
+        assert_eq!(at[3].text(), Some("0"));
+    }
 }

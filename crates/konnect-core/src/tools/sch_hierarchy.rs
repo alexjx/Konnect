@@ -56,6 +56,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "new_file": { "type": "string" },
                     "x": { "type": "number" }, "y": { "type": "number" },
                     "width": { "type": "number" }, "height": { "type": "number" },
+                    "sheet_name_x": { "type": "number", "description": "Explicit Sheetname field X position" },
+                    "sheet_name_y": { "type": "number", "description": "Explicit Sheetname field Y position" },
                     "project_name": { "type": "string", "description": "Default: ''" }
                 },
                 "required": ["schematic", "sheet_name"]
@@ -429,10 +431,41 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         sheet.set_size(w, h);
         changed.push("size");
     }
+    if let (Some(x), Some(y)) = (opt_f64(args, "sheet_name_x"), opt_f64(args, "sheet_name_y")) {
+        if let Some(property) = sheet
+            .properties
+            .iter_mut()
+            .find(|property| property.name == "Sheetname")
+        {
+            let rotation = property
+                .sub_nodes
+                .iter()
+                .find(|node| node.tag() == Some("at"))
+                .and_then(|node| node.scalar_args().get(2).cloned())
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let at = cse::sexp::SexpNode::List(vec![
+                cse::sexp::atom("at"),
+                cse::sexp::atom(cse::types::fmt_f64(x)),
+                cse::sexp::atom(cse::types::fmt_f64(y)),
+                cse::sexp::atom(cse::types::fmt_f64(rotation)),
+            ]);
+            if let Some(existing) = property
+                .sub_nodes
+                .iter_mut()
+                .find(|node| node.tag() == Some("at"))
+            {
+                *existing = at;
+            } else {
+                property.sub_nodes.insert(0, at);
+            }
+            changed.push("sheet_name_position");
+        }
+    }
 
     if changed.is_empty() {
         return Ok(CallToolResult::error(
-            "No fields to change — provide at least one of: new_name, new_file, x+y, width+height",
+            "No fields to change — provide at least one of: new_name, new_file, x+y, width+height, sheet_name_x+sheet_name_y",
         ));
     }
 
@@ -1199,7 +1232,7 @@ mod tests {
         .unwrap();
 
         let result = handle_edit_sheet(
-            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "new_name": "Renamed", "width": 100.0, "height": 60.0 }),
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "new_name": "Renamed", "width": 100.0, "height": 60.0, "sheet_name_x": 12.7, "sheet_name_y": 15.24 }),
             &ctx,
         )
         .await
@@ -1211,6 +1244,20 @@ mod tests {
         let renamed = parent.sheets.by_name("Renamed").unwrap();
         assert_eq!(renamed.width, 100.0);
         assert_eq!(renamed.height, 60.0);
+        let name_at = renamed
+            .properties
+            .iter()
+            .find(|property| property.name == "Sheetname")
+            .and_then(|property| {
+                property
+                    .sub_nodes
+                    .iter()
+                    .find(|node| node.tag() == Some("at"))
+            })
+            .map(|node| node.scalar_args())
+            .unwrap();
+        assert_eq!(name_at[0], "12.7");
+        assert_eq!(name_at[1], "15.24");
     }
 
     #[tokio::test]

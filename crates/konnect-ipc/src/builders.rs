@@ -135,9 +135,9 @@ pub fn build_mounting_hole(
     drill_mm: f64,
 ) -> kiapi::board::types::FootprintInstance {
     use kiapi::board::types::{
-        BoardLayer, DrillProperties, DrillShape, Field, FieldId, Footprint,
-        FootprintAttributes, FootprintInstance, Pad, PadStack, PadStackLayer,
-        PadStackShape, PadStackType, PadType, UnconnectedLayerRemoval,
+        BoardLayer, DrillProperties, DrillShape, Field, FieldId, Footprint, FootprintAttributes,
+        FootprintInstance, Pad, PadStack, PadStackLayer, PadStackShape, PadStackType, PadType,
+        UnconnectedLayerRemoval,
     };
     use kiapi::common::types::{Angle, LibraryIdentifier, LockedState, Text};
 

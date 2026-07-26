@@ -11,7 +11,7 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**185 tools across 18 on-demand toolsets.** Schematic capture, PCB layout and
+**170 exposed tools across 18 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, Freerouting, reference
 circuits, and a full manufacturing export pipeline. Two bundled Codex skills add
 datasheet-driven schematic, placement, routing, review, and fabrication workflows.

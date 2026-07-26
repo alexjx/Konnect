@@ -5,8 +5,8 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use crate::tools::pcb_access::ReadOnlyBoardFile;
+use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use konnect_ipc::builders;
 use konnect_sexp::{parser::parse_sexp, writer::new_uuid};
 use serde_json::json;
@@ -32,7 +32,11 @@ fn rect_outline_items(x1: f64, y1: f64, x2: f64, y2: f64, w: f64) -> Vec<prost_t
 
 // ─── IPC helper ───────────────────────────────────────────────────────────────
 
-async fn with_ipc<T, F>(client: konnect_ipc::KiCadIpcClient, board: std::path::PathBuf, f: F) -> anyhow::Result<Result<T, String>>
+async fn with_ipc<T, F>(
+    client: konnect_ipc::KiCadIpcClient,
+    board: std::path::PathBuf,
+    f: F,
+) -> anyhow::Result<Result<T, String>>
 where
     T: Send + 'static,
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
@@ -365,13 +369,17 @@ async fn handle_set_board_size(
 
     match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
         c.replace_board_outline(ox, oy, x2, y2, 0.0, w)
-    }).await? {
+    })
+    .await?
+    {
         Ok(()) => Ok(CallToolResult::json(&json!({
             "width": width, "height": height,
             "x1": ox, "y1": oy, "x2": x2, "y2": y2,
             "source": "ipc"
         }))),
-        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC set_board_size failed: {reason}"))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC set_board_size failed: {reason}"
+        ))),
     }
 }
 
@@ -439,7 +447,11 @@ async fn handle_get_board_extents(
     let board_path = get_path(args, "board")?;
 
     // Try IPC first; fall through to file-based computation on error
-    if let Ok(ext) = with_ipc(ctx.ipc.clone(), board_path.clone(), |c| c.get_board_extents()).await? {
+    if let Ok(ext) = with_ipc(ctx.ipc.clone(), board_path.clone(), |c| {
+        c.get_board_extents()
+    })
+    .await?
+    {
         return Ok(CallToolResult::json(&json!({
             "x_min": ext.min.x, "y_min": ext.min.y,
             "x_max": ext.max.x, "y_max": ext.max.y,
@@ -558,9 +570,17 @@ async fn handle_set_active_layer(
     };
 
     let layer_ipc = layer.clone();
-    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| c.set_active_layer(&layer_ipc)).await? {
-        Ok(()) => Ok(CallToolResult::json(&json!({ "active_layer": layer, "source": "ipc" }))),
-        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC set_active_layer failed: {reason}"))),
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
+        c.set_active_layer(&layer_ipc)
+    })
+    .await?
+    {
+        Ok(()) => Ok(CallToolResult::json(
+            &json!({ "active_layer": layer, "source": "ipc" }),
+        )),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC set_active_layer failed: {reason}"
+        ))),
     }
 }
 
@@ -592,14 +612,18 @@ async fn handle_add_board_outline(
     // and on-disk document remain consistent.
     match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
         c.replace_board_outline(x1, y1, x2, y2, corner_radius, w)
-    }).await? {
+    })
+    .await?
+    {
         Ok(()) => Ok(CallToolResult::json(&json!({
             "x1": x1, "y1": y1, "x2": x2, "y2": y2,
             "width": (x2-x1).abs(), "height": (y2-y1).abs(),
             "corner_radius": corner_radius,
             "source": "ipc"
         }))),
-        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC add_board_outline failed: {reason}"))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC add_board_outline failed: {reason}"
+        ))),
     }
 }
 
@@ -622,7 +646,8 @@ async fn handle_add_mounting_hole(
     let reference_ipc = reference.to_string();
     let ipc_result = with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
         c.add_mounting_hole(&reference_ipc, x, y, drill_d)
-    }).await?;
+    })
+    .await?;
     match ipc_result {
         Ok(()) => Ok(CallToolResult::json(&json!({
             "reference": reference, "x": x, "y": y,
@@ -662,12 +687,16 @@ async fn handle_add_board_text(
         let bt = builders::board_text(&layer_ipc, &text_ipc, x, y, size, rotation, false);
         let any = builders::pack_any(&bt, "kiapi.board.types.BoardText");
         c.create_items(vec![any])
-    }).await? {
+    })
+    .await?
+    {
         Ok(()) => Ok(CallToolResult::json(&json!({
             "text": text, "x": x, "y": y, "layer": layer, "size": size,
             "source": "ipc"
         }))),
-        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC add_board_text failed: {reason}"))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC add_board_text failed: {reason}"
+        ))),
     }
 }
 
@@ -680,7 +709,9 @@ async fn handle_query_board_texts(
     let layer_filter = args["layer"].as_str().map(String::from);
     match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
         c.get_board_texts(text_filter.as_deref(), layer_filter.as_deref())
-    }).await? {
+    })
+    .await?
+    {
         Ok(texts) => Ok(CallToolResult::json(&json!({
             "count": texts.len(),
             "texts": texts.iter().map(|t| json!({
@@ -688,7 +719,9 @@ async fn handle_query_board_texts(
                 "x": t.position.x, "y": t.position.y
             })).collect::<Vec<_>>()
         }))),
-        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC query_board_texts failed: {reason}"))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC query_board_texts failed: {reason}"
+        ))),
     }
 }
 
@@ -702,9 +735,15 @@ async fn handle_delete_board_text(
         Err(e) => return Ok(e),
     };
     let uuid_ipc = uuid.clone();
-    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| c.delete_board_text(&uuid_ipc)).await? {
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
+        c.delete_board_text(&uuid_ipc)
+    })
+    .await?
+    {
         Ok(()) => Ok(CallToolResult::json(&json!({ "deleted_uuid": uuid }))),
-        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC delete_board_text failed: {reason}"))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC delete_board_text failed: {reason}"
+        ))),
     }
 }
 
@@ -742,11 +781,15 @@ async fn handle_add_zone(
     let points_ipc = points.clone();
     match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
         c.add_copper_zone(&net_ipc, &layer_ipc, clearance, min_width, &points_ipc)
-    }).await? {
+    })
+    .await?
+    {
         Ok(()) => Ok(CallToolResult::json(&json!({
             "net": net_name, "layer": layer, "point_count": points.len(), "source": "ipc"
         }))),
-        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC add_zone failed: {reason}"))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC add_zone failed: {reason}"
+        ))),
     }
 }
 
@@ -782,14 +825,18 @@ async fn handle_import_svg_logo(
         let shape = builders::board_polygon(&layer_ipc, true, &placed_ipc);
         let any = builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape");
         c.create_items(vec![any])
-    }).await? {
+    })
+    .await?
+    {
         Ok(()) => Ok(CallToolResult::json(&json!({
             "polygon_count": placed.len(),
             "layer": layer,
             "width_mm": width_mm,
             "source": "ipc"
         }))),
-        Err(reason) => Ok(CallToolResult::error(format!("KiCad IPC import_svg_logo failed: {reason}"))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC import_svg_logo failed: {reason}"
+        ))),
     }
 }
 

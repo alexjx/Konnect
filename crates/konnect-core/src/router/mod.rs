@@ -193,6 +193,45 @@ mod tests {
     }
 
     #[test]
+    fn disabled_tools_are_implemented_but_not_exposed() {
+        let mut raw_owner = std::collections::HashMap::new();
+        for meta in registry::ALL_TOOLSETS {
+            for def in registry::raw_tools_for(meta.name).unwrap() {
+                raw_owner.insert(def.name, meta.name);
+            }
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for disabled in registry::DISABLED_TOOLS {
+            assert!(
+                seen.insert(disabled.name),
+                "disabled tool '{}' is listed more than once",
+                disabled.name
+            );
+            let owner = raw_owner.get(disabled.name).unwrap_or_else(|| {
+                panic!(
+                    "disabled tool '{}' has no retained implementation",
+                    disabled.name
+                )
+            });
+            assert!(
+                !disabled.reason.trim().is_empty(),
+                "disabled tool '{}' needs a reason",
+                disabled.name
+            );
+            assert!(
+                registry::tools_for(owner)
+                    .unwrap()
+                    .iter()
+                    .all(|def| def.name != disabled.name),
+                "disabled tool '{}' is still exposed by '{}'",
+                disabled.name,
+                owner
+            );
+        }
+    }
+
+    #[test]
     fn no_toolset_has_duplicate_tool_names() {
         for meta in registry::ALL_TOOLSETS {
             let defs = registry::tools_for(meta.name).unwrap();
@@ -270,7 +309,12 @@ mod tests {
             ("pcb_routing", include_str!("../tools/pcb_routing.rs")),
         ] {
             let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-            for forbidden in ["write_atomic(", "std::fs::write(", "tokio::fs::write(", "SexpEdit::"] {
+            for forbidden in [
+                "write_atomic(",
+                "std::fs::write(",
+                "tokio::fs::write(",
+                "SexpEdit::",
+            ] {
                 assert!(
                     !production.contains(forbidden),
                     "{name} reintroduced direct PCB project-file mutation via {forbidden}; use KiCad IPC instead"

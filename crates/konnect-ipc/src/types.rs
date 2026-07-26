@@ -56,6 +56,16 @@ pub struct IpcFootprintPad {
     pub net: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcFootprint3DModel {
+    pub filename: String,
+    pub scale: [f64; 3],
+    pub rotation: [f64; 3],
+    pub offset_mm: [f64; 3],
+    pub visible: bool,
+    pub opacity: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcFootprintText {
     pub reference: String,

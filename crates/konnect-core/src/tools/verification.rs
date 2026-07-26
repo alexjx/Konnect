@@ -186,10 +186,7 @@ async fn handle_run_drc(
 
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
-        crate::tools::pcb_access::validate_artifact_path(
-            &board,
-            std::path::Path::new(out_path),
-        )?;
+        crate::tools::pcb_access::validate_artifact_path(&board, std::path::Path::new(out_path))?;
         let report = serde_json::to_string_pretty(&violations)?;
         tokio::fs::write(out_path, report).await?;
     }
@@ -406,8 +403,8 @@ async fn handle_check_kicad_ui(
     // Try IPC ping
     let ipc = ctx.ipc.clone();
     let ipc_ok = task::spawn_blocking(move || ipc.ping().unwrap_or(false))
-    .await
-    .unwrap_or(false);
+        .await
+        .unwrap_or(false);
 
     Ok(CallToolResult::text(
         serde_json::to_string_pretty(&json!({
@@ -444,8 +441,8 @@ async fn handle_launch_kicad_ui(
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let ipc = ipc.clone();
                     let ok = task::spawn_blocking(move || ipc.ping().unwrap_or(false))
-                    .await
-                    .unwrap_or(false);
+                        .await
+                        .unwrap_or(false);
 
                     if ok {
                         return Ok(CallToolResult::text(

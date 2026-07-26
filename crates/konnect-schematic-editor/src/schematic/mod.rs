@@ -547,7 +547,10 @@ fn atomic_write(path: &Path, content: &str) -> crate::error::Result<()> {
     {
         return Err(crate::error::Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("schematic writes require a .kicad_sch path: {}", path.display()),
+            format!(
+                "schematic writes require a .kicad_sch path: {}",
+                path.display()
+            ),
         )));
     }
     let tmp_path = path.with_extension("kicad_sch.tmp");

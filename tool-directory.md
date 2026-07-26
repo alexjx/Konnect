@@ -10,7 +10,10 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **18 toolsets** organized into 10 categories
-- **185 registered tools** + **6 always-visible meta-tools** = **191 total**
+- **170 exposed workflow tools** + **6 always-visible meta-tools** = **176 total**
+- **36 retained implementations are temporarily hidden** by
+  `router/registry.rs::DISABLED_TOOLS`; removing an entry restores exposure
+  without restoring code.
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -36,10 +39,32 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ---
 
+## Temporarily hidden implementations
+
+These tools remain compiled but are excluded from `tools/list`, toolset loading,
+and dispatch. Reasons are recorded beside each entry in `DISABLED_TOOLS`.
+
+- **Inactive or unsupported:** `add_layer`, `edit_component`, `add_net`,
+  `assign_net_to_class`, `autoroute`, `check_freerouting`, `set_design_rules`,
+  `copy_routing_pattern`, `set_layer_constraints`.
+- **Superseded by skill-safe workflows:** `move_connected`, `move_region`,
+  `add_power_symbol`, `launch_kicad_ui`, `get_drc_violations`.
+- **Specialized, cosmetic, vendor-specific, or global-preference operations:**
+  `open_schematic_viewer`, `group_components`,
+  `repair_schematic_instance_paths`, `set_active_layer`, `add_board_text`,
+  `query_board_texts`, `delete_board_text`, `import_svg_logo`,
+  `add_footprint_courtyard_circle`, `export_dxf`, `export_gencad`,
+  `export_ipc2581`, `export_odb`, `delete_symbol`,
+  `download_jlcpcb_database`, `search_jlcpcb_parts`, `get_jlcpcb_part`,
+  `suggest_jlcpcb_alternatives`, `get_jlcpcb_database_stats`,
+  `enrich_datasheets`, `save_user_config`, `estimate_cost`.
+
+---
+
 ## Project
 
-### `project` · 6 tools
-**Purpose:** Create, open, save, snapshot KiCAD projects, and launch the live schematic viewer.
+### `project` ? 6 tools
+**Purpose:** Create, open, save, inspect, and snapshot KiCAD projects.
 **Source:** [`crates/konnect-core/src/tools/project.rs`](crates/konnect-core/src/tools/project.rs)
 
 | Tool | Description |
@@ -48,14 +73,14 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `open_project` | Check whether a KiCAD project is currently open in the running KiCAD UI. Returns the active project path and whether KiCAD IPC is available. |
 | `save_project` | Save the currently open PCB board file via KiCAD IPC. Requires KiCAD to be running with IPC enabled. |
 | `get_project_info` | Read project metadata from a `.kicad_pro` file. Returns name, schematic/PCB paths, last-modified times. |
+| `read_pcb_document` | Read the exact live PCB document from KiCad without writing or saving it. |
 | `snapshot_project` | Export the schematic and PCB to PDF as a timestamped snapshot/checkpoint. Useful before major edits. |
-| `open_schematic_viewer` | Launch the live schematic viewer (SVG with auto-refresh on file change). Use after placing components so the user can see changes in real time. |
 
 ---
 
 ## Schematic
 
-### `sch_components` · 17 tools
+### `sch_components` ? 17 tools
 **Purpose:** Add, edit, move, rotate, and delete schematic symbols.
 **Source:** [`crates/konnect-core/src/tools/sch_components.rs`](crates/konnect-core/src/tools/sch_components.rs)
 
@@ -69,18 +94,18 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `list_schematic_components` | List all symbol instances with positions, values, footprints, and pin locations. |
 | `move_schematic_component` | Move a symbol to a new position. Does NOT adjust connected wires. |
 | `rotate_schematic_component` | Rotate a symbol by setting its absolute rotation angle (0/90/180/270). |
-| `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
-| `move_region` | Move all symbols within a bounding box by a given offset. |
+| `set_schematic_component_mirror` | Set a symbol's horizontal or vertical mirror state. |
 | `annotate_schematic` | Run kicad-cli to auto-assign reference designators (`R?` → `R1`, `U?` → `U1`, etc.). |
 | `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on a symbol, accounting for rotation/mirroring. |
 | `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read. |
+| `get_schematic_symbol_bounds` | Return transformed symbol-body and field bounds for placement checks. |
+| `check_schematic_field_spacing` | Check visible field-to-body spacing against requested limits. |
 | `add_component_annotation` | Add a custom property (annotation) to a symbol instance. |
-| `group_components` | Add a group property to multiple components in the schematic. |
 | `replace_component` | Replace a component's `lib_id` with a new library symbol (swap the component type). |
 | `get_schematic_view` | Render the schematic to a PNG image (base64-encoded) via kicad-cli. |
 
-### `sch_wiring` · 19 tools
-**Purpose:** Wires, net labels, power symbols, junctions, no-connects, pin-to-pin connections.
+### `sch_wiring` ? 20 tools
+**Purpose:** Wires, net labels, junctions, no-connects, and pin-to-pin connections.
 **Source:** [`crates/konnect-core/src/tools/sch_wiring.rs`](crates/konnect-core/src/tools/sch_wiring.rs)
 
 | Tool | Description |
@@ -91,21 +116,22 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `batch_delete_schematic_wire` | Delete multiple wire segments in a single file read/write cycle. |
 | `split_wire_at_point` | Split a wire at a given point, creating two segments and a junction. |
 | `add_schematic_net_label` | Add a net label (`net_label`, `global_label`, or `hierarchical_label`). |
+| `set_all_global_label_shapes` | Normalize every global label to one electrical shape. |
 | `delete_schematic_net_label` | Delete a net label by net name and position. |
 | `rotate_schematic_label` | Rotate a net label to a new angle and update its justify direction. |
 | `move_labels_by_offset` | Move all labels matching a net name by a given X/Y offset. |
 | `batch_rotate_labels` | Rotate multiple labels by net name in a single file read/write cycle. |
-| `add_power_symbol` | Add a power symbol (VCC, GND, etc.). Auto-numbers the internal `#PWR` reference. |
 | `add_no_connect` | Add a no-connect flag (X marker) to an unconnected pin endpoint. |
 | `delete_no_connect` | Remove a no-connect flag at a given position. |
 | `batch_delete_no_connect` | Delete multiple no-connect flags in a single file read/write cycle. |
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle. |
 | `connect_to_net` | Connect a pin endpoint to a named net by adding a short wire stub + net label. |
+| `extend_schematic_label_stub` | Extend an existing label's straight wire stub while preserving label identity and orientation. |
 | `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. |
 | `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing). Use `connect_pins` if you have references instead of coordinates. |
 
-### `sch_analysis` · 15 tools
+### `sch_analysis` ? 16 tools
 **Purpose:** Net connectivity, pin queries, trace paths, overlap/orphan detection.
 **Source:** [`crates/konnect-core/src/tools/sch_analysis.rs`](crates/konnect-core/src/tools/sch_analysis.rs)
 
@@ -126,8 +152,9 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `find_single_pin_nets` | Find nets with only one label/connection — often indicates a missing counterpart. |
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
 | `check_schematic_overlaps` | Find overlapping symbols or labels that may indicate placement errors. |
+| `get_schematic_connection_islands` | Return connected-item envelopes and clearance conflicts for placement review. |
 
-### `sch_batch` · 10 tools
+### `sch_batch` ? 11 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
 **Source:** [`crates/konnect-core/src/tools/sch_batch.rs`](crates/konnect-core/src/tools/sch_batch.rs)
 
@@ -136,6 +163,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint. Single read → all labels inserted → single write. |
 | `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID or reference — single file write. |
 | `bulk_move_schematic_components` | Move multiple components by a uniform dx/dy offset in a single atomic write. |
+| `move_schematic_connection_island` | Move one complete connected symbol/wire/label island without stretching it apart. |
 | `batch_edit_schematic_components` | Apply field updates (Value, Footprint, custom properties) to multiple components in a single atomic write. |
 | `batch_delete_schematic_components` | Delete multiple components by reference designator in a single atomic write. |
 | `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. |
@@ -144,7 +172,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
 
-### `sch_export` · 6 tools
+### `sch_export` ? 6 tools
 **Purpose:** Export schematic to SVG/PDF/netlist, run ERC.
 **Source:** [`crates/konnect-core/src/tools/sch_export.rs`](crates/konnect-core/src/tools/sch_export.rs)
 
@@ -157,7 +185,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 
-### `sch_hierarchy` · 12 tools
+### `sch_hierarchy` ? 12 tools
 **Purpose:** Hierarchical sheets: add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
 **Source:** [`crates/konnect-core/src/tools/sch_hierarchy.rs`](crates/konnect-core/src/tools/sch_hierarchy.rs)
 
@@ -180,8 +208,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## PCB
 
-### `pcb_board` · 11 tools
-**Purpose:** Board outline, layers, zones, mounting holes, board text, SVG logo import.
+### `pcb_board` ? 7 tools
+**Purpose:** Board outline, layer inspection, zones, and mounting holes.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
 | Tool | Description |
@@ -190,15 +218,11 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `get_board_info` | Return metadata about the PCB: title, revision, company, layer count, paper size. |
 | `get_board_extents` | Return the bounding box of all objects on the board (IPC, falls back to file parse). |
 | `get_layer_list` | Return all layers defined in the board with names and types. |
-| `add_layer` | Add a new inner copper or technical layer to the board stack. |
-| `set_active_layer` | Set the active layer recorded in the board file's setup section. |
 | `add_board_outline` | Add a rectangular board outline on the Edge.Cuts layer at specified coordinates. |
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position. |
-| `add_board_text` | Add a silkscreen or fabrication text string to the board. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net. |
-| `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
-### `pcb_components` · 13 tools
+### `pcb_components` ? 20 tools
 **Purpose:** Place, move, rotate, align, and duplicate PCB footprints.
 **Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
 
@@ -208,37 +232,46 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `move_component` | Move a placed footprint to a new X/Y position via KiCAD IPC. |
 | `rotate_component` | Set the rotation angle of a placed footprint via KiCAD IPC. |
 | `delete_component` | Remove a footprint from the board via KiCAD IPC. |
-| `edit_component` | Update the value or other properties of a placed footprint via KiCAD IPC. |
 | `find_component` | Find a footprint by reference designator and return its position. |
 | `get_component_pads` | Return pad positions and net assignments for a footprint. |
+| `set_component_pad_nets` | Atomically reassign selected footprint pads to existing board nets through KiCad IPC without moving the footprint or modifying tracks. |
+| `get_component_3d_models` | Return embedded 3-D model filenames and transforms for a live footprint. |
+| `set_component_3d_model_transform` | Atomically update one embedded footprint 3-D model offset and rotation through KiCad IPC. |
 | `get_pad_position` | Return the schematic-space position of a specific pad number on a footprint. |
 | `get_component_list` | List all footprints on the board with positions, layers, and values. |
+| `get_footprint_courtyards` | Return live transformed courtyard geometry and bounds for footprints. |
+| `check_courtyard_overlaps` | Check same-side footprint courtyards for overlap and requested clearance. |
 | `place_component_array` | Place multiple copies of a footprint in a grid or line array via KiCAD IPC. |
 | `align_components` | Align multiple footprints along a common X or Y axis via KiCAD IPC. |
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
+| `list_footprint_texts` | List footprint reference/value text geometry and visibility. |
+| `edit_footprint_reference` | Edit one footprint reference field through KiCad IPC. |
+| `batch_set_reference_style` | Apply consistent reference text size, thickness, and visibility. |
+| `check_reference_collisions` | Check reference text against pads, courtyards, and neighboring text. |
+| `auto_place_references` | Place footprint references using live geometry and collision checks. |
 | `get_board_2d_view` | Render the PCB as a 2D image using kicad-cli; returns base64 PNG. |
 
-### `pcb_routing` · 12 tools
+### `pcb_routing` ? 12 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
 | Tool | Description |
 |------|-------------|
-| `add_net` | Add a new net entry to the PCB file (S-expression insert, no IPC required). |
 | `route_trace` | Route a trace segment between two points on a copper layer via KiCAD IPC. |
 | `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. |
 | `add_via` | Add a through-hole via at a position and assign it to a net via IPC. |
 | `add_copper_pour` | Add a copper fill zone polygon on a layer/net via S-expression insert. |
 | `delete_trace` | Delete a trace segment identified by its UUID via KiCAD IPC. |
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
+| `delete_via` | Delete a via identified by UUID through KiCad IPC. |
+| `query_vias` | List vias, optionally filtered by net. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
 | `modify_trace` | Modify a trace segment by deleting and re-adding it with new parameters. |
 | `create_netclass` | Add a netclass definition to the board's design rules (S-expression insert). |
-| `assign_net_to_class` | Assign a net to an existing netclass in the PCB file (S-expression edit). |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
-### `pcb_export` · 13 tools
-**Purpose:** Gerber, PDF, SVG, 3D model, BOM, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++.
+### `pcb_export` ? 8 tools
+**Purpose:** Gerber, PDF, SVG, 3D model, BOM, netlist, pick-and-place, and zone refill.
 **Source:** [`crates/konnect-core/src/tools/pcb_export.rs`](crates/konnect-core/src/tools/pcb_export.rs)
 
 | Tool | Description |
@@ -250,18 +283,13 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `export_bom` | Generate a Bill of Materials (BOM) CSV from the schematic's component data. |
 | `export_netlist` | Export the PCB netlist in KiCAD or IPC-D-356 format. |
 | `export_position_file` | Generate a component placement (pick-and-place) position file for SMT assembly. |
-| `export_dxf` | Export the PCB to DXF, one file per layer, using kicad-cli. For mechanical CAD interchange. |
-| `export_gencad` | Export the PCB in GenCAD format using kicad-cli. |
-| `export_ipc2581` | Export the PCB in IPC-2581 format using kicad-cli — a unified fab/assembly/test data format. |
-| `export_odb` | Export the PCB in ODB++ format using kicad-cli — a unified fabrication data format. |
 | `refill_zones` | Refill all copper pour zones using kicad-cli (`zone-fill`). |
-| `get_drc_violations` | Run the Design Rule Check and return a list of violations. |
 
 ---
 
 ## Library
 
-### `library` · 14 tools
+### `library` ? 13 tools
 **Purpose:** Symbol libraries, footprint libraries, search and registration.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
@@ -272,7 +300,6 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `register_footprint_library` | Register a local footprint library directory in the KiCAD global or project library table. |
 | `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library. |
-| `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. |
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |
@@ -286,53 +313,40 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Integration
 
-### `integration` · 9 tools
-**Purpose:** JLCPCB parts database, Freerouting autoroute, datasheet URLs.
+### `integration` ? 1 tool
+**Purpose:** Exact-device datasheet URL lookup.
 **Source:** [`crates/konnect-core/src/tools/integration.rs`](crates/konnect-core/src/tools/integration.rs)
 
 | Tool | Description |
 |------|-------------|
-| `download_jlcpcb_database` | Download or update the local JLCPCB parts database cache (SQLite). |
-| `search_jlcpcb_parts` | Search the local JLCPCB database by keyword, value, or category. |
-| `get_jlcpcb_part` | Retrieve full details for a single JLCPCB part by LCSC part number. |
-| `suggest_jlcpcb_alternatives` | Suggest JLCPCB-stocked alternatives for a given component value and footprint. |
-| `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, last updated, file size. |
-| `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic (LCSC API). |
 | `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID. |
-| `autoroute` | Run Freerouting autorouter: export DSN → autoroute → import SES result. |
-| `check_freerouting` | Verify that the Freerouting JAR is available and return its version. |
 
 ---
 
 ## Verification
 
-### `verification` · 8 tools
-**Purpose:** ERC, DRC, design rules, KiCAD UI control.
+### `verification` ? 4 tools
+**Purpose:** DRC, design-rule inspection, KiCAD status, and clearance checks.
 **Source:** [`crates/konnect-core/src/tools/verification.rs`](crates/konnect-core/src/tools/verification.rs)
 
 | Tool | Description |
 |------|-------------|
 | `run_drc` | Run the Design Rule Check on the PCB and return structured violation results. |
-| `set_design_rules` | Set board-level design rules (clearance, trace width, via size) in the PCB file. |
 | `get_design_rules` | Return the current design rule constraints defined in the PCB file. |
 | `check_kicad_ui` | Check whether the KiCAD GUI application is running and responsive. |
-| `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. |
-| `copy_routing_pattern` | Copy a routing pattern (traces and vias) from one region of the board to another. |
-| `set_layer_constraints` | Set per-layer design constraints (min trace width, clearance) in board setup. |
 | `check_clearance` | Check the physical clearance (distance) between two components on the PCB. |
 
 ---
 
 ## Configuration
 
-### `config` · 7 tools
+### `config` ? 6 tools
 **Purpose:** User preferences, project rules, design rules, fab constraints. **Call `load_user_config` at session start.**
 **Source:** [`crates/konnect-core/src/tools/config.rs`](crates/konnect-core/src/tools/config.rs)
 
 | Tool | Description |
 |------|-------------|
 | `load_user_config` | Load the user's global Konnect preferences (manufacturers, fab constraints, default passives, design rules). Call at session start. |
-| `save_user_config` | Update a user preference using dot-notation, e.g. `fab_constraints.fab_house`. |
 | `load_project_config` | Load project-specific config from `<project_dir>/.konnect/project.json`. Project overrides user. |
 | `save_project_config` | Save a project-specific rule or override (same dot-notation as `save_user_config`). |
 | `get_effective_config` | Return the merged config (user defaults + project overrides). The config Claude should use for design decisions. |
@@ -343,7 +357,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Design Review
 
-### `design_review` · 6 tools
+### `design_review` ? 6 tools
 **Purpose:** AI-powered design audits: decoupling, connections, power rails, DFM, BOM health.
 **Source:** [`crates/konnect-core/src/tools/design_review.rs`](crates/konnect-core/src/tools/design_review.rs)
 
@@ -360,7 +374,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Templates
 
-### `templates` · 4 tools
+### `templates` ? 4 tools
 **Purpose:** Reference circuit library — USB-C, LDO, buck converter, STM32, I2C, LED — verified component values.
 **Source:** [`crates/konnect-core/src/tools/templates.rs`](crates/konnect-core/src/tools/templates.rs)
 
@@ -378,15 +392,14 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Manufacturing
 
-### `manufacturing` · 3 tools
-**Purpose:** Design-to-fab pipeline: export Gerber+BOM+positions package, validate for fab house, estimate cost.
+### `manufacturing` ? 2 tools
+**Purpose:** Export a manufacturing package and validate fabrication readiness.
 **Source:** [`crates/konnect-core/src/tools/manufacturing.rs`](crates/konnect-core/src/tools/manufacturing.rs)
 
 | Tool | Description |
 |------|-------------|
 | `export_manufacturing_package` | Generate ALL files needed for PCB fab + assembly in one call: Gerbers, drill, fab-house BOM, pick-and-place. Targets JLCPCB, PCBWay, etc. |
 | `validate_for_manufacturing` | Pre-flight check before ordering: verifies the design is ready for the target fab house (board outline, design rules, BOM completeness, assembly constraints). |
-| `estimate_cost` | Estimate total manufacturing cost (PCB + components + assembly) with itemized breakdown. |
 
 ---
 

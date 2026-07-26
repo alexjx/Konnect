@@ -248,9 +248,9 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **18 toolsets, 185 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
+- **18 toolsets, 170 exposed tools** + 6 meta-tools (4 routing + 2 observability; see `tool-directory.md`)
 - Baseline `tools/list`: ~19 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): ~191 tools / ~25K tokens
+- Full-catalog `tools/list` (all loaded): ~176 tools; 36 retained implementations are hidden by the registry filter
 - **0 IPC stubs** (all protobuf methods implemented)
-- **0 unimplemented tools**
+- **0 unsupported tools exposed** (9 inactive implementations remain hidden)
 - **3 CLI commands removed in KiCAD v10** (specctra DSN/SES, pcb sync — return clear errors)

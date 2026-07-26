@@ -51,14 +51,15 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "delete_schematic_component",
-            "Remove a symbol instance from the schematic by its reference designator.",
+            "Remove one symbol instance by UUID (preferred when references may repeat) or by reference designator.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
-                    "reference": { "type": "string", "description": "Reference designator (e.g. 'R1')" }
+                    "reference": { "type": "string", "description": "Reference designator (e.g. 'R1')" },
+                    "uuid": { "type": "string", "description": "Exact placed-symbol UUID; takes precedence over reference" }
                 },
-                "required": ["schematic", "reference"]
+                "required": ["schematic"]
             }),
             |args, ctx| async move { handle_delete_schematic_component(args, ctx).await }
         ),
@@ -143,6 +144,24 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "reference", "rotation"]
             }),
             |args, ctx| async move { handle_rotate_schematic_component(args, ctx).await }
+        ),
+        tool!(
+            "set_schematic_component_mirror",
+            "Set or clear a schematic symbol instance mirror without changing its library symbol, pin numbers, position, or rotation. Horizontal mirror swaps left/right; vertical mirror swaps top/bottom.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "reference": { "type": "string" },
+                    "axis": {
+                        "type": "string",
+                        "enum": ["horizontal", "vertical", "none"],
+                        "description": "Absolute mirror state: horizontal (left/right), vertical (top/bottom), or none"
+                    }
+                },
+                "required": ["schematic", "reference", "axis"]
+            }),
+            |args, ctx| async move { handle_set_schematic_component_mirror(args, ctx).await }
         ),
         tool!(
             "move_connected",
@@ -322,8 +341,6 @@ pub fn tools() -> Vec<ToolDef> {
     ]
 }
 
-// ─── Handlers ─────────────────────────────────────────────────────────────────
-
 async fn handle_repair_schematic_instance_paths(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -394,6 +411,8 @@ fn symbol_instances_node(
     ])
 }
 
+// ─── Handlers ─────────────────────────────────────────────────────────────────
+
 async fn handle_create_schematic(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -456,7 +475,7 @@ async fn handle_add_schematic_component(
     let instance_path = format!("/{root_uuid}");
 
     // Embed the library symbol definition
-    cse::library::ensure_lib_symbol(&mut sch, &lib_id);
+    cse::library::ensure_lib_symbol_in_project(&mut sch, &lib_id, sch_path.parent());
 
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(&lib_id, x, y);
@@ -525,7 +544,8 @@ async fn handle_add_schematic_component(
     // Missing pin UUIDs are particularly dangerous because the schematic can
     // still load, then crash in KIID::operator< when autosave runs after an
     // interactive edit.
-    let pin_numbers = cse::library::resolve_lib_symbol_pin_numbers(&lib_id);
+    let pin_numbers =
+        cse::library::resolve_lib_symbol_pin_numbers_in_project(&lib_id, sch_path.parent());
     if pin_numbers.is_empty() {
         return Ok(CallToolResult::error(format!(
             "Could not resolve any pins for library symbol '{}'; refusing to create an unsafe symbol instance",
@@ -581,21 +601,30 @@ async fn handle_delete_schematic_component(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let reference = match require_str(args, "reference") {
-        Ok(r) => r.to_string(),
-        Err(e) => return Ok(e),
-    };
+    let uuid = args.get("uuid").and_then(|v| v.as_str());
+    let reference = args.get("reference").and_then(|v| v.as_str());
+    if uuid.is_none() && reference.is_none() {
+        return Ok(CallToolResult::error(
+            "Either 'uuid' or 'reference' is required",
+        ));
+    }
 
     let mut sch = cse::Schematic::load(&sch_path)?;
 
-    match sch.symbols.remove_by_reference(&reference) {
+    let removed = if let Some(uuid) = uuid {
+        sch.symbols.remove_by_uuid(uuid)
+    } else {
+        sch.symbols.remove_by_reference(reference.unwrap())
+    };
+    let selector = uuid.or(reference).unwrap();
+    match removed {
         Some(_) => {
             sch.overwrite()?;
-            Ok(CallToolResult::json(&json!({ "deleted": reference })))
+            Ok(CallToolResult::json(&json!({ "deleted": selector })))
         }
         None => Ok(CallToolResult::error(format!(
             "Component '{}' not found in schematic",
-            reference
+            selector
         ))),
     }
 }
@@ -830,6 +859,7 @@ async fn handle_list_schematic_components(
             let rotation = sym.at.rotation.unwrap_or(0.0);
             let mirror = sym.mirror.as_deref().unwrap_or("");
             json!({
+                "uuid": sym.uuid,
                 "reference": sym.reference().unwrap_or("?"),
                 "value": sym.value_str().unwrap_or(""),
                 "footprint": sym.footprint().unwrap_or(""),
@@ -905,6 +935,46 @@ async fn handle_rotate_schematic_component(
             Ok(CallToolResult::json(
                 &json!({ "rotated": reference, "rotation": rotation }),
             ))
+        }
+        None => Err(anyhow::anyhow!("Component '{}' not found", reference)),
+    }
+}
+
+async fn handle_set_schematic_component_mirror(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let reference = match require_str(args, "reference") {
+        Ok(r) => r.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let axis = match require_str(args, "axis") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let mirror = match axis {
+        // KiCad's `(mirror y)` negates screen X, so it is a left/right flip.
+        "horizontal" => Some("y".to_string()),
+        // KiCad's `(mirror x)` negates screen Y, so it is a top/bottom flip.
+        "vertical" => Some("x".to_string()),
+        "none" => None,
+        _ => {
+            return Ok(CallToolResult::error(
+                "axis must be one of: horizontal, vertical, none",
+            ))
+        }
+    };
+
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    match sch.symbols.by_reference_mut(&reference) {
+        Some(sym) => {
+            sym.mirror = mirror;
+            sch.overwrite()?;
+            Ok(CallToolResult::json(&json!({
+                "mirrored": reference,
+                "axis": axis
+            })))
         }
         None => Err(anyhow::anyhow!("Component '{}' not found", reference)),
     }
@@ -1012,7 +1082,7 @@ async fn handle_get_schematic_pin_locations(
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let lib_sym = resolve_embedded_pin_symbol(&lib_syms, &inst.lib_id);
+    let lib_sym = super::resolve_embedded_pin_symbol(&lib_syms, &inst.lib_id);
 
     let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
         let lib_pins = extract_lib_pins(sym);
@@ -1070,7 +1140,7 @@ async fn handle_batch_get_pin_locations(
                 Some(i) => i,
                 None => return json!({ "reference": reference, "error": "not found" }),
             };
-            let lib_sym = resolve_embedded_pin_symbol(&lib_syms, &inst.lib_id);
+            let lib_sym = super::resolve_embedded_pin_symbol(&lib_syms, &inst.lib_id);
             let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
                 let t = inst.pin_transform();
                 extract_lib_pins(sym)
@@ -1091,15 +1161,15 @@ async fn handle_batch_get_pin_locations(
 }
 
 #[derive(Clone, Copy, Debug)]
-struct SchBounds {
-    left: f64,
-    right: f64,
-    top: f64,
-    bottom: f64,
+pub(crate) struct SchBounds {
+    pub(crate) left: f64,
+    pub(crate) right: f64,
+    pub(crate) top: f64,
+    pub(crate) bottom: f64,
 }
 
 impl SchBounds {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             left: f64::INFINITY,
             right: f64::NEG_INFINITY,
@@ -1108,21 +1178,21 @@ impl SchBounds {
         }
     }
 
-    fn include(&mut self, x: f64, y: f64) {
+    pub(crate) fn include(&mut self, x: f64, y: f64) {
         self.left = self.left.min(x);
         self.right = self.right.max(x);
         self.top = self.top.min(y);
         self.bottom = self.bottom.max(y);
     }
 
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         self.left.is_finite()
             && self.right.is_finite()
             && self.top.is_finite()
             && self.bottom.is_finite()
     }
 
-    fn json(&self) -> serde_json::Value {
+    pub(crate) fn json(&self) -> serde_json::Value {
         json!({
             "left": self.left, "right": self.right,
             "top": self.top, "bottom": self.bottom,
@@ -1186,7 +1256,7 @@ fn collect_graphic_points(node: &SexpNode, points: &mut Vec<(f64, f64)>) {
     }
 }
 
-fn transformed_body_bounds(
+pub(crate) fn transformed_body_bounds(
     sym: &SexpNode,
     inst: &konnect_sexp::schematic::SymbolInstance,
 ) -> Option<SchBounds> {
@@ -1205,7 +1275,7 @@ fn rendered_field_rotation(symbol_rotation: f64, stored_rotation: f64) -> f64 {
     (symbol_rotation - stored_rotation).rem_euclid(180.0)
 }
 
-fn property_bounds(
+pub(crate) fn property_bounds(
     instance_node: &SexpNode,
     name: &str,
     symbol_rotation: f64,
@@ -1269,7 +1339,7 @@ fn property_bounds(
     Some((bounds, x, y, rotation, rendered_rotation))
 }
 
-fn bounds_gap(first: SchBounds, second: SchBounds) -> (f64, bool) {
+pub(crate) fn bounds_gap(first: SchBounds, second: SchBounds) -> (f64, bool) {
     let dx = if first.right < second.left {
         second.left - first.right
     } else if second.right < first.left {
@@ -1322,7 +1392,7 @@ fn edge_pin_corridor(body: SchBounds, pin_x: f64, pin_y: f64, clearance: f64) ->
     }
 }
 
-fn find_instance_node<'a>(tree: &'a SexpNode, reference: &str) -> Option<&'a SexpNode> {
+pub(crate) fn find_instance_node<'a>(tree: &'a SexpNode, reference: &str) -> Option<&'a SexpNode> {
     tree.find_all("symbol").into_iter().find(|node| {
         node.find_all("property").into_iter().any(|property| {
             property.get(1).and_then(SexpNode::as_str) == Some("Reference")
@@ -1341,7 +1411,7 @@ fn symbol_bounds_result(
         .iter()
         .find(|instance| instance.reference == reference)
         .ok_or_else(|| anyhow::anyhow!("Component '{}' not found", reference))?;
-    let lib_sym = resolve_embedded_pin_symbol(lib_syms, &inst.lib_id)
+    let lib_sym = super::resolve_embedded_pin_symbol(lib_syms, &inst.lib_id)
         .ok_or_else(|| anyhow::anyhow!("Library symbol '{}' not found", inst.lib_id))?;
     let body = transformed_body_bounds(lib_sym, inst)
         .ok_or_else(|| anyhow::anyhow!("Symbol '{}' has no supported body graphics", reference))?;
@@ -1547,7 +1617,7 @@ async fn handle_check_field_spacing(
                 }
             }
         }
-        let Some(lib_sym) = resolve_embedded_pin_symbol(&lib_syms, &instance.lib_id) else {
+        let Some(lib_sym) = super::resolve_embedded_pin_symbol(&lib_syms, &instance.lib_id) else {
             continue;
         };
         let Some(instance_node) = find_instance_node(&tree, &instance.reference) else {
@@ -1595,37 +1665,6 @@ async fn handle_check_field_spacing(
         "max_clearance": max_clearance,
         "issues": issues
     })))
-}
-
-/// Resolve the embedded symbol that owns an instance's pin graphics.
-///
-/// KiCad aliases commonly contain only `(extends "Library:Parent")`; their
-/// pins live on the embedded parent symbol.  Returning the alias itself makes
-/// every pin-location query empty even though KiCad renders and connects the
-/// instance correctly.
-fn resolve_embedded_pin_symbol<'a>(
-    lib_syms: &[&'a SexpNode],
-    lib_id: &str,
-) -> Option<&'a SexpNode> {
-    let mut current = lib_id;
-    for _ in 0..16 {
-        let symbol = lib_syms
-            .iter()
-            .copied()
-            .find(|node| node.get(1).and_then(|child| child.as_str()) == Some(current))?;
-        if !extract_lib_pins(symbol).is_empty() {
-            return Some(symbol);
-        }
-        match symbol
-            .find("extends")
-            .and_then(|node| node.get(1))
-            .and_then(SexpNode::as_str)
-        {
-            Some(parent) => current = parent,
-            None => return Some(symbol),
-        }
-    }
-    None
 }
 
 async fn handle_get_schematic_view(
@@ -1853,28 +1892,132 @@ async fn handle_replace_component(
     );
     content = new_content;
 
-    // Ensure the new library symbol definition is present
-    super::ensure_lib_symbol_in_schematic(&mut content, &new_lib_id);
+    // Persist the new lib_id, then resolve and embed its definition from the
+    // project symbol table as well as the installed KiCad libraries.  Project
+    // symbols are the normal case for datasheet-specific ICs and raw displays.
+    write_atomic(&sch_path, &content)?;
+    let mut library_schematic = cse::Schematic::load(&sch_path)?;
+    cse::library::refresh_lib_symbol_in_project(
+        &mut library_schematic,
+        &new_lib_id,
+        sch_path.parent(),
+    );
+    library_schematic.overwrite()?;
+    content = std::fs::read_to_string(&sch_path)?;
+
+    // KiCad schematic caches store a fully flattened copy of a derived symbol,
+    // not the library's `(extends ...)` alias node. Prefer the core resolver,
+    // which overlays the alias properties onto its inherited graphics and pins.
+    // Project-only symbols fall back to the project-aware raw resolver.
+    if let Some(library_definition) = super::resolve_lib_symbol(&new_lib_id)
+        .or_else(|| cse::library::resolve_lib_symbol_in_project(&new_lib_id, sch_path.parent()))
+    {
+        if let Some(target_start) = content.find(&format!("(symbol \"{}\"", new_lib_id)) {
+            if let Some(target_definition) =
+                super::extract_symbol_block(&content[target_start..], &new_lib_id)
+            {
+                content.replace_range(
+                    target_start..target_start + target_definition.len(),
+                    &library_definition,
+                );
+            }
+        }
+    }
 
     // A verified project may contain a flattened or project-qualified embedded
     // definition that is more authoritative than the installed library alias.
     // Reuse that complete definition when explicitly requested.
     if let Some(source_path) = args["source_schematic"].as_str() {
         let source = std::fs::read_to_string(source_path)?;
-        let source_def = super::extract_symbol_block(&source, &new_lib_id)
-            .ok_or_else(|| anyhow::anyhow!("Symbol '{}' not found in source schematic", new_lib_id))?;
-        let target_start = content.find(&format!("(symbol \"{}\"", new_lib_id))
-            .ok_or_else(|| anyhow::anyhow!("Embedded symbol '{}' not found in target schematic", new_lib_id))?;
+        let source_def = super::extract_symbol_block(&source, &new_lib_id).ok_or_else(|| {
+            anyhow::anyhow!("Symbol '{}' not found in source schematic", new_lib_id)
+        })?;
+        let target_start = content
+            .find(&format!("(symbol \"{}\"", new_lib_id))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Embedded symbol '{}' not found in target schematic",
+                    new_lib_id
+                )
+            })?;
         let target_def = super::extract_symbol_block(&content[target_start..], &new_lib_id)
             .ok_or_else(|| anyhow::anyhow!("Could not parse embedded symbol '{}'", new_lib_id))?;
         content.replace_range(target_start..target_start + target_def.len(), &source_def);
     }
     write_atomic(&sch_path, &content)?;
 
+    // Reconcile placed-symbol pin KIIDs with the replacement symbol.  Merely
+    // changing lib_id leaves stale pin nodes behind (or omits newly introduced
+    // pins), which can make the schematic unsafe to edit in KiCad.  Preserve
+    // UUIDs for pin numbers shared by the old and new symbols so connectivity
+    // identity remains stable, remove obsolete pins, and create UUIDs only for
+    // genuinely new pin numbers.
+    let pin_numbers =
+        cse::library::resolve_lib_symbol_pin_numbers_in_project(&new_lib_id, sch_path.parent());
+    if pin_numbers.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "Could not resolve any pins for replacement symbol '{}'",
+            new_lib_id
+        )));
+    }
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    let symbol = sch.symbols.by_reference_mut(&reference).ok_or_else(|| {
+        anyhow::anyhow!("Component '{}' disappeared after replacement", reference)
+    })?;
+    let existing_pin_uuids: std::collections::BTreeMap<String, String> = symbol
+        .raw_sub_nodes
+        .iter()
+        .filter(|node| node.tag() == Some("pin"))
+        .filter_map(|node| Some((node.value()?.to_owned(), node.get_value("uuid")?.to_owned())))
+        .collect();
+    let mut raw_sub_nodes = Vec::with_capacity(pin_numbers.len() + symbol.raw_sub_nodes.len());
+    for number in &pin_numbers {
+        let pin_uuid = existing_pin_uuids
+            .get(number)
+            .cloned()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        raw_sub_nodes.push(cse::sexp::SexpNode::List(vec![
+            cse::sexp::atom("pin"),
+            cse::sexp::qstr(number),
+            cse::sexp::SexpNode::List(vec![cse::sexp::atom("uuid"), cse::sexp::qstr(pin_uuid)]),
+        ]));
+    }
+    raw_sub_nodes.extend(
+        symbol
+            .raw_sub_nodes
+            .iter()
+            .filter(|node| node.tag() != Some("pin"))
+            .cloned(),
+    );
+    symbol.raw_sub_nodes = raw_sub_nodes;
+    sch.overwrite()?;
+
+    // `Schematic::overwrite` normalizes S-expressions.  Keep the embedded
+    // library cache byte-for-byte sourced from the current library after the
+    // instance-pin rewrite; otherwise KiCad can report a false "doesn't match
+    // copy in library" warning for locally generated symbols.
+    if let Some(library_definition) = super::resolve_lib_symbol(&new_lib_id)
+        .or_else(|| cse::library::resolve_lib_symbol_in_project(&new_lib_id, sch_path.parent()))
+    {
+        let mut final_content = std::fs::read_to_string(&sch_path)?;
+        if let Some(target_start) = final_content.find(&format!("(symbol \"{}\"", new_lib_id)) {
+            if let Some(target_definition) =
+                super::extract_symbol_block(&final_content[target_start..], &new_lib_id)
+            {
+                final_content.replace_range(
+                    target_start..target_start + target_definition.len(),
+                    &library_definition,
+                );
+                write_atomic(&sch_path, &final_content)?;
+            }
+        }
+    }
+
     Ok(CallToolResult::json(&json!({
         "reference": reference,
         "old_lib_id": old_lib_id,
-        "new_lib_id": new_lib_id
+        "new_lib_id": new_lib_id,
+        "pin_uuid_count": pin_numbers.len()
     })))
 }
 

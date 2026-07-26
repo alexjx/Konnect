@@ -103,7 +103,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "create_symbol",
-            "Create a new KiCAD schematic symbol and append it to a .kicad_sym library file.",
+            "Create a rectangular KiCAD schematic symbol and append it to a .kicad_sym library file. Pin names and numbers are visible by default; use body_width/body_height to reserve readable interior space.",
             json!({
                 "type": "object",
                 "properties": {
@@ -111,6 +111,11 @@ pub fn tools() -> Vec<ToolDef> {
                     "name": { "type": "string", "description": "Symbol name" },
                     "reference_prefix": { "type": "string", "description": "Default reference prefix (e.g. 'U')" },
                     "value": { "type": "string", "description": "Default value string" },
+                    "body_width": { "type": "number", "description": "Rectangular body width in mm", "default": 15.24 },
+                    "body_height": { "type": "number", "description": "Rectangular body height in mm", "default": 10.16 },
+                    "show_pin_names": { "type": "boolean", "description": "Render pin names", "default": true },
+                    "show_pin_numbers": { "type": "boolean", "description": "Render pin numbers", "default": true },
+                    "pin_name_offset": { "type": "number", "description": "Pin-name offset from the body edge in mm", "default": 1.016 },
                     "pins": {
                         "type": "array",
                         "description": "Pin definitions",
@@ -543,13 +548,22 @@ async fn handle_register_footprint_library(
         ));
     };
 
-    register_in_lib_table(
-        &table_path,
-        nickname,
-        lib_path.to_str().unwrap_or(""),
-        "KiCad",
-    )
-    .await?;
+    let library_uri = if scope == "project" {
+        table_path
+            .parent()
+            .and_then(|project_dir| lib_path.strip_prefix(project_dir).ok())
+            .map(|relative| {
+                format!(
+                    "${{KIPRJMOD}}/{}",
+                    relative.to_string_lossy().replace('\\', "/")
+                )
+            })
+            .unwrap_or_else(|| lib_path.to_string_lossy().replace('\\', "/"))
+    } else {
+        lib_path.to_string_lossy().replace('\\', "/")
+    };
+
+    register_in_lib_table(&table_path, nickname, &library_uri, "KiCad").await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string_pretty(&json!({
@@ -624,13 +638,22 @@ async fn handle_register_symbol_library(
         ));
     };
 
-    register_in_lib_table(
-        &table_path,
-        nickname,
-        lib_path.to_str().unwrap_or(""),
-        "KiCad",
-    )
-    .await?;
+    let library_uri = if scope == "project" {
+        table_path
+            .parent()
+            .and_then(|project_dir| lib_path.strip_prefix(project_dir).ok())
+            .map(|relative| {
+                format!(
+                    "${{KIPRJMOD}}/{}",
+                    relative.to_string_lossy().replace('\\', "/")
+                )
+            })
+            .unwrap_or_else(|| lib_path.to_string_lossy().replace('\\', "/"))
+    } else {
+        lib_path.to_string_lossy().replace('\\', "/")
+    };
+
+    register_in_lib_table(&table_path, nickname, &library_uri, "KiCad").await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string_pretty(&json!({
@@ -701,17 +724,37 @@ async fn register_in_lib_table(
         "(fp_lib_table\n  (version 7)\n)\n".to_string()
     };
 
-    // Check if nickname already registered
+    let normalized_uri = uri.replace('\\', "/");
+    let entry = format!(
+        "  (lib (name \"{}\") (type \"{}\") (uri \"{}\") (options \"\") (descr \"\"))",
+        nickname, lib_type, normalized_uri
+    );
+
+    // Registration is idempotent but also repairs stale/non-portable URIs for
+    // an existing nickname (notably Windows backslashes in a KiCad table).
     if content.contains(&format!("(name \"{}\")", nickname)) {
-        return Ok(()); // already registered, idempotent
+        let had_trailing_newline = content.ends_with('\n');
+        let mut updated = content
+            .lines()
+            .map(|line| {
+                if line.contains(&format!("(name \"{}\")", nickname)) {
+                    entry.clone()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if had_trailing_newline {
+            updated.push('\n');
+        }
+        write_atomic(table_path, &updated)?;
+        return Ok(());
     }
 
     // Find closing paren of the root expression
     let insert_pos = content.rfind(')').unwrap_or(content.len());
-    let entry = format!(
-        "\n  (lib (name \"{}\") (type \"{}\") (uri \"{}\") (options \"\") (descr \"\"))",
-        nickname, lib_type, uri
-    );
+    let entry = format!("\n{}", entry);
 
     let new_content = format!("{}{}\n)", &content[..insert_pos], entry);
 
@@ -734,51 +777,31 @@ async fn handle_create_symbol(
     let value_str = args["value"].as_str().unwrap_or(name);
     let pins_val = args["pins"].as_array().cloned().unwrap_or_default();
 
-    // Build pin S-expressions
-    let mut pins_sexp = String::new();
-    for pin in &pins_val {
-        let number = pin["number"].as_str().unwrap_or("1");
-        let pin_name = pin["name"].as_str().unwrap_or("~");
-        let pin_type = pin["type"].as_str().unwrap_or("passive");
-        let x = pin["x"].as_f64().unwrap_or(0.0);
-        let y = pin["y"].as_f64().unwrap_or(0.0);
-        let angle = pin["angle"].as_f64().unwrap_or(0.0);
-        let length = pin["length"].as_f64().unwrap_or(2.54);
-
-        pins_sexp.push_str(&format!(
-            r#"
-    (pin {} line (at {} {} {})
-      (length {})
-      (name "{}" (effects (font (size 1.27 1.27))))
-      (number "{}" (effects (font (size 1.27 1.27))))
-    )"#,
-            pin_type, x, y, angle, length, pin_name, number
-        ));
-    }
-
-    let symbol_sexp = format!(
-        r#"
-  (symbol "{}"
-    (pin_numbers hide)
-    (pin_names (offset 1.016) hide)
-    (in_bom yes)
-    (on_board yes)
-    (property "Reference" "{}" (at 0 0 0) (effects (font (size 1.27 1.27))))
-    (property "Value" "{}" (at 0 -2.54 0) (effects (font (size 1.27 1.27))))
-    (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (property "Datasheet" "~" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-    (symbol "{}_0_1"{}
-    )
-  )"#,
-        name, ref_prefix, value_str, name, pins_sexp
-    );
+    let symbol_sexp = build_rectangular_symbol_sexp(
+        name,
+        ref_prefix,
+        value_str,
+        &pins_val,
+        args["body_width"].as_f64().unwrap_or(15.24),
+        args["body_height"].as_f64().unwrap_or(10.16),
+        args["show_pin_names"].as_bool().unwrap_or(true),
+        args["show_pin_numbers"].as_bool().unwrap_or(true),
+        args["pin_name_offset"].as_f64().unwrap_or(1.016),
+    )?;
 
     // If file doesn't exist, create scaffold
     let content = if lib_path.exists() {
         tokio::fs::read_to_string(&lib_path).await?
     } else {
-        "(kicad_symbol_lib\n  (version 20240108)\n  (generator \"kicad-mcp\")\n)\n".to_string()
+        "(kicad_symbol_lib\n  (version 20251024)\n  (generator \"konnect\")\n  (generator_version \"10.0\")\n)\n".to_string()
     };
+    let content = content
+        .replacen("(version 20240108)", "(version 20251024)", 1)
+        .replacen(
+            "(generator \"kicad-mcp\")",
+            "(generator \"konnect\")\n  (generator_version \"10.0\")",
+            1,
+        );
 
     // Insert before closing paren of root expression
     let insert_pos = content.rfind(')').unwrap_or(content.len());
@@ -798,6 +821,140 @@ async fn handle_create_symbol(
         }))
         .unwrap(),
     ))
+}
+
+fn build_rectangular_symbol_sexp(
+    name: &str,
+    ref_prefix: &str,
+    value_str: &str,
+    pins_val: &[serde_json::Value],
+    body_width: f64,
+    body_height: f64,
+    show_pin_names: bool,
+    show_pin_numbers: bool,
+    pin_name_offset: f64,
+) -> anyhow::Result<String> {
+    if body_width <= 0.0 || body_height <= 0.0 {
+        anyhow::bail!("body_width and body_height must be positive");
+    }
+
+    // Build pin S-expressions
+    let mut pins_sexp = String::new();
+    for pin in pins_val {
+        let number = pin["number"].as_str().unwrap_or("1");
+        let pin_name = pin["name"].as_str().unwrap_or("~");
+        let pin_type = pin["type"].as_str().unwrap_or("passive");
+        let x = pin["x"].as_f64().unwrap_or(0.0);
+        let y = pin["y"].as_f64().unwrap_or(0.0);
+        let angle = pin["angle"].as_f64().unwrap_or(0.0);
+        let length = pin["length"].as_f64().unwrap_or(2.54);
+
+        pins_sexp.push_str(&format!(
+            r#"
+    (pin {} line (at {} {} {})
+      (length {})
+      (name "{}" (effects (font (size 1.27 1.27))))
+      (number "{}" (effects (font (size 1.27 1.27))))
+    )"#,
+            pin_type, x, y, angle, length, pin_name, number
+        ));
+    }
+
+    let pin_numbers = if show_pin_numbers {
+        String::new()
+    } else {
+        "    (pin_numbers hide)\n".to_string()
+    };
+    let pin_names = if show_pin_names {
+        format!("    (pin_names (offset {}))\n", pin_name_offset)
+    } else {
+        format!("    (pin_names (offset {}) hide)\n", pin_name_offset)
+    };
+    let half_width = body_width / 2.0;
+    let half_height = body_height / 2.0;
+    let field_gap = 1.27;
+
+    Ok(format!(
+        r#"
+  (symbol "{}"
+{}{}
+    (exclude_from_sim no)
+    (in_bom yes)
+    (on_board yes)
+    (in_pos_files yes)
+    (duplicate_pin_numbers_are_jumpers no)
+    (property "Reference" "{}" (at {} {} 0) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27)) (justify left)))
+    (property "Value" "{}" (at 0 {} 0) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27))))
+    (property "Footprint" "" (at 0 0 0) (show_name no) (do_not_autoplace no) (hide yes) (effects (font (size 1.27 1.27))))
+    (property "Datasheet" "~" (at 0 0 0) (show_name no) (do_not_autoplace no) (hide yes) (effects (font (size 1.27 1.27))))
+    (symbol "{}_0_1"
+      (rectangle (start {} {}) (end {} {})
+        (stroke (width 0.254) (type default))
+        (fill (type background)))
+    )
+    (symbol "{}_1_1"{}
+    )
+  )"#,
+        name,
+        pin_numbers,
+        pin_names,
+        ref_prefix,
+        -half_width,
+        half_height + field_gap,
+        value_str,
+        -(half_height + field_gap),
+        name,
+        -half_width,
+        half_height,
+        half_width,
+        -half_height,
+        name,
+        pins_sexp
+    ))
+}
+
+#[cfg(test)]
+mod symbol_creation_tests {
+    use super::build_rectangular_symbol_sexp;
+    use serde_json::json;
+
+    #[test]
+    fn rectangular_symbol_has_visible_pin_text_and_body() {
+        let pins = vec![
+            json!({"number":"1","name":"IN","type":"input","x":-10.16,"y":0.0,"angle":0,"length":2.54}),
+            json!({"number":"2","name":"OUT","type":"output","x":10.16,"y":0.0,"angle":180,"length":2.54}),
+        ];
+        let sexp = build_rectangular_symbol_sexp(
+            "TEST_IC", "U", "TEST_IC", &pins, 15.24, 10.16, true, true, 1.016,
+        )
+        .unwrap();
+
+        assert!(sexp.contains("(rectangle (start -7.62 5.08) (end 7.62 -5.08)"));
+        assert!(sexp.contains("(symbol \"TEST_IC_1_1\""));
+        assert!(sexp.contains("(pin_names (offset 1.016))"));
+        assert!(!sexp.contains("pin_numbers hide"));
+        assert!(!sexp.contains("pin_names (offset 1.016) hide"));
+        assert!(sexp.contains("(name \"IN\""));
+        assert!(sexp.contains("(number \"2\""));
+    }
+
+    #[test]
+    fn rectangular_symbol_can_hide_pin_text_explicitly() {
+        let sexp = build_rectangular_symbol_sexp(
+            "TEST_IC",
+            "U",
+            "TEST_IC",
+            &[],
+            12.7,
+            7.62,
+            false,
+            false,
+            0.508,
+        )
+        .unwrap();
+        assert!(sexp.contains("(pin_numbers hide)"));
+        assert!(sexp.contains("(pin_names (offset 0.508) hide)"));
+    }
 }
 
 async fn handle_delete_symbol(

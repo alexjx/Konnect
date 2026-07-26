@@ -533,7 +533,9 @@ mod tests {
     async fn create_project_never_overwrites_an_existing_board() {
         let dir = tempfile::tempdir().expect("tempdir");
         let board = dir.path().join("widget.kicad_pcb");
-        tokio::fs::write(&board, "valuable existing board").await.unwrap();
+        tokio::fs::write(&board, "valuable existing board")
+            .await
+            .unwrap();
         let ctx = test_ctx();
         let args = json!({
             "path": dir.path().to_str().unwrap(),

@@ -8,6 +8,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, opt_str, require_f64, require_str, ToolDef};
+use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, snap_point},
     schematic::{
@@ -17,6 +18,7 @@ use konnect_sexp::{
     writer::{apply_edits, find_block_with_leading_whitespace, new_uuid, write_atomic, SexpEdit},
 };
 use serde_json::json;
+use std::collections::HashSet;
 
 // Re-use the crate-internal net-graph primitives from sch_analysis.
 use super::sch_analysis::build_net_graph;
@@ -92,6 +94,24 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "references", "dx", "dy"]
             }),
             |args, ctx| async move { handle_bulk_move(args, ctx).await }
+        ),
+        tool!(
+            "move_schematic_connection_island",
+            "Translate one physically connected schematic island as a rigid graphical group. \
+             Moves every symbol, Reference/Value field, wire, terminal label, junction, and \
+             no-connect marker belonging to the island selected by a component reference.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "reference": { "type": "string", "description": "Any component reference in the island" },
+                    "dx": { "type": "number", "description": "Grid-aligned X translation in mm" },
+                    "dy": { "type": "number", "description": "Grid-aligned Y translation in mm" },
+                    "connect_tolerance": { "type": "number", "default": 0.05 }
+                },
+                "required": ["schematic", "reference", "dx", "dy"]
+            }),
+            |args, ctx| async move { handle_move_connection_island(args, ctx).await }
         ),
         tool!(
             "batch_edit_schematic_components",
@@ -323,9 +343,7 @@ async fn handle_batch_connect_to_net(
             }
         };
 
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = super::resolve_embedded_pin_symbol(&lib_syms, &inst.lib_id);
 
         let pin_ep = lib_sym.and_then(|sym| {
             extract_lib_pins(sym)
@@ -534,6 +552,227 @@ async fn handle_bulk_move(
         "moved": moved,
         "dx": dx, "dy": dy,
         "errors": errors
+    })))
+}
+
+async fn handle_move_connection_island(
+    args: &serde_json::Value,
+    _ctx: &crate::tools::ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let dx = match require_f64(args, "dx") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let dy = match require_f64(args, "dy") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let tolerance = args["connect_tolerance"].as_f64().unwrap_or(0.05).max(0.0);
+    let grid = 1.27_f64;
+    let grid_aligned = |value: f64| ((value / grid).round() * grid - value).abs() < 1e-6;
+    if !grid_aligned(dx) || !grid_aligned(dy) {
+        return Ok(CallToolResult::error(
+            "dx and dy must be exact multiples of the 1.27 mm schematic grid",
+        ));
+    }
+
+    let (_, tree) = read_schematic(&sch_path)?;
+    let instances = extract_symbol_instances(&tree);
+    let wires = extract_wires(&tree);
+    let labels = extract_labels(&tree);
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    let target_index = match instances
+        .iter()
+        .position(|item| item.reference == reference)
+    {
+        Some(index) => index,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Component '{}' not found",
+                reference
+            )))
+        }
+    };
+
+    let wire_base = instances.len();
+    let label_base = wire_base + wires.len();
+    let mut dsu = super::sch_analysis::IslandDsu::new(label_base + labels.len());
+
+    for (first_index, first) in wires.iter().enumerate() {
+        for (second_index, second) in wires.iter().enumerate().skip(first_index + 1) {
+            if super::sch_analysis::wire_segments_touch(first, second, tolerance) {
+                dsu.union(wire_base + first_index, wire_base + second_index);
+            }
+        }
+    }
+    for (label_index, label) in labels.iter().enumerate() {
+        for (wire_index, wire) in wires.iter().enumerate() {
+            if point_on_segment(
+                label.x, label.y, wire.x1, wire.y1, wire.x2, wire.y2, tolerance,
+            ) {
+                dsu.union(label_base + label_index, wire_base + wire_index);
+            }
+        }
+        for (other_index, other) in labels.iter().enumerate().skip(label_index + 1) {
+            if points_coincident(label.x, label.y, other.x, other.y, tolerance) {
+                dsu.union(label_base + label_index, label_base + other_index);
+            }
+        }
+    }
+
+    let mut symbol_pin_points: Vec<Vec<(f64, f64)>> = Vec::with_capacity(instances.len());
+    for (symbol_index, instance) in instances.iter().enumerate() {
+        let mut endpoints = Vec::new();
+        if let Some(lib_symbol) = super::resolve_embedded_pin_symbol(&lib_syms, &instance.lib_id) {
+            for pin in extract_lib_pins(lib_symbol) {
+                let (pin_x, pin_y) = pin_endpoint(&pin, instance.pin_transform());
+                endpoints.push((pin_x, pin_y));
+                for (wire_index, wire) in wires.iter().enumerate() {
+                    if point_on_segment(pin_x, pin_y, wire.x1, wire.y1, wire.x2, wire.y2, tolerance)
+                    {
+                        dsu.union(symbol_index, wire_base + wire_index);
+                    }
+                }
+                for (label_index, label) in labels.iter().enumerate() {
+                    if points_coincident(pin_x, pin_y, label.x, label.y, tolerance) {
+                        dsu.union(symbol_index, label_base + label_index);
+                    }
+                }
+            }
+        }
+        symbol_pin_points.push(endpoints);
+    }
+    for first_index in 0..symbol_pin_points.len() {
+        for second_index in (first_index + 1)..symbol_pin_points.len() {
+            if symbol_pin_points[first_index].iter().any(|first| {
+                symbol_pin_points[second_index].iter().any(|second| {
+                    points_coincident(first.0, first.1, second.0, second.1, tolerance)
+                })
+            }) {
+                dsu.union(first_index, second_index);
+            }
+        }
+    }
+
+    let target_root = dsu.find(target_index);
+    let selected_references: HashSet<String> = instances
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| dsu.find(*index) == target_root)
+        .map(|(_, item)| item.reference.clone())
+        .collect();
+    let selected_wire_uuids: HashSet<String> = wires
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| dsu.find(wire_base + *index) == target_root)
+        .filter_map(|(_, item)| item.uuid.clone())
+        .collect();
+    let selected_label_uuids: HashSet<String> = labels
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| dsu.find(label_base + *index) == target_root)
+        .filter_map(|(_, item)| item.uuid.clone())
+        .collect();
+    let selected_pin_points: Vec<(f64, f64)> = instances
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| dsu.find(*index) == target_root)
+        .flat_map(|(index, _)| symbol_pin_points[index].iter().copied())
+        .collect();
+    let selected_wires: Vec<&konnect_sexp::schematic::Wire> = wires
+        .iter()
+        .filter(|item| {
+            item.uuid
+                .as_ref()
+                .is_some_and(|uuid| selected_wire_uuids.contains(uuid))
+        })
+        .collect();
+
+    let point_on_selected_wire = |x: f64, y: f64| {
+        selected_wires
+            .iter()
+            .any(|wire| point_on_segment(x, y, wire.x1, wire.y1, wire.x2, wire.y2, tolerance))
+    };
+    let point_on_selected_pin = |x: f64, y: f64| {
+        selected_pin_points
+            .iter()
+            .any(|point| points_coincident(x, y, point.0, point.1, tolerance))
+    };
+
+    let mut schematic = cse::Schematic::load(&sch_path)?;
+    let mut moved_symbols = 0usize;
+    for symbol in schematic.symbols.iter_mut() {
+        if symbol
+            .reference()
+            .is_some_and(|item| selected_references.contains(item))
+        {
+            symbol.translate(dx, dy);
+            moved_symbols += 1;
+        }
+    }
+    let mut moved_wires = 0usize;
+    for wire in schematic.wires.iter_mut() {
+        if selected_wire_uuids.contains(&wire.uuid) {
+            wire.translate(dx, dy);
+            moved_wires += 1;
+        }
+    }
+    let mut moved_labels = 0usize;
+    for label in schematic.labels.iter_mut() {
+        if selected_label_uuids.contains(&label.uuid) {
+            label.translate(dx, dy);
+            moved_labels += 1;
+        }
+    }
+    for label in schematic.global_labels.iter_mut() {
+        if selected_label_uuids.contains(&label.uuid) {
+            label.translate(dx, dy);
+            moved_labels += 1;
+        }
+    }
+    for label in schematic.hierarchical_labels.iter_mut() {
+        if selected_label_uuids.contains(&label.uuid) {
+            label.translate(dx, dy);
+            moved_labels += 1;
+        }
+    }
+    let mut moved_junctions = 0usize;
+    for junction in &mut schematic.junctions {
+        if point_on_selected_wire(junction.x, junction.y) {
+            junction.translate(dx, dy);
+            moved_junctions += 1;
+        }
+    }
+    let mut moved_no_connects = 0usize;
+    for no_connect in &mut schematic.no_connects {
+        if point_on_selected_pin(no_connect.x, no_connect.y) {
+            no_connect.x += dx;
+            no_connect.y += dy;
+            moved_no_connects += 1;
+        }
+    }
+    schematic.overwrite()?;
+
+    let mut references: Vec<String> = selected_references.into_iter().collect();
+    references.sort();
+    Ok(CallToolResult::json(&json!({
+        "selected_by": reference,
+        "dx": dx,
+        "dy": dy,
+        "references": references,
+        "moved_symbols": moved_symbols,
+        "moved_wires": moved_wires,
+        "moved_labels": moved_labels,
+        "moved_junctions": moved_junctions,
+        "moved_no_connects": moved_no_connects
     })))
 }
 
@@ -845,9 +1084,7 @@ async fn handle_validate_wire_connections(
     // Collect all valid pin endpoints
     let mut pin_points: Vec<(f64, f64)> = Vec::new();
     for inst in &instances {
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = super::resolve_embedded_pin_symbol(&lib_syms, &inst.lib_id);
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
             for pin in extract_lib_pins(sym) {
@@ -978,9 +1215,7 @@ async fn handle_validate_component_connections(
         if !filter_refs.is_empty() && !filter_refs.contains(&inst.reference) {
             continue;
         }
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = super::resolve_embedded_pin_symbol(&lib_syms, &inst.lib_id);
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
             for pin in extract_lib_pins(sym) {

@@ -155,9 +155,7 @@ async fn handle_audit_decoupling(
 
     // For each IC (non-passive, non-connector component), check power pins
     for inst in &instances {
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = super::resolve_embedded_pin_symbol(&lib_syms, &inst.lib_id);
         let lib_sym = match lib_sym {
             Some(s) => s,
             None => continue,
@@ -255,10 +253,7 @@ async fn handle_audit_connections(
     let mut findings = Vec::new();
 
     for inst in &instances {
-        let lib_sym = match lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
-        {
+        let lib_sym = match super::resolve_embedded_pin_symbol(&lib_syms, &inst.lib_id) {
             Some(s) => s,
             None => continue,
         };
@@ -759,9 +754,7 @@ fn collect_capacitor_nets(
         if !inst.reference.starts_with('C') || inst.reference.starts_with("CN") {
             continue; // Only capacitors
         }
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = super::resolve_embedded_pin_symbol(lib_syms, &inst.lib_id);
         if let Some(sym) = lib_sym {
             let pins = extract_lib_pins(sym);
             for pin in &pins {
@@ -803,9 +796,7 @@ fn collect_bulk_cap_nets(
             continue;
         }
 
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = super::resolve_embedded_pin_symbol(lib_syms, &inst.lib_id);
         if let Some(sym) = lib_sym {
             let pins = extract_lib_pins(sym);
             for pin in &pins {
@@ -918,9 +909,7 @@ fn has_pull_up_on_net(
         if !inst.reference.starts_with('R') {
             continue;
         }
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = super::resolve_embedded_pin_symbol(lib_syms, &inst.lib_id);
         if let Some(sym) = lib_sym {
             let pins = extract_lib_pins(sym);
             let pin_nets: Vec<Option<String>> = pins

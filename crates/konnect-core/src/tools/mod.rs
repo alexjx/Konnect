@@ -6,8 +6,8 @@ pub mod design_review;
 pub mod integration;
 pub mod library;
 pub mod manufacturing;
-pub mod pcb_board;
 pub mod pcb_access;
+pub mod pcb_board;
 pub mod pcb_components;
 pub mod pcb_export;
 pub mod pcb_routing;
@@ -386,24 +386,45 @@ fn kicad_config_base() -> std::path::PathBuf {
 /// Resolve a lib_id like "Device:R" to the full symbol S-expression definition.
 /// KiCAD 10 stores symbols in .kicad_symdir directories, one .kicad_sym file per symbol.
 /// Returns the symbol block with the lib_id prefix (e.g. "Device:R") as the symbol name.
-fn qualify_embedded_extends(mut symbol: String, library_name: &str) -> String {
-    let marker = "(extends \"";
-    if let Some(start) = symbol.find(marker) {
-        let value_start = start + marker.len();
-        if let Some(end) = symbol[value_start..].find('"') {
-            let parent = symbol[value_start..value_start + end].to_string();
-            if !parent.contains(':') {
-                symbol.replace_range(
-                    value_start..value_start + end,
-                    &format!("{}:{}", library_name, parent),
-                );
-            }
-        }
-    }
-    symbol
+pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
+    resolve_lib_symbol_from_dirs(lib_id, &find_kicad_symbol_dirs())
 }
 
-pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
+fn resolve_lib_symbol_from_dirs(lib_id: &str, sym_dirs: &[std::path::PathBuf]) -> Option<String> {
+    let mut visiting = std::collections::HashSet::new();
+    flatten_lib_symbol(lib_id, sym_dirs, &mut visiting)
+}
+
+fn flatten_lib_symbol(
+    lib_id: &str,
+    sym_dirs: &[std::path::PathBuf],
+    visiting: &mut std::collections::HashSet<String>,
+) -> Option<String> {
+    if !visiting.insert(lib_id.to_string()) {
+        tracing::warn!("[BETA] Cyclic library symbol inheritance at '{}'", lib_id);
+        return None;
+    }
+    let alias = resolve_lib_symbol_raw_from_dirs(lib_id, sym_dirs)?;
+    let flattened = if let Some(parent) = symbol_parent(&alias) {
+        let library_name = lib_id.split_once(':')?.0;
+        let parent_lib_id = if parent.contains(':') {
+            parent
+        } else {
+            format!("{}:{}", library_name, parent)
+        };
+        let base = flatten_lib_symbol(&parent_lib_id, sym_dirs, visiting)?;
+        flatten_alias_definition(base, &alias, &parent_lib_id, lib_id)
+    } else {
+        alias
+    };
+    visiting.remove(lib_id);
+    Some(flattened)
+}
+
+fn resolve_lib_symbol_raw_from_dirs(
+    lib_id: &str,
+    sym_dirs: &[std::path::PathBuf],
+) -> Option<String> {
     let parts: Vec<&str> = lib_id.splitn(2, ':').collect();
     if parts.len() != 2 {
         tracing::warn!(
@@ -414,9 +435,7 @@ pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
     }
     let (library_name, symbol_name) = (parts[0], parts[1]);
 
-    let sym_dirs = find_kicad_symbol_dirs();
-
-    for base_dir in &sym_dirs {
+    for base_dir in sym_dirs {
         // KiCAD 10: Library.kicad_symdir/SymbolName.kicad_sym
         let symdir_path = base_dir.join(format!("{}.kicad_symdir", library_name));
         let sym_file = symdir_path.join(format!("{}.kicad_sym", symbol_name));
@@ -431,7 +450,7 @@ pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
                             &format!("(symbol \"{}:{}\"", library_name, symbol_name),
                             1,
                         );
-                        return Some(qualify_embedded_extends(renamed, library_name));
+                        return Some(renamed);
                     }
                 }
                 Err(e) => tracing::warn!("[BETA] Failed to read {}: {}", sym_file.display(), e),
@@ -449,7 +468,7 @@ pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
                             &format!("(symbol \"{}:{}\"", library_name, symbol_name),
                             1,
                         );
-                        return Some(qualify_embedded_extends(renamed, library_name));
+                        return Some(renamed);
                     }
                 }
                 Err(e) => tracing::warn!("[BETA] Failed to read {}: {}", legacy_path.display(), e),
@@ -461,6 +480,71 @@ pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
         "[BETA] Symbol '{}' not found in any library directory",
         lib_id
     );
+    None
+}
+
+fn flatten_alias_definition(
+    mut base: String,
+    alias: &str,
+    base_lib_id: &str,
+    result_lib_id: &str,
+) -> String {
+    let base_name = base_lib_id
+        .split_once(':')
+        .map_or(base_lib_id, |(_, name)| name);
+    let result_name = result_lib_id
+        .split_once(':')
+        .map_or(result_lib_id, |(_, name)| name);
+
+    // Rename the outer cache entry and every unqualified unit sub-symbol.
+    base = base.replacen(
+        &format!("(symbol \"{}\"", base_lib_id),
+        &format!("(symbol \"{}\"", result_lib_id),
+        1,
+    );
+    base = base.replace(
+        &format!("(symbol \"{}_", base_name),
+        &format!("(symbol \"{}_", result_name),
+    );
+
+    // Derived symbols override fields while inheriting graphics and pins.
+    for property_name in [
+        "Reference",
+        "Value",
+        "Footprint",
+        "Datasheet",
+        "Description",
+        "ki_keywords",
+        "ki_fp_filters",
+    ] {
+        let Some(alias_property) = extract_named_property(alias, property_name) else {
+            continue;
+        };
+        let Some(base_property) = extract_named_property(&base, property_name) else {
+            continue;
+        };
+        if let Some(start) = base.find(&base_property) {
+            base.replace_range(start..start + base_property.len(), &alias_property);
+        }
+    }
+    base
+}
+
+fn extract_named_property(content: &str, property_name: &str) -> Option<String> {
+    let start = content.find(&format!("(property \"{}\"", property_name))?;
+    let mut depth = 0i32;
+    for (offset, ch) in content[start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(content[start..=start + offset].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
     None
 }
 
@@ -493,26 +577,51 @@ fn extract_symbol_block(content: &str, symbol_name: &str) -> Option<String> {
 /// Insert a symbol definition into the schematic's lib_symbols section.
 /// Creates the lib_symbols section if it doesn't exist. Skips if already present.
 pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) {
-    // Check if already present
+    let mut visiting = std::collections::HashSet::new();
+    let sym_dirs = find_kicad_symbol_dirs();
+    ensure_lib_symbol_in_schematic_inner(content, lib_id, &mut visiting, &sym_dirs);
+}
+
+fn ensure_lib_symbol_in_schematic_inner(
+    content: &mut String,
+    lib_id: &str,
+    visiting: &mut std::collections::HashSet<String>,
+    sym_dirs: &[std::path::PathBuf],
+) {
+    // Library aliases may form an inheritance chain through `(extends ...)`.
+    // Guard against malformed/cyclic libraries while recursively embedding it.
+    if !visiting.insert(lib_id.to_string()) {
+        tracing::warn!(
+            "[BETA] Cyclic symbol inheritance detected while embedding '{}'",
+            lib_id
+        );
+        return;
+    }
+
+    // Check if already present. Replace an inherited library alias with the
+    // complete flattened cache symbol required by schematic instances.
     let lib_id_check = format!("(symbol \"{}\"", lib_id);
     if content.contains(&lib_id_check) {
-        if let Some((library_name, _)) = lib_id.split_once(':') {
-            if let Some(sym_start) = content.find(&lib_id_check) {
-                if let Some(sym_block) = extract_symbol_block(&content[sym_start..], lib_id) {
-                    let qualified = qualify_embedded_extends(sym_block.clone(), library_name);
-                    if qualified != sym_block {
-                        content.replace_range(sym_start..sym_start + sym_block.len(), &qualified);
+        if let Some(sym_start) = content.find(&lib_id_check) {
+            if let Some(sym_block) = extract_symbol_block(&content[sym_start..], lib_id) {
+                if symbol_parent(&sym_block).is_some() {
+                    if let Some(flattened) = resolve_lib_symbol_from_dirs(lib_id, sym_dirs) {
+                        content.replace_range(sym_start..sym_start + sym_block.len(), &flattened);
                     }
                 }
             }
         }
+        visiting.remove(lib_id);
         return;
     }
 
     // Resolve the symbol from KiCAD libraries
-    let sym_def = match resolve_lib_symbol(lib_id) {
+    let sym_def = match resolve_lib_symbol_from_dirs(lib_id, sym_dirs) {
         Some(s) => s,
-        None => return,
+        None => {
+            visiting.remove(lib_id);
+            return;
+        }
     };
 
     // Ensure lib_symbols section exists
@@ -551,6 +660,118 @@ pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) {
             .collect::<Vec<_>>()
             .join("\n");
         content.insert_str(ls_end, &format!("\n{}\n\t", indented));
+    }
+
+    visiting.remove(lib_id);
+}
+
+fn symbol_parent(symbol: &str) -> Option<String> {
+    let marker = "(extends \"";
+    let start = symbol.find(marker)? + marker.len();
+    let end = start + symbol[start..].find('"')?;
+    Some(symbol[start..end].to_string())
+}
+
+/// Resolve the embedded symbol that owns an instance's pin graphics.
+///
+/// KiCad library aliases often contain only `(extends "Library:Parent")`.
+/// Every schematic analysis/export tool must follow that chain instead of
+/// treating the pin-less alias as the complete symbol.
+pub(crate) fn resolve_embedded_pin_symbol<'a>(
+    lib_syms: &[&'a konnect_sexp::SexpNode],
+    lib_id: &str,
+) -> Option<&'a konnect_sexp::SexpNode> {
+    let mut current = lib_id.to_string();
+    let mut visited = std::collections::HashSet::new();
+    for _ in 0..32 {
+        if !visited.insert(current.clone()) {
+            return None;
+        }
+        let symbol = lib_syms
+            .iter()
+            .copied()
+            .find(|node| node.get(1).and_then(|child| child.as_str()) == Some(current.as_str()))?;
+        if !konnect_sexp::schematic::extract_lib_pins(symbol).is_empty() {
+            return Some(symbol);
+        }
+        let parent = symbol
+            .find("extends")
+            .and_then(|node| node.get(1))
+            .and_then(konnect_sexp::SexpNode::as_str)?;
+        current = if parent.contains(':') {
+            parent.to_string()
+        } else {
+            let library_name = current.split_once(':').map_or("", |(library, _)| library);
+            format!("{}:{}", library_name, parent)
+        };
+    }
+    None
+}
+
+#[cfg(test)]
+mod symbol_embedding_tests {
+    use super::*;
+
+    #[test]
+    fn embeds_flattened_library_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("TestLib.kicad_sym"),
+            r#"(kicad_symbol_lib
+  (version 20231120)
+  (generator kicad_symbol_editor)
+  (symbol "Parent"
+    (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+    (property "Value" "Parent" (at 0 1 0) (effects (font (size 1.27 1.27))))
+    (symbol "Parent_0_1" (rectangle (start -1 -1) (end 1 1) (stroke (width 0) (type default)) (fill (type background))))
+    (symbol "Parent_1_1" (pin input line (at -2 0 0) (length 1) (name "IN" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27))))))
+  )
+  (symbol "Child"
+    (extends "Parent")
+    (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+    (property "Value" "Child" (at 0 1 0) (effects (font (size 1.27 1.27))))
+  )
+)"#,
+        )
+        .unwrap();
+
+        let mut schematic = "(kicad_sch\n  (lib_symbols\n  )\n)\n".to_string();
+        let mut visiting = std::collections::HashSet::new();
+        ensure_lib_symbol_in_schematic_inner(
+            &mut schematic,
+            "TestLib:Child",
+            &mut visiting,
+            &[dir.path().to_path_buf()],
+        );
+
+        assert!(schematic.contains("(symbol \"TestLib:Child\""));
+        assert!(!schematic.contains("(extends"));
+        assert!(schematic.contains("(number \"1\""));
+        assert!(schematic.contains("(property \"Value\" \"Child\""));
+        assert!(schematic.contains("(symbol \"Child_1_1\""));
+        assert!(!schematic.contains("(symbol \"Parent_1_1\""));
+    }
+
+    #[test]
+    fn resolves_pin_owner_through_embedded_alias() {
+        let tree = konnect_sexp::parse_sexp(
+            r#"(kicad_sch
+  (lib_symbols
+    (symbol "TestLib:Parent"
+      (symbol "TestLib:Parent_1_1"
+        (pin input line
+          (at 0 0 0)
+          (length 2.54)
+          (name "IN" (effects (font (size 1.27 1.27))))
+          (number "1" (effects (font (size 1.27 1.27)))))))
+    (symbol "TestLib:Child" (extends "Parent"))))"#,
+        )
+        .unwrap();
+        let lib_syms = tree.find("lib_symbols").unwrap().find_all("symbol");
+        let owner = resolve_embedded_pin_symbol(&lib_syms, "TestLib:Child").unwrap();
+        let pins = konnect_sexp::schematic::extract_lib_pins(owner);
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].number, "1");
     }
 }
 

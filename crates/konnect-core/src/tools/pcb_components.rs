@@ -8,17 +8,17 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use konnect_ipc::client::KiCadIpcClient;
-use konnect_sexp::{
-    parse_sexp,
-    writer::find_block_with_leading_whitespace,
-    SexpNode,
-};
+use konnect_sexp::{parse_sexp, writer::find_block_with_leading_whitespace, SexpNode};
 use serde_json::json;
 use std::collections::HashMap;
 
 // ─── IPC helper ───────────────────────────────────────────────────────────────
 
-async fn with_ipc<T, F>(client: KiCadIpcClient, board: std::path::PathBuf, f: F) -> anyhow::Result<Result<T, String>>
+async fn with_ipc<T, F>(
+    client: KiCadIpcClient,
+    board: std::path::PathBuf,
+    f: F,
+) -> anyhow::Result<Result<T, String>>
 where
     T: Send + 'static,
     F: FnOnce(&KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
@@ -26,7 +26,9 @@ where
     match tokio::task::spawn_blocking(move || {
         let client = client.bind_board(board)?;
         f(&client)
-    }).await {
+    })
+    .await
+    {
         Ok(Ok(r)) => Ok(Ok(r)),
         Ok(Err(e)) => Ok(Err(e.to_string())),
         Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
@@ -152,6 +154,57 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference"]
             }),
             |args, ctx| async move { handle_get_component_pads(args, ctx).await }
+        ),
+        tool!(
+            "set_component_pad_nets",
+            "Atomically reassign selected footprint pads to existing board nets through KiCad IPC without moving the footprint or modifying tracks.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":     { "type": "string" },
+                    "reference": { "type": "string" },
+                    "pad_nets": {
+                        "type": "object",
+                        "description": "Map of pad number to existing board net name",
+                        "additionalProperties": { "type": "string" }
+                    }
+                },
+                "required": ["board", "reference", "pad_nets"]
+            }),
+            |args, ctx| async move { handle_set_component_pad_nets(args, ctx).await }
+        ),
+        tool!(
+            "get_component_3d_models",
+            "Return embedded 3-D model filenames and transforms for a live PCB footprint.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":     { "type": "string" },
+                    "reference": { "type": "string" }
+                },
+                "required": ["board", "reference"]
+            }),
+            |args, ctx| async move { handle_get_component_3d_models(args, ctx).await }
+        ),
+        tool!(
+            "set_component_3d_model_transform",
+            "Atomically update only one embedded footprint 3-D model offset and rotation through KiCad IPC.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":       { "type": "string" },
+                    "reference":   { "type": "string" },
+                    "model_index": { "type": "integer", "default": 0, "minimum": 0 },
+                    "offset_x":    { "type": "number", "default": 0 },
+                    "offset_y":    { "type": "number", "default": 0 },
+                    "offset_z":    { "type": "number", "default": 0 },
+                    "rotation_x":  { "type": "number", "default": 0 },
+                    "rotation_y":  { "type": "number", "default": 0 },
+                    "rotation_z":  { "type": "number", "default": 0 }
+                },
+                "required": ["board", "reference"]
+            }),
+            |args, ctx| async move { handle_set_component_3d_model_transform(args, ctx).await }
         ),
         tool!(
             "get_pad_position",
@@ -1026,16 +1079,14 @@ async fn handle_move_component(
         .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", reference))?;
     let move_reference = reference.clone();
     ipc!(ctx, args, |c| c.move_footprint(&move_reference, x, y));
-    Ok(CallToolResult::json(
-        &json!({
-            "moved": reference,
-            "from": { "x": before.position.x, "y": before.position.y },
-            "x": x,
-            "y": y,
-            "rotation": before.rotation,
-            "method": "kicad_ipc_commit"
-        }),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "moved": reference,
+        "from": { "x": before.position.x, "y": before.position.y },
+        "x": x,
+        "y": y,
+        "rotation": before.rotation,
+        "method": "kicad_ipc_commit"
+    })))
 }
 
 async fn handle_rotate_component(
@@ -1189,16 +1240,117 @@ async fn handle_get_component_pads(
 
     let reference_ipc = reference.clone();
     let live_pads = ipc!(ctx, args, |c| c.get_footprint_pads(&reference_ipc));
-    let pads: Vec<serde_json::Value> = live_pads.into_iter().map(|pad| json!({
-        "number": pad.number,
-        "x": pad.position.x,
-        "y": pad.position.y,
-        "net": pad.net
-    })).collect();
+    let pads: Vec<serde_json::Value> = live_pads
+        .into_iter()
+        .map(|pad| {
+            json!({
+                "number": pad.number,
+                "x": pad.position.x,
+                "y": pad.position.y,
+                "net": pad.net
+            })
+        })
+        .collect();
 
     Ok(CallToolResult::json(
         &json!({ "reference": reference, "pad_count": pads.len(), "pads": pads }),
     ))
+}
+
+async fn handle_set_component_pad_nets(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let Some(mapping) = args["pad_nets"].as_object() else {
+        return Ok(CallToolResult::error(
+            "pad_nets must be an object mapping pad numbers to net names",
+        ));
+    };
+    if mapping.is_empty() {
+        return Ok(CallToolResult::error("pad_nets must not be empty"));
+    }
+    let mut pad_nets = Vec::with_capacity(mapping.len());
+    for (pad_number, net_name) in mapping {
+        let Some(net_name) = net_name.as_str() else {
+            return Ok(CallToolResult::error(format!(
+                "Net name for pad '{}' must be a string",
+                pad_number
+            )));
+        };
+        pad_nets.push((pad_number.clone(), net_name.to_string()));
+    }
+
+    let reference_ipc = reference.clone();
+    let pad_nets_ipc = pad_nets.clone();
+    ipc!(ctx, args, |client| client
+        .set_footprint_pad_nets(&reference_ipc, &pad_nets_ipc));
+
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "pad_nets": mapping,
+        "source": "ipc"
+    })))
+}
+
+async fn handle_get_component_3d_models(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let reference_ipc = reference.clone();
+    let models = ipc!(ctx, args, |client| client
+        .get_footprint_3d_models(&reference_ipc));
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "model_count": models.len(),
+        "models": models,
+        "source": "ipc"
+    })))
+}
+
+async fn handle_set_component_3d_model_transform(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let model_index = args["model_index"].as_u64().unwrap_or(0) as usize;
+    let offset_mm = [
+        args["offset_x"].as_f64().unwrap_or(0.0),
+        args["offset_y"].as_f64().unwrap_or(0.0),
+        args["offset_z"].as_f64().unwrap_or(0.0),
+    ];
+    let rotation = [
+        args["rotation_x"].as_f64().unwrap_or(0.0),
+        args["rotation_y"].as_f64().unwrap_or(0.0),
+        args["rotation_z"].as_f64().unwrap_or(0.0),
+    ];
+    let reference_ipc = reference.clone();
+    ipc!(ctx, args, |client| client.set_footprint_3d_model_transform(
+        &reference_ipc,
+        model_index,
+        offset_mm,
+        rotation
+    ));
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "model_index": model_index,
+        "offset_mm": offset_mm,
+        "rotation": rotation,
+        "source": "ipc"
+    })))
 }
 
 async fn handle_get_pad_position(
@@ -1452,13 +1604,22 @@ mod reference_layout_tests {
 
     #[test]
     fn courtyard_overlap_requires_positive_area() {
-        use konnect_ipc::types::{IpcBounds,IpcVector2};
-        let a=IpcBounds{min:IpcVector2{x:0.0,y:0.0},max:IpcVector2{x:2.0,y:2.0}};
-        let overlap=IpcBounds{min:IpcVector2{x:1.0,y:1.0},max:IpcVector2{x:3.0,y:3.0}};
-        let touching=IpcBounds{min:IpcVector2{x:2.0,y:0.0},max:IpcVector2{x:3.0,y:1.0}};
-        assert!(bounds_overlap(&a,&overlap,0.0));
-        assert!(!bounds_overlap(&a,&touching,0.0));
-        assert!(bounds_overlap(&a,&touching,0.01));
+        use konnect_ipc::types::{IpcBounds, IpcVector2};
+        let a = IpcBounds {
+            min: IpcVector2 { x: 0.0, y: 0.0 },
+            max: IpcVector2 { x: 2.0, y: 2.0 },
+        };
+        let overlap = IpcBounds {
+            min: IpcVector2 { x: 1.0, y: 1.0 },
+            max: IpcVector2 { x: 3.0, y: 3.0 },
+        };
+        let touching = IpcBounds {
+            min: IpcVector2 { x: 2.0, y: 0.0 },
+            max: IpcVector2 { x: 3.0, y: 1.0 },
+        };
+        assert!(bounds_overlap(&a, &overlap, 0.0));
+        assert!(!bounds_overlap(&a, &touching, 0.0));
+        assert!(bounds_overlap(&a, &touching, 0.01));
     }
 
     #[test]
@@ -1500,40 +1661,112 @@ mod reference_layout_tests {
 }
 
 fn requested_references(args: &serde_json::Value) -> Vec<String> {
-    args.get("references").and_then(|v|v.as_array()).map(|a|a.iter().filter_map(|v|v.as_str().map(str::to_owned)).collect()).unwrap_or_default()
+    args.get("references")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-async fn handle_get_footprint_courtyards(args:&serde_json::Value,ctx:&ToolContext)->anyhow::Result<CallToolResult>{
-    let requested=requested_references(args);
-    let courtyards=ipc!(ctx, args, |c| c.list_footprint_courtyards());
-    let filtered:Vec<_>=courtyards.into_iter().filter(|c|requested.is_empty()||requested.contains(&c.reference)).collect();
-    Ok(CallToolResult::json(&json!({"coordinate_space":"board_mm","source":"active_kicad_ipc","count":filtered.len(),"courtyards":filtered})))
+async fn handle_get_footprint_courtyards(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let requested = requested_references(args);
+    let courtyards = ipc!(ctx, args, |c| c.list_footprint_courtyards());
+    let filtered: Vec<_> = courtyards
+        .into_iter()
+        .filter(|c| requested.is_empty() || requested.contains(&c.reference))
+        .collect();
+    Ok(CallToolResult::json(
+        &json!({"coordinate_space":"board_mm","source":"active_kicad_ipc","count":filtered.len(),"courtyards":filtered}),
+    ))
 }
 
-async fn handle_add_footprint_courtyard_circle(args:&serde_json::Value,ctx:&ToolContext)->anyhow::Result<CallToolResult>{
-    let reference=match require_str(args,"reference"){Ok(v)=>v.to_string(),Err(e)=>return Ok(e)};
-    let diameter=match require_f64(args,"diameter"){Ok(v)=>v,Err(e)=>return Ok(e)};
-    let line_width=args.get("line_width").and_then(|v|v.as_f64()).unwrap_or(0.05);
-    let layer=args.get("layer").and_then(|v|v.as_str()).unwrap_or("F.CrtYd").to_string();
-    let refs=ipc!(ctx, args, |c| c.list_footprints());
-    let fp=refs.into_iter().find(|f|f.reference==reference)
-        .ok_or_else(||anyhow::anyhow!("Footprint '{}' not found",reference))?;
-    let x=fp.position.x; let y=fp.position.y;
-    let result_ref=reference.clone(); let result_layer=layer.clone();
-    ipc!(ctx, args, |c| c.add_footprint_circle(&reference,&layer,x,y,diameter,line_width));
-    Ok(CallToolResult::json(&json!({"reference":result_ref,"layer":result_layer,"center":{"x":x,"y":y},"diameter":diameter,"line_width":line_width,"source":"active_kicad_ipc"})))
+async fn handle_add_footprint_courtyard_circle(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let reference = match require_str(args, "reference") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let diameter = match require_f64(args, "diameter") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let line_width = args
+        .get("line_width")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.05);
+    let layer = args
+        .get("layer")
+        .and_then(|v| v.as_str())
+        .unwrap_or("F.CrtYd")
+        .to_string();
+    let refs = ipc!(ctx, args, |c| c.list_footprints());
+    let fp = refs
+        .into_iter()
+        .find(|f| f.reference == reference)
+        .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", reference))?;
+    let x = fp.position.x;
+    let y = fp.position.y;
+    let result_ref = reference.clone();
+    let result_layer = layer.clone();
+    ipc!(ctx, args, |c| c.add_footprint_circle(
+        &reference, &layer, x, y, diameter, line_width
+    ));
+    Ok(CallToolResult::json(
+        &json!({"reference":result_ref,"layer":result_layer,"center":{"x":x,"y":y},"diameter":diameter,"line_width":line_width,"source":"active_kicad_ipc"}),
+    ))
 }
 
-fn bounds_overlap(a:&konnect_ipc::types::IpcBounds,b:&konnect_ipc::types::IpcBounds,clearance:f64)->bool{
-    a.min.x < b.max.x+clearance && a.max.x+clearance > b.min.x && a.min.y < b.max.y+clearance && a.max.y+clearance > b.min.y
+fn bounds_overlap(
+    a: &konnect_ipc::types::IpcBounds,
+    b: &konnect_ipc::types::IpcBounds,
+    clearance: f64,
+) -> bool {
+    a.min.x < b.max.x + clearance
+        && a.max.x + clearance > b.min.x
+        && a.min.y < b.max.y + clearance
+        && a.max.y + clearance > b.min.y
 }
 
-async fn handle_check_courtyard_overlaps(args:&serde_json::Value,ctx:&ToolContext)->anyhow::Result<CallToolResult>{
-    let requested=requested_references(args); let clearance=args.get("clearance").and_then(|v|v.as_f64()).unwrap_or(0.0);
-    if clearance < 0.0{return Ok(CallToolResult::error("clearance must be >= 0"))}
-    let courtyards=ipc!(ctx, args, |c| c.list_footprint_courtyards());
-    let selected:Vec<_>=courtyards.into_iter().filter(|c|requested.is_empty()||requested.contains(&c.reference)).collect();
-    let mut overlaps=Vec::new();
-    for i in 0..selected.len(){for b in &selected[i+1..]{let a=&selected[i];if a.reference==b.reference||a.layer!=b.layer{continue}if let(Some(ab),Some(bb))=(&a.bounds,&b.bounds){if bounds_overlap(ab,bb,clearance){overlaps.push(json!({"ref1":a.reference,"ref2":b.reference,"layer":a.layer,"bounds1":ab,"bounds2":bb}))}}}}
-    Ok(CallToolResult::json(&json!({"source":"active_kicad_ipc","method":"courtyard_aabb","clearance_mm":clearance,"checked":selected.len(),"overlap_count":overlaps.len(),"overlaps":overlaps})))
+async fn handle_check_courtyard_overlaps(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let requested = requested_references(args);
+    let clearance = args
+        .get("clearance")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    if clearance < 0.0 {
+        return Ok(CallToolResult::error("clearance must be >= 0"));
+    }
+    let courtyards = ipc!(ctx, args, |c| c.list_footprint_courtyards());
+    let selected: Vec<_> = courtyards
+        .into_iter()
+        .filter(|c| requested.is_empty() || requested.contains(&c.reference))
+        .collect();
+    let mut overlaps = Vec::new();
+    for i in 0..selected.len() {
+        for b in &selected[i + 1..] {
+            let a = &selected[i];
+            if a.reference == b.reference || a.layer != b.layer {
+                continue;
+            }
+            if let (Some(ab), Some(bb)) = (&a.bounds, &b.bounds) {
+                if bounds_overlap(ab, bb, clearance) {
+                    overlaps.push(json!({"ref1":a.reference,"ref2":b.reference,"layer":a.layer,"bounds1":ab,"bounds2":bb}))
+                }
+            }
+        }
+    }
+    Ok(CallToolResult::json(
+        &json!({"source":"active_kicad_ipc","method":"courtyard_aabb","clearance_mm":clearance,"checked":selected.len(),"overlap_count":overlaps.len(),"overlaps":overlaps}),
+    ))
 }
