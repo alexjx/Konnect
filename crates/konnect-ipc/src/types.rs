@@ -96,6 +96,10 @@ pub struct IpcVia {
     pub uuid: String,
     pub net_name: String,
     pub position: IpcVector2,
+    pub pad_size: f64,
+    pub drill: f64,
+    pub layers: Vec<String>,
+    pub locked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

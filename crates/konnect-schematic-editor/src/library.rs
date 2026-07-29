@@ -135,6 +135,116 @@ pub fn resolve_lib_symbol_in_project(
     resolve_lib_symbol(lib_id)
 }
 
+/// Resolve the complete cache definition KiCad stores inside a schematic.
+///
+/// Library aliases may contain only `(extends "Parent")` plus overridden
+/// properties. KiCad's schematic cache, however, needs a self-contained symbol
+/// with the inherited graphics and pins copied into the alias definition.
+pub fn resolve_flattened_lib_symbol_in_project(
+    lib_id: &str,
+    project_dir: Option<&std::path::Path>,
+) -> Option<String> {
+    let mut visiting = BTreeSet::new();
+    flatten_lib_symbol_in_project(lib_id, project_dir, &mut visiting)
+}
+
+fn flatten_lib_symbol_in_project(
+    lib_id: &str,
+    project_dir: Option<&std::path::Path>,
+    visiting: &mut BTreeSet<String>,
+) -> Option<String> {
+    if !visiting.insert(lib_id.to_owned()) {
+        return None;
+    }
+
+    let alias = resolve_lib_symbol_in_project(lib_id, project_dir)?;
+    let flattened = if let Some(parent) = symbol_parent(&alias) {
+        let parent_id = if parent.contains(':') {
+            parent
+        } else {
+            format!("{}:{}", lib_id.split_once(':')?.0, parent)
+        };
+        let base = flatten_lib_symbol_in_project(&parent_id, project_dir, visiting)?;
+        flatten_alias_definition(base, &alias, &parent_id, lib_id)
+    } else {
+        alias
+    };
+
+    visiting.remove(lib_id);
+    Some(flattened)
+}
+
+fn symbol_parent(symbol: &str) -> Option<String> {
+    let marker = "(extends \"";
+    let start = symbol.find(marker)? + marker.len();
+    let end = start + symbol[start..].find('"')?;
+    Some(symbol[start..end].to_string())
+}
+
+fn flatten_alias_definition(
+    mut base: String,
+    alias: &str,
+    base_lib_id: &str,
+    result_lib_id: &str,
+) -> String {
+    let base_name = base_lib_id
+        .split_once(':')
+        .map_or(base_lib_id, |(_, name)| name);
+    let result_name = result_lib_id
+        .split_once(':')
+        .map_or(result_lib_id, |(_, name)| name);
+
+    base = base.replacen(
+        &format!("(symbol \"{}\"", base_lib_id),
+        &format!("(symbol \"{}\"", result_lib_id),
+        1,
+    );
+    base = base.replace(
+        &format!("(symbol \"{}_", base_name),
+        &format!("(symbol \"{}_", result_name),
+    );
+
+    for property_name in [
+        "Reference",
+        "Value",
+        "Footprint",
+        "Datasheet",
+        "Description",
+        "ki_keywords",
+        "ki_fp_filters",
+    ] {
+        let Some(alias_property) = extract_named_property(alias, property_name) else {
+            continue;
+        };
+        let Some(base_property) = extract_named_property(&base, property_name) else {
+            continue;
+        };
+        if let Some(start) = base.find(&base_property) {
+            base.replace_range(start..start + base_property.len(), &alias_property);
+        }
+    }
+
+    base
+}
+
+fn extract_named_property(content: &str, property_name: &str) -> Option<String> {
+    let start = content.find(&format!("(property \"{}\"", property_name))?;
+    let mut depth = 0i32;
+    for (offset, ch) in content[start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(content[start..=start + offset].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn project_symbol_library_path(
     project_dir: &std::path::Path,
     library_name: &str,
@@ -394,23 +504,23 @@ pub fn ensure_lib_symbol_in_project(
         node.tag() == Some("lib_symbols") && format!("{:?}", node).contains(&check_name)
     });
     if already_present {
-        return;
+        let embedded_is_inherited = schematic.raw_other.iter().any(|node| {
+            node.tag() == Some("lib_symbols")
+                && node.find_all("symbol").iter().any(|symbol| {
+                    symbol.value() == Some(lib_id) && symbol.get_value("extends").is_some()
+                })
+        });
+        if !embedded_is_inherited {
+            return;
+        }
     }
 
-    let Some(raw) = resolve_lib_symbol_in_project(lib_id, project_dir) else {
+    let Some(raw) = resolve_flattened_lib_symbol_in_project(lib_id, project_dir) else {
         return;
     };
     let Ok(node) = parser::parse(&raw) else {
         return;
     };
-    if let Some(parent) = node.get_value("extends") {
-        let parent_id = if parent.contains(':') {
-            parent.to_string()
-        } else {
-            format!("{}:{}", lib_id.split_once(':').map_or("", |v| v.0), parent)
-        };
-        ensure_lib_symbol_in_project(schematic, &parent_id, project_dir);
-    }
 
     if let Some(idx) = schematic
         .raw_other
@@ -418,6 +528,8 @@ pub fn ensure_lib_symbol_in_project(
         .position(|node| node.tag() == Some("lib_symbols"))
     {
         if let SexpNode::List(ref mut children) = schematic.raw_other[idx] {
+            children
+                .retain(|child| !(child.tag() == Some("symbol") && child.value() == Some(lib_id)));
             children.push(node);
         }
     } else {
@@ -451,21 +563,12 @@ fn refresh_lib_symbol_in_project_inner(
     if !visiting.insert(lib_id.to_owned()) {
         return false;
     }
-    let Some(raw) = resolve_lib_symbol_in_project(lib_id, project_dir) else {
+    let Some(raw) = resolve_flattened_lib_symbol_in_project(lib_id, project_dir) else {
         return false;
     };
     let Ok(node) = parser::parse(&raw) else {
         return false;
     };
-
-    if let Some(parent) = node.get_value("extends") {
-        let parent_id = if parent.contains(':') {
-            parent.to_string()
-        } else {
-            format!("{}:{}", lib_id.split_once(':').map_or("", |v| v.0), parent)
-        };
-        refresh_lib_symbol_in_project_inner(schematic, &parent_id, project_dir, visiting);
-    }
 
     if let Some(index) = schematic
         .raw_other
@@ -543,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn refreshes_derived_symbol_with_its_parent() {
+    fn refreshes_derived_symbol_as_a_flattened_cache_entry() {
         let dir = tempfile::tempdir().unwrap();
         let lib = dir.path().join("ProjectSymbols.kicad_sym");
         std::fs::write(
@@ -582,8 +685,63 @@ mod tests {
         ));
         schematic.overwrite().unwrap();
         let saved = std::fs::read_to_string(&schematic_path).unwrap();
-        assert!(saved.contains("(symbol \"ProjectSymbols:Parent\""));
         assert!(saved.contains("(symbol \"ProjectSymbols:Child\""));
-        assert!(saved.contains("(extends \"ProjectSymbols:Parent\")"));
+        assert!(!saved.contains("(extends"));
+        assert!(saved.contains("(symbol \"Child_1_1\""));
+        assert!(saved.contains("(number \"1\""));
+    }
+
+    #[test]
+    fn ensure_replaces_an_existing_alias_with_a_flattened_cache_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("ProjectSymbols.kicad_sym");
+        std::fs::write(
+            &lib,
+            r#"(kicad_symbol_lib (version 20240108)
+              (symbol "Parent"
+                (property "Reference" "U" (at 0 0 0))
+                (property "Value" "Parent" (at 0 1 0))
+                (symbol "Parent_1_1"
+                  (pin input line (at -5.08 0 0) (length 2.54)
+                    (name "IN") (number "1"))))
+              (symbol "Child"
+                (extends "Parent")
+                (property "Reference" "U" (at 0 0 0))
+                (property "Value" "Child" (at 0 1 0))))"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("sym-lib-table"),
+            format!(
+                "(sym_lib_table\n  (lib (name \"ProjectSymbols\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\"))\n)\n",
+                lib.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let schematic_path = dir.path().join("derived.kicad_sch");
+        std::fs::write(
+            &schematic_path,
+            r#"(kicad_sch (version 20231120) (generator eeschema)
+              (uuid "00000000-0000-0000-0000-000000000001")
+              (paper "A4")
+              (lib_symbols
+                (symbol "ProjectSymbols:Parent"
+                  (symbol "Parent_1_1"
+                    (pin input line (at -5.08 0 0) (length 2.54)
+                      (name "IN") (number "1"))))
+                (symbol "ProjectSymbols:Child"
+                  (extends "ProjectSymbols:Parent"))))"#,
+        )
+        .unwrap();
+
+        let mut schematic = Schematic::load(&schematic_path).unwrap();
+        ensure_lib_symbol_in_project(&mut schematic, "ProjectSymbols:Child", Some(dir.path()));
+        schematic.overwrite().unwrap();
+
+        let saved = std::fs::read_to_string(&schematic_path).unwrap();
+        assert!(saved.contains("(symbol \"ProjectSymbols:Child\""));
+        assert!(!saved.contains("(extends"));
+        assert!(saved.contains("(symbol \"Child_1_1\""));
+        assert!(saved.contains("(number \"1\""));
     }
 }

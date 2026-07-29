@@ -119,6 +119,52 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
     normalized_path(left) == normalized_path(right)
 }
 
+fn update_via_dimensions(
+    via: &mut kiapi::board::types::Via,
+    drill: Option<f64>,
+    pad_size: Option<f64>,
+) -> Result<()> {
+    let stack = via
+        .pad_stack
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("via has no pad stack"))?;
+    let drill_properties = stack
+        .drill
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("via has no drill properties"))?;
+    let current_drill = drill_properties
+        .diameter
+        .as_ref()
+        .map(|diameter| crate::builders::nm_to_mm(diameter.x_nm))
+        .ok_or_else(|| anyhow::anyhow!("via has no drill diameter"))?;
+    let current_pad_size = stack
+        .copper_layers
+        .first()
+        .and_then(|layer| layer.size.as_ref())
+        .map(|size| crate::builders::nm_to_mm(size.x_nm))
+        .ok_or_else(|| anyhow::anyhow!("via has no copper diameter"))?;
+    let target_drill = drill.unwrap_or(current_drill);
+    let target_pad_size = pad_size.unwrap_or(current_pad_size);
+    if target_pad_size <= target_drill {
+        anyhow::bail!(
+            "via pad_size ({target_pad_size}) must be greater than drill ({target_drill})"
+        );
+    }
+
+    if let Some(drill) = drill {
+        drill_properties.diameter = Some(crate::builders::vec2(drill, drill));
+    }
+    if let Some(pad_size) = pad_size {
+        if stack.copper_layers.is_empty() {
+            anyhow::bail!("via has no copper layers");
+        }
+        for layer in &mut stack.copper_layers {
+            layer.size = Some(crate::builders::vec2(pad_size, pad_size));
+        }
+    }
+    Ok(())
+}
+
 fn has_board_filename(doc: &kiapi::common::types::DocumentSpecifier) -> bool {
     matches!(
         doc.identifier,
@@ -1053,6 +1099,97 @@ impl KiCadIpcClient {
         self.delete_items(vec![uuid.to_string()])
     }
 
+    /// Update one or more existing vias in place, preserving their UUIDs,
+    /// positions, nets, layer spans, locking, and all unrelated properties.
+    pub fn modify_vias(
+        &self,
+        uuids: &[String],
+        drill: Option<f64>,
+        pad_size: Option<f64>,
+    ) -> Result<Vec<IpcVia>> {
+        if uuids.is_empty() {
+            anyhow::bail!("at least one via UUID is required");
+        }
+        if drill.is_none() && pad_size.is_none() {
+            anyhow::bail!("at least one of drill or pad_size is required");
+        }
+        if drill.is_some_and(|value| value <= 0.0) {
+            anyhow::bail!("via drill must be greater than zero");
+        }
+        if pad_size.is_some_and(|value| value <= 0.0) {
+            anyhow::bail!("via pad_size must be greater than zero");
+        }
+        if let (Some(drill), Some(pad_size)) = (drill, pad_size) {
+            if pad_size <= drill {
+                anyhow::bail!("via pad_size must be greater than drill");
+            }
+        }
+
+        let requested: std::collections::HashSet<&str> = uuids.iter().map(String::as_str).collect();
+        if requested.len() != uuids.len() {
+            anyhow::bail!("duplicate via UUIDs are not allowed");
+        }
+
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbVia)?;
+        let mut updates = Vec::with_capacity(uuids.len());
+        let mut found = std::collections::HashSet::with_capacity(uuids.len());
+        for item in items {
+            let Ok(mut via) = kiapi::board::types::Via::decode(item.value.as_slice()) else {
+                continue;
+            };
+            let uuid = via
+                .id
+                .as_ref()
+                .map(|id| id.value.clone())
+                .unwrap_or_default();
+            if !requested.contains(uuid.as_str()) {
+                continue;
+            }
+
+            update_via_dimensions(&mut via, drill, pad_size)?;
+            found.insert(uuid);
+            updates.push(crate::builders::pack_any(&via, "kiapi.board.types.Via"));
+        }
+
+        let missing: Vec<&str> = uuids
+            .iter()
+            .map(String::as_str)
+            .filter(|uuid| !found.contains(*uuid))
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!("via UUIDs not found: {}", missing.join(", "));
+        }
+
+        let commit = self.begin_commit()?;
+        match self.update_items(updates) {
+            Ok(()) => {
+                if let Err(error) =
+                    self.push_commit(&commit, &format!("Modify {} via dimension(s)", uuids.len()))
+                {
+                    let _ = self.drop_commit(&commit);
+                    return Err(error);
+                }
+            }
+            Err(error) => {
+                let _ = self.drop_commit(&commit);
+                return Err(error);
+            }
+        }
+
+        let updated = self.get_vias(None)?;
+        let by_uuid: std::collections::HashMap<&str, &IpcVia> =
+            updated.iter().map(|via| (via.uuid.as_str(), via)).collect();
+        uuids
+            .iter()
+            .map(|uuid| {
+                by_uuid
+                    .get(uuid.as_str())
+                    .map(|via| (*via).clone())
+                    .ok_or_else(|| anyhow::anyhow!("updated via '{}' cannot be verified", uuid))
+            })
+            .collect()
+    }
+
     /// Query tracks, optionally filtered by net and/or layer.
     pub fn get_tracks(
         &self,
@@ -1129,6 +1266,26 @@ impl KiCadIpcClient {
                     }
                 }
                 let position = via.position.as_ref();
+                let pad_stack = via.pad_stack.as_ref();
+                let pad_size = pad_stack
+                    .and_then(|stack| stack.copper_layers.first())
+                    .and_then(|layer| layer.size.as_ref())
+                    .map(|size| crate::builders::nm_to_mm(size.x_nm))
+                    .unwrap_or(0.0);
+                let drill = pad_stack
+                    .and_then(|stack| stack.drill.as_ref())
+                    .and_then(|drill| drill.diameter.as_ref())
+                    .map(|diameter| crate::builders::nm_to_mm(diameter.x_nm))
+                    .unwrap_or(0.0);
+                let layers = pad_stack
+                    .map(|stack| {
+                        stack
+                            .layers
+                            .iter()
+                            .map(|layer| layer_enum_to_name(*layer).to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 vias.push(IpcVia {
                     uuid: via
                         .id
@@ -1144,6 +1301,10 @@ impl KiCadIpcClient {
                             .map(|p| crate::builders::nm_to_mm(p.y_nm))
                             .unwrap_or(0.0),
                     },
+                    pad_size,
+                    drill,
+                    layers,
+                    locked: via.locked == kiapi::common::types::LockedState::LsLocked as i32,
                 });
             }
         }
@@ -1312,6 +1473,122 @@ impl KiCadIpcClient {
             }
         }
         anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// Set every pad in a footprint to one angle relative to the footprint.
+    ///
+    /// KiCad IPC exposes pad-stack angles in board coordinates, so convert the
+    /// requested footprint-relative angle using the instance orientation.
+    pub fn set_footprint_pad_relative_angle(
+        &self,
+        reference: &str,
+        relative_angle: f64,
+    ) -> Result<Vec<(String, f64, f64)>> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in &items {
+            if let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) {
+                let ref_text = fp
+                    .reference_field
+                    .as_ref()
+                    .and_then(|f| f.text.as_ref())
+                    .and_then(|bt| bt.text.as_ref())
+                    .map(|t| t.text.as_str())
+                    .unwrap_or("");
+                if ref_text != reference {
+                    continue;
+                }
+
+                let mut update = fp.clone();
+                let instance_angle = update
+                    .orientation
+                    .as_ref()
+                    .map(|angle| angle.value_degrees)
+                    .unwrap_or(0.0);
+                let target_angle = (instance_angle + relative_angle).rem_euclid(360.0);
+                let mut changed = Vec::new();
+                if let Some(definition) = update.definition.as_mut() {
+                    for definition_item in &mut definition.items {
+                        if !definition_item.type_url.ends_with("kiapi.board.types.Pad") {
+                            continue;
+                        }
+                        let mut pad =
+                            kiapi::board::types::Pad::decode(definition_item.value.as_slice())?;
+                        let pad_stack = pad.pad_stack.get_or_insert_with(Default::default);
+                        let angle = pad_stack.angle.get_or_insert_with(Default::default);
+                        let old_angle = angle.value_degrees;
+                        angle.value_degrees = target_angle;
+                        changed.push((pad.number.clone(), old_angle, target_angle));
+                        definition_item.value = pad.encode_to_vec();
+                    }
+                }
+
+                let any = crate::builders::pack_any(&update, "kiapi.board.types.FootprintInstance");
+                let commit = self.begin_commit()?;
+                match self.update_items(vec![any]) {
+                    Ok(()) => {
+                        if let Err(error) = self.push_commit(
+                            &commit,
+                            &format!("Set footprint pad angles for {reference}"),
+                        ) {
+                            let _ = self.drop_commit(&commit);
+                            return Err(error);
+                        }
+                        return Ok(changed);
+                    }
+                    Err(error) => {
+                        let _ = self.drop_commit(&commit);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// Flip a footprint between the front and back board sides using KiCad's
+    /// native interactive action. Selection is scoped to the requested
+    /// footprint and cleared again after the action.
+    pub fn flip_footprint(&self, reference: &str) -> Result<()> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let mut footprint_id = None;
+        for item in &items {
+            if let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) {
+                let ref_text = fp
+                    .reference_field
+                    .as_ref()
+                    .and_then(|field| field.text.as_ref())
+                    .and_then(|text| text.text.as_ref())
+                    .map(|text| text.text.as_str())
+                    .unwrap_or("");
+                if ref_text == reference {
+                    footprint_id = fp.id.clone();
+                    break;
+                }
+            }
+        }
+
+        let footprint_id =
+            footprint_id.ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", reference))?;
+        let header = self.make_header()?;
+        let clear = kiapi::common::commands::ClearSelection {
+            header: Some(header.clone()),
+        };
+        self.send_command(&clear, "kiapi.common.commands.ClearSelection")?;
+
+        let select = kiapi::common::commands::AddToSelection {
+            header: Some(header.clone()),
+            items: vec![footprint_id],
+        };
+        self.send_command(&select, "kiapi.common.commands.AddToSelection")?;
+
+        let flip_result = self.run_action("pcbnew.InteractiveEdit.flip");
+        let clear = kiapi::common::commands::ClearSelection {
+            header: Some(header),
+        };
+        let clear_result = self.send_command(&clear, "kiapi.common.commands.ClearSelection");
+        flip_result?;
+        clear_result?;
+        Ok(())
     }
 
     /// Return footprint pads in board coordinates from the live KiCad document.
@@ -2087,13 +2364,68 @@ mod courtyard_geometry_tests {
 }
 
 #[cfg(test)]
+mod via_dimension_tests {
+    use super::*;
+
+    #[test]
+    fn update_via_dimensions_preserves_identity_and_connectivity() {
+        let mut via = crate::builders::build_via("GND", 1, 12.5, 24.5, 0.2, 0.5);
+        via.id = Some(kiapi::common::types::Kiid {
+            value: "test-via-uuid".to_string(),
+        });
+        via.locked = kiapi::common::types::LockedState::LsLocked as i32;
+        let original_position = via.position.clone();
+        let original_net = via.net.clone();
+        let original_layers = via.pad_stack.as_ref().unwrap().layers.clone();
+
+        update_via_dimensions(&mut via, Some(0.3), Some(0.6)).unwrap();
+
+        assert_eq!(via.id.as_ref().unwrap().value, "test-via-uuid");
+        assert_eq!(via.position, original_position);
+        assert_eq!(via.net, original_net);
+        assert_eq!(via.pad_stack.as_ref().unwrap().layers, original_layers);
+        assert_eq!(
+            via.locked,
+            kiapi::common::types::LockedState::LsLocked as i32
+        );
+        let stack = via.pad_stack.as_ref().unwrap();
+        assert!(
+            (crate::builders::nm_to_mm(
+                stack
+                    .drill
+                    .as_ref()
+                    .unwrap()
+                    .diameter
+                    .as_ref()
+                    .unwrap()
+                    .x_nm
+            ) - 0.3)
+                .abs()
+                < 1e-9
+        );
+        for layer in &stack.copper_layers {
+            assert!(
+                (crate::builders::nm_to_mm(layer.size.as_ref().unwrap().x_nm) - 0.6).abs() < 1e-9
+            );
+        }
+    }
+
+    #[test]
+    fn update_via_dimensions_rejects_invalid_annular_geometry() {
+        let mut via = crate::builders::build_via("GND", 1, 12.5, 24.5, 0.3, 0.6);
+        let error = update_via_dimensions(&mut via, Some(0.6), None).unwrap_err();
+        assert!(error.to_string().contains("must be greater than drill"));
+    }
+}
+
+#[cfg(test)]
 mod footprint_transform_tests {
     use super::*;
     use prost::Message;
 
     #[test]
     fn absolute_definition_pad_tracks_translation() {
-        let mut fp = footprint_with_absolute_pad(45.0, 40.0, 43.8625, 39.05);
+        let mut fp = footprint_with_absolute_pad(45.0, 40.0, 43.8625, 39.05, 0.0);
         translate_footprint_definition(
             &mut fp,
             crate::builders::mm_to_nm(2.0),
@@ -2108,7 +2440,7 @@ mod footprint_transform_tests {
 
     #[test]
     fn absolute_definition_pad_tracks_rotation_about_instance_origin() {
-        let mut fp = footprint_with_absolute_pad(45.0, 40.0, 43.0, 39.0);
+        let mut fp = footprint_with_absolute_pad(45.0, 40.0, 43.0, 39.0, 15.0);
         rotate_footprint_definition(
             &mut fp,
             crate::builders::mm_to_nm(45.0),
@@ -2119,6 +2451,13 @@ mod footprint_transform_tests {
         let p = first_pad(&fp).position.unwrap();
         assert!((crate::builders::nm_to_mm(p.x_nm) - 46.0).abs() < 1e-9);
         assert!((crate::builders::nm_to_mm(p.y_nm) - 38.0).abs() < 1e-9);
+        let angle = first_pad(&fp)
+            .pad_stack
+            .unwrap()
+            .angle
+            .unwrap()
+            .value_degrees;
+        assert!((angle - 105.0).abs() < 1e-9);
     }
 
     fn footprint_with_absolute_pad(
@@ -2126,9 +2465,16 @@ mod footprint_transform_tests {
         fp_y: f64,
         pad_x: f64,
         pad_y: f64,
+        pad_angle: f64,
     ) -> kiapi::board::types::FootprintInstance {
         let pad = kiapi::board::types::Pad {
             position: Some(crate::builders::vec2(pad_x, pad_y)),
+            pad_stack: Some(kiapi::board::types::PadStack {
+                angle: Some(kiapi::common::types::Angle {
+                    value_degrees: pad_angle,
+                }),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         kiapi::board::types::FootprintInstance {
@@ -2269,6 +2615,10 @@ fn rotate_footprint_definition(
         if item.type_url.ends_with("kiapi.board.types.Pad") {
             let mut v = kiapi::board::types::Pad::decode(item.value.as_slice())?;
             rotate_vector(&mut v.position, cx, cy, degrees);
+            if let Some(pad_stack) = &mut v.pad_stack {
+                let angle = pad_stack.angle.get_or_insert_with(Default::default);
+                angle.value_degrees += degrees;
+            }
             item.value = v.encode_to_vec();
         } else if item
             .type_url

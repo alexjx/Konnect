@@ -229,13 +229,13 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_components",
         description: "Place, move, rotate, align, and duplicate PCB footprints",
         category: "pcb",
-        tool_count: 22,
+        tool_count: 24,
     },
     ToolsetMeta {
         name: "pcb_routing",
         description: "Traces, vias, copper pours, net classes, differential pairs",
         category: "pcb",
-        tool_count: 12,
+        tool_count: 13,
     },
     ToolsetMeta {
         name: "pcb_export",

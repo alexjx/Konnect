@@ -103,6 +103,33 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_rotate_component(args, ctx).await }
         ),
         tool!(
+            "set_component_pad_relative_angle",
+            "Repair or intentionally set every pad angle in one footprint relative to the footprint body via KiCad IPC.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":          { "type": "string" },
+                    "reference":      { "type": "string" },
+                    "relative_angle": { "type": "number", "description": "Pad angle relative to the footprint body in degrees" }
+                },
+                "required": ["board", "reference", "relative_angle"]
+            }),
+            |args, ctx| async move { handle_set_component_pad_relative_angle(args, ctx).await }
+        ),
+        tool!(
+            "flip_component",
+            "Flip one placed footprint between F.Cu and B.Cu using KiCad's native interactive action via IPC.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":     { "type": "string" },
+                    "reference": { "type": "string" }
+                },
+                "required": ["board", "reference"]
+            }),
+            |args, ctx| async move { handle_flip_component(args, ctx).await }
+        ),
+        tool!(
             "delete_component",
             "Remove a footprint from the board via KiCAD IPC.",
             json!({
@@ -1112,6 +1139,68 @@ async fn handle_rotate_component(
         "from": before.as_ref().map(|footprint| footprint.rotation),
         "rotation": rotation,
         "method": "kicad_ipc_commit"
+    })))
+}
+
+async fn handle_set_component_pad_relative_angle(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let relative_angle = match require_f64(args, "relative_angle") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+
+    let repair_reference = reference.clone();
+    let changed = ipc!(ctx, args, |client| client
+        .set_footprint_pad_relative_angle(&repair_reference, relative_angle));
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "relative_angle": relative_angle,
+        "pads": changed,
+        "method": "kicad_ipc_commit"
+    })))
+}
+
+async fn handle_flip_component(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+
+    let lookup_reference = reference.clone();
+    let before = ipc!(ctx, args, |client| client.get_footprint(&lookup_reference))
+        .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", reference))?;
+    let flip_reference = reference.clone();
+    ipc!(ctx, args, |client| client.flip_footprint(&flip_reference));
+    let verify_reference = reference.clone();
+    let after = ipc!(ctx, args, |client| client.get_footprint(&verify_reference))
+        .ok_or_else(|| anyhow::anyhow!("Footprint '{}' missing after flip", reference))?;
+
+    if before.layer == after.layer {
+        return Ok(CallToolResult::error(format!(
+            "KiCad flip action did not change the layer for '{}'",
+            reference
+        )));
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "flipped": reference,
+        "from_layer": before.layer,
+        "layer": after.layer,
+        "x": after.position.x,
+        "y": after.position.y,
+        "rotation": after.rotation,
+        "method": "kicad_ipc_native_action"
     })))
 }
 

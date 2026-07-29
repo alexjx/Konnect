@@ -216,13 +216,45 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_delete_via(args, ctx).await }
         ),
         tool!(
+            "modify_vias",
+            "Update existing vias in place by UUID, preserving position, net, layers, lock state, and UUID.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": {
+                        "type": "string"
+                    },
+                    "uuids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "UUIDs of vias to update"
+                    },
+                    "drill": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "description": "New drill diameter in mm (optional)"
+                    },
+                    "pad_size": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "description": "New via pad diameter in mm (optional)"
+                    }
+                },
+                "required": ["board", "uuids"]
+            }),
+            |args, ctx| async move { handle_modify_vias(args, ctx).await }
+        ),
+        tool!(
             "query_vias",
-            "List vias on the board, optionally filtered by net.",
+            "List vias with dimensions and layer spans, optionally filtered by net and exact dimensions.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":    { "type": "string" },
-                    "net_name": { "type": "string", "description": "Filter by net (optional)" }
+                    "net_name": { "type": "string", "description": "Filter by net (optional)" },
+                    "drill":    { "type": "number", "description": "Filter by exact drill diameter in mm (optional)" },
+                    "pad_size": { "type": "number", "description": "Filter by exact via pad diameter in mm (optional)" }
                 },
                 "required": ["board"]
             }),
@@ -604,17 +636,70 @@ async fn handle_delete_via(
     Ok(CallToolResult::json(&json!({ "deleted_uuid": uuid })))
 }
 
+async fn handle_modify_vias(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let uuids = match args["uuids"].as_array() {
+        Some(values) if !values.is_empty() => {
+            let mut uuids = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(uuid) = value.as_str() else {
+                    return Ok(CallToolResult::error(
+                        "Every entry in 'uuids' must be a string",
+                    ));
+                };
+                uuids.push(uuid.to_string());
+            }
+            uuids
+        }
+        _ => return Ok(CallToolResult::error("Missing non-empty 'uuids' array")),
+    };
+    let drill = args["drill"].as_f64();
+    let pad_size = args["pad_size"].as_f64();
+    if drill.is_none() && pad_size.is_none() {
+        return Ok(CallToolResult::error(
+            "At least one of 'drill' or 'pad_size' is required",
+        ));
+    }
+
+    let update_uuids = uuids.clone();
+    let updated = ipc!(ctx, args, |client| client.modify_vias(
+        &update_uuids,
+        drill,
+        pad_size
+    ));
+    Ok(CallToolResult::json(&json!({
+        "count": updated.len(),
+        "vias": updated,
+        "method": "kicad_ipc_update_items"
+    })))
+}
+
 async fn handle_query_vias(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let net = args["net_name"].as_str().map(String::from);
+    let drill = args["drill"].as_f64();
+    let pad_size = args["pad_size"].as_f64();
     let vias = ipc!(ctx, args, |c| c.get_vias(net.as_deref()));
     let items: Vec<serde_json::Value> = vias
         .iter()
+        .filter(|via| {
+            drill.is_none_or(|value| (via.drill - value).abs() < 0.000_001)
+                && pad_size.is_none_or(|value| (via.pad_size - value).abs() < 0.000_001)
+        })
         .map(|v| {
             json!({
-                "uuid": v.uuid, "net": v.net_name, "x": v.position.x, "y": v.position.y
+                "uuid": v.uuid,
+                "net": v.net_name,
+                "x": v.position.x,
+                "y": v.position.y,
+                "pad_size": v.pad_size,
+                "drill": v.drill,
+                "layers": v.layers,
+                "locked": v.locked
             })
         })
         .collect();

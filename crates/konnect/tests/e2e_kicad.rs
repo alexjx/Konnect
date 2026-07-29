@@ -140,6 +140,59 @@ fn body(result: &Value) -> Value {
 
 #[test]
 #[ignore = "requires kicad-cli + symbol libraries; run via e2e workflow"]
+fn stm32_alias_is_flattened_and_exported_with_all_pins() {
+    let Some(kicad_cli) = find_kicad_cli() else {
+        panic!("kicad-cli not found - set KICAD_CLI or install KiCAD");
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let sch = tmp.path().join("stm32-alias.kicad_sch");
+    let netlist = tmp.path().join("stm32-alias.net");
+    let mut p = Mcp::spawn(&kicad_cli);
+
+    p.load("sch_components");
+    p.tool("create_schematic", json!({"path": sch.to_string_lossy()}));
+    let added = body(&p.tool(
+        "add_schematic_component",
+        json!({
+            "schematic": sch.to_string_lossy(),
+            "lib_id": "MCU_ST_STM32G0:STM32G0B1CBTx",
+            "reference": "U1",
+            "value": "STM32G0B1CBT6",
+            "x": 100.0,
+            "y": 100.0
+        }),
+    ));
+    assert_eq!(added["pin_uuid_count"], json!(48));
+
+    let content = std::fs::read_to_string(&sch).unwrap();
+    let tree = konnect_sexp::parse_sexp(&content).expect("tool output must reparse");
+    let lib_symbols = tree.find("lib_symbols").unwrap().find_all("symbol");
+    let stm32 = lib_symbols
+        .iter()
+        .find(|symbol| {
+            symbol.get(1).and_then(|value| value.as_str()) == Some("MCU_ST_STM32G0:STM32G0B1CBTx")
+        })
+        .expect("STM32 alias must be embedded");
+    assert!(stm32.find("extends").is_none());
+    assert_eq!(konnect_sexp::schematic::extract_lib_pins(stm32).len(), 48);
+
+    let status = Command::new(&kicad_cli)
+        .args(["sch", "export", "netlist", "-o"])
+        .arg(&netlist)
+        .arg(&sch)
+        .status()
+        .unwrap();
+    assert!(status.success(), "kicad-cli netlist export failed");
+    let exported = std::fs::read_to_string(netlist).unwrap();
+    assert_eq!(
+        exported.matches("(ref \"U1\")").count(),
+        49,
+        "netlist must contain one component reference plus all 48 U1 pin nodes"
+    );
+}
+
+#[test]
+#[ignore = "requires kicad-cli + symbol libraries; run via e2e workflow"]
 fn full_design_loop_with_real_kicad() {
     let Some(kicad_cli) = find_kicad_cli() else {
         panic!("kicad-cli not found — set KICAD_CLI or install KiCAD (this test is e2e-only)");
