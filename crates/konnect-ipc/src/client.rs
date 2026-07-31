@@ -2623,6 +2623,35 @@ mod footprint_transform_tests {
         assert!((angle - 105.0).abs() < 1e-9);
     }
 
+    #[test]
+    fn absolute_definition_zone_tracks_translation() {
+        let mut fp = footprint_with_absolute_zone(45.0, 40.0, 43.0, 39.0);
+        translate_footprint_definition(
+            &mut fp,
+            crate::builders::mm_to_nm(2.0),
+            crate::builders::mm_to_nm(-3.5),
+        )
+        .unwrap();
+        let p = first_zone_outline_point(&fp);
+        assert!((crate::builders::nm_to_mm(p.x_nm) - 45.0).abs() < 1e-9);
+        assert!((crate::builders::nm_to_mm(p.y_nm) - 35.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn absolute_definition_zone_tracks_rotation_about_instance_origin() {
+        let mut fp = footprint_with_absolute_zone(45.0, 40.0, 43.0, 39.0);
+        rotate_footprint_definition(
+            &mut fp,
+            crate::builders::mm_to_nm(45.0),
+            crate::builders::mm_to_nm(40.0),
+            90.0,
+        )
+        .unwrap();
+        let p = first_zone_outline_point(&fp);
+        assert!((crate::builders::nm_to_mm(p.x_nm) - 46.0).abs() < 1e-9);
+        assert!((crate::builders::nm_to_mm(p.y_nm) - 38.0).abs() < 1e-9);
+    }
+
     fn footprint_with_absolute_pad(
         fp_x: f64,
         fp_y: f64,
@@ -2656,6 +2685,58 @@ mod footprint_transform_tests {
     fn first_pad(fp: &kiapi::board::types::FootprintInstance) -> kiapi::board::types::Pad {
         let item = &fp.definition.as_ref().unwrap().items[0];
         kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap()
+    }
+
+    fn footprint_with_absolute_zone(
+        fp_x: f64,
+        fp_y: f64,
+        zone_x: f64,
+        zone_y: f64,
+    ) -> kiapi::board::types::FootprintInstance {
+        use kiapi::common::types::{
+            poly_line_node, PolyLine, PolyLineNode, PolySet, PolygonWithHoles,
+        };
+        let zone = kiapi::board::types::Zone {
+            outline: Some(PolySet {
+                polygons: vec![PolygonWithHoles {
+                    outline: Some(PolyLine {
+                        nodes: vec![PolyLineNode {
+                            geometry: Some(poly_line_node::Geometry::Point(crate::builders::vec2(
+                                zone_x, zone_y,
+                            ))),
+                        }],
+                        closed: true,
+                    }),
+                    holes: vec![],
+                }],
+            }),
+            ..Default::default()
+        };
+        kiapi::board::types::FootprintInstance {
+            position: Some(crate::builders::vec2(fp_x, fp_y)),
+            definition: Some(kiapi::board::types::Footprint {
+                items: vec![prost_types::Any {
+                    type_url: "type.googleapis.com/kiapi.board.types.Zone".to_string(),
+                    value: zone.encode_to_vec(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn first_zone_outline_point(
+        fp: &kiapi::board::types::FootprintInstance,
+    ) -> kiapi::common::types::Vector2 {
+        use kiapi::common::types::poly_line_node;
+        let item = &fp.definition.as_ref().unwrap().items[0];
+        let zone = kiapi::board::types::Zone::decode(item.value.as_slice()).unwrap();
+        let outline = zone.outline.unwrap();
+        let node = &outline.polygons[0].outline.as_ref().unwrap().nodes[0];
+        match node.geometry.as_ref().unwrap() {
+            poly_line_node::Geometry::Point(point) => *point,
+            poly_line_node::Geometry::Arc(_) => panic!("expected point"),
+        }
     }
 }
 
@@ -2691,6 +2772,31 @@ fn rotate_polyline(line: &mut kiapi::common::types::PolyLine, cx: i64, cy: i64, 
             }
             None => {}
         }
+    }
+}
+
+fn rotate_polyset(polyset: &mut kiapi::common::types::PolySet, cx: i64, cy: i64, degrees: f64) {
+    for polygon in &mut polyset.polygons {
+        if let Some(line) = &mut polygon.outline {
+            rotate_polyline(line, cx, cy, degrees);
+        }
+        for line in &mut polygon.holes {
+            rotate_polyline(line, cx, cy, degrees);
+        }
+    }
+}
+
+fn rotate_zone(zone: &mut kiapi::board::types::Zone, cx: i64, cy: i64, degrees: f64) {
+    if let Some(outline) = &mut zone.outline {
+        rotate_polyset(outline, cx, cy, degrees);
+    }
+    for filled in &mut zone.filled_polygons {
+        if let Some(shapes) = &mut filled.shapes {
+            rotate_polyset(shapes, cx, cy, degrees);
+        }
+    }
+    for layer in &mut zone.layer_properties {
+        rotate_vector(&mut layer.hatching_offset, cx, cy, degrees);
     }
 }
 
@@ -2797,6 +2903,10 @@ fn rotate_footprint_definition(
             if let Some(text) = &mut v.text {
                 rotate_vector(&mut text.position, cx, cy, degrees);
             }
+            item.value = v.encode_to_vec();
+        } else if item.type_url.ends_with("kiapi.board.types.Zone") {
+            let mut v = kiapi::board::types::Zone::decode(item.value.as_slice())?;
+            rotate_zone(&mut v, cx, cy, degrees);
             item.value = v.encode_to_vec();
         }
     }
@@ -2981,6 +3091,31 @@ fn translate_polyline(line: &mut kiapi::common::types::PolyLine, dx_nm: i64, dy_
     }
 }
 
+fn translate_polyset(polyset: &mut kiapi::common::types::PolySet, dx_nm: i64, dy_nm: i64) {
+    for polygon in &mut polyset.polygons {
+        if let Some(line) = &mut polygon.outline {
+            translate_polyline(line, dx_nm, dy_nm);
+        }
+        for line in &mut polygon.holes {
+            translate_polyline(line, dx_nm, dy_nm);
+        }
+    }
+}
+
+fn translate_zone(zone: &mut kiapi::board::types::Zone, dx_nm: i64, dy_nm: i64) {
+    if let Some(outline) = &mut zone.outline {
+        translate_polyset(outline, dx_nm, dy_nm);
+    }
+    for filled in &mut zone.filled_polygons {
+        if let Some(shapes) = &mut filled.shapes {
+            translate_polyset(shapes, dx_nm, dy_nm);
+        }
+    }
+    for layer in &mut zone.layer_properties {
+        translate_vector(&mut layer.hatching_offset, dx_nm, dy_nm);
+    }
+}
+
 fn translate_graphic_shape(shape: &mut kiapi::common::types::GraphicShape, dx_nm: i64, dy_nm: i64) {
     use kiapi::common::types::graphic_shape::Geometry;
     match &mut shape.geometry {
@@ -3076,6 +3211,10 @@ fn translate_footprint_definition(
                 translate_vector(&mut text.position, dx_nm, dy_nm);
             }
             item.value = board_text.encode_to_vec();
+        } else if item.type_url.ends_with("kiapi.board.types.Zone") {
+            let mut zone = kiapi::board::types::Zone::decode(item.value.as_slice())?;
+            translate_zone(&mut zone, dx_nm, dy_nm);
+            item.value = zone.encode_to_vec();
         }
     }
     Ok(())
