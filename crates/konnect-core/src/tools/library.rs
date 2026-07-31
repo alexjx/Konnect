@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "create_footprint",
             "Create a new footprint (.kicad_mod) file from a pad layout description.",
@@ -64,6 +64,37 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["footprint_path", "pad_number"]
             }),
             |args, ctx| async move { handle_edit_footprint_pad(args, ctx).await }
+        ),
+        tool!(
+            "replace_footprint_pad_layout",
+            "Atomically replace all pads in an existing .kicad_mod file while preserving its graphics, fields, courtyard, attributes, and models.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "footprint_path": { "type": "string" },
+                    "description": { "type": "string" },
+                    "pads": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "number": { "type": "string" },
+                                "type": { "type": "string", "enum": ["thru_hole", "np_thru_hole"] },
+                                "shape": { "type": "string", "enum": ["circle", "oval", "rect", "roundrect"] },
+                                "x": { "type": "number" },
+                                "y": { "type": "number" },
+                                "width": { "type": "number" },
+                                "height": { "type": "number" },
+                                "drill_width": { "type": "number" },
+                                "drill_height": { "type": "number" }
+                            },
+                            "required": ["number", "type", "shape", "x", "y", "width", "height", "drill_width", "drill_height"]
+                        }
+                    }
+                },
+                "required": ["footprint_path", "pads"]
+            }),
+            |args, ctx| async move { handle_replace_footprint_pad_layout(args, ctx).await }
         ),
         tool!(
             "register_footprint_library",
@@ -261,7 +292,9 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_get_symbol_info(args, ctx).await }
         ),
-    ]
+    ];
+    tools.extend(crate::tools::pcb_components::pad_layout_tools());
+    tools
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -461,6 +494,141 @@ async fn handle_edit_footprint_pad(
         serde_json::to_string_pretty(&json!({
             "success": true,
             "pad": pad_number
+        }))
+        .unwrap(),
+    ))
+}
+
+async fn handle_replace_footprint_pad_layout(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let path = get_path(args, "footprint_path")?;
+    let pads = args["pads"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("pads must be an array"))?;
+    let content = tokio::fs::read_to_string(&path).await?;
+    let description = args["description"].as_str();
+
+    // Remove only top-level pad blocks. Everything else in the footprint,
+    // including graphics, fields, courtyard, attributes and models, is kept.
+    let bytes = content.as_bytes();
+    let mut ranges = Vec::<(usize, usize)>::new();
+    let mut i = 0usize;
+    while i + 5 <= bytes.len() {
+        if &bytes[i..i + 5] == b"(pad " {
+            let mut depth = 0i32;
+            let mut quoted = false;
+            let mut escaped = false;
+            let mut end = None;
+            for (offset, ch) in content[i..].char_indices() {
+                if quoted {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        quoted = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => quoted = true,
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i + offset + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end = end.ok_or_else(|| anyhow::anyhow!("Unterminated pad block"))?;
+            let start = content[..i].rfind('\n').map(|p| p + 1).unwrap_or(i);
+            let mut range_end = end;
+            if content.as_bytes().get(range_end) == Some(&b'\r') {
+                range_end += 1;
+            }
+            if content.as_bytes().get(range_end) == Some(&b'\n') {
+                range_end += 1;
+            }
+            ranges.push((start, range_end));
+            i = range_end;
+        } else {
+            i += 1;
+        }
+    }
+
+    let mut stripped = content.clone();
+    for (start, end) in ranges.iter().rev() {
+        stripped.replace_range(*start..*end, "");
+    }
+    if let Some(description) = description {
+        if let Some(start) = stripped.find("(descr \"") {
+            let value_start = start + "(descr \"".len();
+            if let Some(relative_end) = stripped[value_start..].find("\")") {
+                let value_end = value_start + relative_end;
+                stripped.replace_range(value_start..value_end, description);
+            }
+        }
+    }
+    let insert_at = stripped
+        .rfind(')')
+        .ok_or_else(|| anyhow::anyhow!("Invalid footprint: missing closing parenthesis"))?;
+    let mut generated = String::new();
+    for pad in pads {
+        let number = pad["number"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("pad number must be a string"))?;
+        let pad_type = pad["type"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("pad type must be a string"))?;
+        let shape = pad["shape"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("pad shape must be a string"))?;
+        let x = pad["x"]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("pad x missing"))?;
+        let y = pad["y"]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("pad y missing"))?;
+        let width = pad["width"]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("pad width missing"))?;
+        let height = pad["height"]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("pad height missing"))?;
+        let drill_width = pad["drill_width"]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("pad drill_width missing"))?;
+        let drill_height = pad["drill_height"]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("pad drill_height missing"))?;
+        let drill = if (drill_width - drill_height).abs() < 1e-9 {
+            format!("(drill {drill_width})")
+        } else {
+            format!("(drill oval {drill_width} {drill_height})")
+        };
+        let layers = if pad_type == "np_thru_hole" {
+            "\"*.Cu\" \"*.Mask\""
+        } else {
+            "\"*.Cu\" \"*.Mask\""
+        };
+        generated.push_str(&format!(
+            "  (pad \"{number}\" {pad_type} {shape} (at {x} {y}) (size {width} {height}) {drill} (layers {layers}))\n"
+        ));
+    }
+
+    stripped.insert_str(insert_at, &generated);
+    write_atomic(&path, &stripped)?;
+    Ok(CallToolResult::text(
+        serde_json::to_string_pretty(&json!({
+            "success": true,
+            "footprint_path": path,
+            "removed_pad_count": ranges.len(),
+            "pad_count": pads.len()
         }))
         .unwrap(),
     ))

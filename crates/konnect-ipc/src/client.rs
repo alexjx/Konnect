@@ -1735,6 +1735,169 @@ impl KiCadIpcClient {
         anyhow::bail!("Footprint '{}' not found", reference)
     }
 
+    /// Atomically replace the complete pad layout of one live footprint.
+    ///
+    /// Numbered pads inherit their existing nets by pad number. Unnumbered
+    /// NPTH pads have no net. KiCad 10 currently consumes nested footprint pad
+    /// positions in board-absolute coordinates, matching get_footprint_pads().
+    pub fn replace_footprint_pad_layout(
+        &self,
+        reference: &str,
+        pad_specs: &[serde_json::Value],
+        description: Option<&str>,
+    ) -> Result<usize> {
+        use kiapi::board::types::{
+            BoardLayer, DrillProperties, DrillShape, Pad, PadStack, PadStackLayer, PadStackShape,
+            PadStackType, PadType, UnconnectedLayerRemoval,
+        };
+        use kiapi::common::types::LockedState;
+
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in items {
+            let Ok(mut footprint) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let ref_text = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            if ref_text != reference {
+                continue;
+            }
+
+            if let Some(description) = description {
+                if let Some(text) = footprint
+                    .description_field
+                    .as_mut()
+                    .and_then(|field| field.text.as_mut())
+                    .and_then(|board_text| board_text.text.as_mut())
+                {
+                    text.text = description.to_string();
+                }
+            }
+            let definition = footprint
+                .definition
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no definition", reference))?;
+            if let Some(description) = description {
+                if let Some(text) = definition
+                    .description_field
+                    .as_mut()
+                    .and_then(|field| field.text.as_mut())
+                    .and_then(|board_text| board_text.text.as_mut())
+                {
+                    text.text = description.to_string();
+                }
+            }
+            let existing_nets: std::collections::HashMap<String, kiapi::board::types::Net> =
+                definition
+                    .items
+                    .iter()
+                    .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+                    .filter_map(|item| Pad::decode(item.value.as_slice()).ok())
+                    .filter_map(|pad| pad.net.map(|net| (pad.number, net)))
+                    .collect();
+            definition
+                .items
+                .retain(|item| !item.type_url.ends_with("kiapi.board.types.Pad"));
+
+            for spec in pad_specs {
+                let number = spec["number"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("pad number must be a string"))?
+                    .to_string();
+                let pad_type = match spec["type"].as_str() {
+                    Some("thru_hole") => PadType::PtPth,
+                    Some("np_thru_hole") => PadType::PtNpth,
+                    other => anyhow::bail!("Unsupported pad type: {:?}", other),
+                };
+                let pad_shape = match spec["shape"].as_str() {
+                    Some("circle") => PadStackShape::PssCircle,
+                    Some("oval") => PadStackShape::PssOval,
+                    Some("rect") => PadStackShape::PssRectangle,
+                    Some("roundrect") => PadStackShape::PssRoundrect,
+                    other => anyhow::bail!("Unsupported pad shape: {:?}", other),
+                };
+                let read = |name: &str| {
+                    spec[name]
+                        .as_f64()
+                        .ok_or_else(|| anyhow::anyhow!("pad {} missing", name))
+                };
+                let x = read("x")?;
+                let y = read("y")?;
+                let width = read("width")?;
+                let height = read("height")?;
+                let drill_width = read("drill_width")?;
+                let drill_height = read("drill_height")?;
+                let copper = |layer| PadStackLayer {
+                    layer,
+                    shape: pad_shape as i32,
+                    size: Some(crate::builders::vec2(width, height)),
+                    ..Default::default()
+                };
+                let pad = Pad {
+                    id: None,
+                    locked: LockedState::LsUnlocked as i32,
+                    number: number.clone(),
+                    net: existing_nets.get(&number).cloned(),
+                    r#type: pad_type as i32,
+                    pad_stack: Some(PadStack {
+                        r#type: PadStackType::PstNormal as i32,
+                        layers: vec![BoardLayer::BlFCu as i32, BoardLayer::BlBCu as i32],
+                        drill: Some(DrillProperties {
+                            start_layer: BoardLayer::BlFCu as i32,
+                            end_layer: BoardLayer::BlBCu as i32,
+                            diameter: Some(crate::builders::vec2(drill_width, drill_height)),
+                            shape: if (drill_width - drill_height).abs() < 1e-9 {
+                                DrillShape::DsCircle as i32
+                            } else {
+                                DrillShape::DsOblong as i32
+                            },
+                            ..Default::default()
+                        }),
+                        unconnected_layer_removal: UnconnectedLayerRemoval::UlrKeep as i32,
+                        copper_layers: vec![
+                            copper(BoardLayer::BlFCu as i32),
+                            copper(BoardLayer::BlBCu as i32),
+                        ],
+                        ..Default::default()
+                    }),
+                    position: Some(crate::builders::vec2(x, y)),
+                    ..Default::default()
+                };
+                definition
+                    .items
+                    .push(crate::builders::pack_any(&pad, "kiapi.board.types.Pad"));
+            }
+
+            let update =
+                crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+            let commit = self.begin_commit()?;
+            match self.update_items(vec![update]) {
+                Ok(()) => {
+                    if let Err(error) = self.push_commit(
+                        &commit,
+                        &format!("Replace footprint pad layout for {reference}"),
+                    ) {
+                        let _ = self.drop_commit(&commit);
+                        return Err(error);
+                    }
+                    return Ok(pad_specs.len());
+                }
+                Err(error) => {
+                    let _ = self.drop_commit(&commit);
+                    return Err(error);
+                }
+            }
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
     /// Return the 3-D model transforms embedded in one live footprint instance.
     pub fn get_footprint_3d_models(&self, reference: &str) -> Result<Vec<IpcFootprint3DModel>> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;

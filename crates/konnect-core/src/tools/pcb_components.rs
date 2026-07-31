@@ -436,6 +436,41 @@ pub fn tools() -> Vec<ToolDef> {
     ]
 }
 
+pub fn pad_layout_tools() -> Vec<ToolDef> {
+    vec![tool!(
+        "replace_component_pad_layout",
+        "Atomically replace every pad in one live footprint via KiCad IPC while preserving footprint placement, graphics, fields, courtyard and existing numbered-pad nets.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board": { "type": "string" },
+                "reference": { "type": "string" },
+                "description": { "type": "string" },
+                "pads": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "number": { "type": "string" },
+                            "type": { "type": "string", "enum": ["thru_hole", "np_thru_hole"] },
+                            "shape": { "type": "string", "enum": ["circle", "oval", "rect", "roundrect"] },
+                            "x": { "type": "number", "description": "Board-absolute X in mm" },
+                            "y": { "type": "number", "description": "Board-absolute Y in mm" },
+                            "width": { "type": "number" },
+                            "height": { "type": "number" },
+                            "drill_width": { "type": "number" },
+                            "drill_height": { "type": "number" }
+                        },
+                        "required": ["number", "type", "shape", "x", "y", "width", "height", "drill_width", "drill_height"]
+                    }
+                }
+            },
+            "required": ["board", "reference", "pads"]
+        }),
+        |args, ctx| async move { handle_replace_component_pad_layout(args, ctx).await }
+    )]
+}
+
 async fn handle_list_footprint_texts(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1384,6 +1419,34 @@ async fn handle_set_component_pad_nets(
         "pad_nets": mapping,
         "source": "ipc"
     })))
+}
+
+async fn handle_replace_component_pad_layout(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let reference = require_str(args, "reference")
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?
+        .to_string();
+    let pads = args["pads"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("pads must be an array"))?
+        .clone();
+    let pad_count = pads.len();
+    let description = args["description"].as_str().map(str::to_string);
+    let reference_ipc = reference.clone();
+    let result = ipc!(ctx, args, |client| {
+        client.replace_footprint_pad_layout(&reference_ipc, &pads, description.as_deref())
+    });
+    Ok(CallToolResult::text(
+        serde_json::to_string_pretty(&json!({
+            "success": true,
+            "reference": reference,
+            "pad_count": pad_count,
+            "result": result
+        }))
+        .unwrap(),
+    ))
 }
 
 async fn handle_get_component_3d_models(
