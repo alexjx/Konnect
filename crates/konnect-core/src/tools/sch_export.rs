@@ -56,7 +56,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "generate_netlist",
-            "Generate a KiCAD netlist file from the schematic using kicad-cli.",
+            "Generate a KiCad netlist file from a schematic using kicad-cli. This is the canonical netlist-file export.",
             json!({
                 "type": "object",
                 "properties": {

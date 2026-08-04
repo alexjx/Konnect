@@ -59,13 +59,13 @@ Konnect/
 │   │           ├── sch_analysis.rs   # 15 tools (union-find net graph, connectivity)
 │   │           ├── sch_batch.rs      # 10 tools (single-read/single-write atomic operations)
 │   │           ├── sch_export.rs     # 7 tools (SVG/PDF/netlist/ERC)
-│   │           ├── sch_hierarchy.rs  # 12 tools (typed Sheet model, sheet CRUD + hierarchy/page queries + pin lifecycle)
+│   │           ├── sch_hierarchy.rs  # 13 tools (typed Sheet model, sheet CRUD/repair + hierarchy/page queries + pin lifecycle)
 │   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
 │   │           ├── pcb_components.rs # 13 tools (IPC real-time via NNG+protobuf)
 │   │           ├── pcb_routing.rs    # 12 tools (traces, vias, nets, netclasses)
 │   │           ├── pcb_export.rs     # 13 tools (Gerber, PDF, 3D, DRC, DXF/GenCAD/IPC-2581/ODB++)
 │   │           ├── library.rs        # 14 tools (symbol/footprint library management)
-│   │           ├── integration.rs    # 11 tools (JLCPCB SQLite, Freerouting, datasheets)
+│   │           ├── integration.rs    # exact-device datasheet lookup (vendor helpers retained hidden)
 │   │           ├── verification.rs   # 8 tools (DRC, design rules, KiCAD UI)
 │   │           ├── config.rs         # 7 tools (user/project config, design rules)
 │   │           ├── design_review.rs  # 6 tools (decoupling/connection/power/DFM audits)
@@ -248,9 +248,9 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **18 toolsets, 170 exposed tools** + 6 meta-tools (4 routing + 2 observability; see `tool-directory.md`)
-- Baseline `tools/list`: ~19 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): ~176 tools; 36 retained implementations are hidden by the registry filter
+- **18 toolsets, 174 exposed tools** + 6 meta-tools (4 routing + 2 observability; see `tool-directory.md`)
+- Baseline `tools/list`: 18 tools / ~2K tokens (starter kit + meta-tools)
+- Full-catalog `tools/list` (all loaded): ~180 tools; 40 retained implementations are hidden by the registry filter
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unsupported tools exposed** (9 inactive implementations remain hidden)
 - **3 CLI commands removed in KiCAD v10** (specctra DSN/SES, pcb sync — return clear errors)

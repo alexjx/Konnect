@@ -225,7 +225,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_board_outline",
-            "Add a rectangular board outline on the Edge.Cuts layer at specified coordinates.",
+            "Replace the board outline with a rectangular or rounded Edge.Cuts outline at specified coordinates.",
             json!({
                 "type": "object",
                 "properties": {

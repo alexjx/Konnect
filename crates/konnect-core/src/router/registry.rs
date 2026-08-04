@@ -74,6 +74,24 @@ pub static DISABLED_TOOLS: &[DisabledTool] = &[
         name: "get_drc_violations",
         reason: "run_drc provides the same check with a clearer structured result",
     },
+    // Consolidated public workflows: retain the implementations for compatibility
+    // and testing, but expose one canonical operation for each capability.
+    DisabledTool {
+        name: "set_board_size",
+        reason: "use add_board_outline; it replaces the existing outline and also supports rounded corners",
+    },
+    DisabledTool {
+        name: "add_copper_pour",
+        reason: "use add_zone; both create a KiCad IPC copper zone, but add_zone is the canonical board operation",
+    },
+    DisabledTool {
+        name: "export_netlist",
+        reason: "use generate_netlist from sch_export; this legacy PCB wrapper invokes the same schematic CLI export",
+    },
+    DisabledTool {
+        name: "audit_manufacturing",
+        reason: "use validate_for_manufacturing for fab preflight or run_design_review for the consolidated DFM audit",
+    },
     // Specialized or cosmetic operations outside the current skill workflows.
     DisabledTool {
         name: "open_schematic_viewer",
@@ -215,15 +233,15 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_hierarchy",
-        description: "Hierarchical sheets: add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation",
+        description: "Hierarchical sheets: add/edit/move/delete/duplicate and repair sheet instances, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation",
         category: "schematic",
-        tool_count: 12,
+        tool_count: 13,
     },
     ToolsetMeta {
         name: "pcb_board",
         description: "Board outline, layer inspection, zones, and mounting holes",
         category: "pcb",
-        tool_count: 7,
+        tool_count: 6,
     },
     ToolsetMeta {
         name: "pcb_components",
@@ -235,13 +253,13 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_routing",
         description: "Traces, vias, copper pours, net classes, differential pairs",
         category: "pcb",
-        tool_count: 13,
+        tool_count: 12,
     },
     ToolsetMeta {
         name: "pcb_export",
         description: "Gerber, PDF, SVG, 3D model, BOM, netlist, pick-and-place, and zone refill",
         category: "pcb",
-        tool_count: 8,
+        tool_count: 7,
     },
     ToolsetMeta {
         name: "library",
@@ -271,7 +289,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "design_review",
         description: "AI-powered design audits: decoupling, connections, power rails, DFM, BOM health",
         category: "review",
-        tool_count: 6,
+        tool_count: 5,
     },
     ToolsetMeta {
         name: "templates",

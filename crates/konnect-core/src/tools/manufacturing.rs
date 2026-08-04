@@ -50,7 +50,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "validate_for_manufacturing",
             "Pre-flight check before ordering: verifies the design is ready for the target \
-             fab house. Checks board outline, design rules, BOM completeness, and assembly constraints.",
+             fab house. Checks board outline, design rules, BOM completeness, and assembly constraints. \
+             Use run_design_review for the broader DFM audit.",
             json!({
                 "type": "object",
                 "properties": {

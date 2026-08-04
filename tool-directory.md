@@ -10,8 +10,8 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **18 toolsets** organized into 10 categories
-- **170 exposed workflow tools** + **6 always-visible meta-tools** = **176 total**
-- **36 retained implementations are temporarily hidden** by
+- **174 exposed workflow tools** + **6 always-visible meta-tools** = **180 total**
+- **40 retained implementations are temporarily hidden** by
   `router/registry.rs::DISABLED_TOOLS`; removing an entry restores exposure
   without restoring code.
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop.
@@ -48,7 +48,9 @@ and dispatch. Reasons are recorded beside each entry in `DISABLED_TOOLS`.
   `assign_net_to_class`, `autoroute`, `check_freerouting`, `set_design_rules`,
   `copy_routing_pattern`, `set_layer_constraints`.
 - **Superseded by skill-safe workflows:** `move_connected`, `move_region`,
-  `add_power_symbol`, `launch_kicad_ui`, `get_drc_violations`.
+  `add_power_symbol`, `launch_kicad_ui`, `get_drc_violations`,
+  `set_board_size`, `add_copper_pour`, `export_netlist`,
+  `audit_manufacturing`.
 - **Specialized, cosmetic, vendor-specific, or global-preference operations:**
   `open_schematic_viewer`, `group_components`,
   `repair_schematic_instance_paths`, `set_active_layer`, `add_board_text`,
@@ -58,6 +60,25 @@ and dispatch. Reasons are recorded beside each entry in `DISABLED_TOOLS`.
   `download_jlcpcb_database`, `search_jlcpcb_parts`, `get_jlcpcb_part`,
   `suggest_jlcpcb_alternatives`, `get_jlcpcb_database_stats`,
   `enrich_datasheets`, `save_user_config`, `estimate_cost`.
+
+---
+
+## Canonical operations for consolidated capabilities
+
+Use the public operation in this table. The former alternative remains compiled
+but is hidden above, so it cannot be discovered or dispatched by an MCP agent.
+
+| Capability | Canonical tool | Replaced public tool |
+|---|---|---|
+| Board outline replacement | `add_board_outline` | `set_board_size` |
+| Copper-zone creation | `add_zone` | `add_copper_pour` |
+| Netlist-file export | `generate_netlist` | `export_netlist` |
+| Fab readiness | `validate_for_manufacturing` | `audit_manufacturing` |
+| Broad DFM review | `run_design_review` | Standalone `audit_manufacturing` |
+
+`export_manufacturing_package` intentionally remains separate: it composes the
+individual fabrication outputs into one deliverable rather than duplicating a
+single export operation.
 
 ---
 
@@ -180,18 +201,19 @@ and dispatch. Reasons are recorded beside each entry in `DISABLED_TOOLS`.
 |------|-------------|
 | `export_schematic_svg` | Export a schematic sheet to an SVG file using kicad-cli. |
 | `export_schematic_pdf` | Export a schematic sheet to a PDF file using kicad-cli. |
-| `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
+| `generate_netlist` | Generate a KiCad netlist file from a schematic using kicad-cli; canonical netlist-file export. |
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Does not require kicad-cli. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 
-### `sch_hierarchy` ? 12 tools
-**Purpose:** Hierarchical sheets: add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
+### `sch_hierarchy` ? 13 tools
+**Purpose:** Hierarchical sheets: add/edit/move/delete/duplicate and repair sheet instances, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
 **Source:** [`crates/konnect-core/src/tools/sch_hierarchy.rs`](crates/konnect-core/src/tools/sch_hierarchy.rs)
 
 | Tool | Description |
 |------|-------------|
 | `add_hierarchical_sheet` | Insert a hierarchical sheet into a parent schematic, linking it to a child `.kicad_sch` file. Creates the child file if it doesn't exist, or links to an existing one (multi-instance reuse). Patches existing symbols' instance paths if the linked file already has components. |
+| `repair_hierarchical_sheet_instances` | Restore valid project, parent-path, and page instance metadata for every direct child sheet in a root schematic. Does not alter geometry, symbols, wiring, footprints, or child files. |
 | `edit_sheet` | Rename, resize, reposition, or repoint (`Sheetfile`) an existing sheet. |
 | `move_sheet` | Reposition a sheet on the parent canvas without touching any other field. |
 | `delete_sheet` | Remove a sheet reference from the parent schematic. Does not delete the child file. |
@@ -208,21 +230,20 @@ and dispatch. Reasons are recorded beside each entry in `DISABLED_TOOLS`.
 
 ## PCB
 
-### `pcb_board` ? 7 tools
+### `pcb_board` ? 6 tools
 **Purpose:** Board outline, layer inspection, zones, and mounting holes.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
 | Tool | Description |
 |------|-------------|
-| `set_board_size` | Set the PCB board outline to a rectangle on the Edge.Cuts layer. |
 | `get_board_info` | Return metadata about the PCB: title, revision, company, layer count, paper size. |
 | `get_board_extents` | Return the bounding box of all objects on the board (IPC, falls back to file parse). |
 | `get_layer_list` | Return all layers defined in the board with names and types. |
-| `add_board_outline` | Add a rectangular board outline on the Edge.Cuts layer at specified coordinates. |
+| `add_board_outline` | Replace the board outline with a rectangular or rounded Edge.Cuts outline. |
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net. |
 
-### `pcb_components` ? 20 tools
+### `pcb_components` ? 24 tools
 **Purpose:** Place, move, rotate, align, and duplicate PCB footprints.
 **Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
 
@@ -231,6 +252,8 @@ and dispatch. Reasons are recorded beside each entry in `DISABLED_TOOLS`.
 | `place_component` | Place a footprint on the PCB at a given position and layer via KiCAD IPC. |
 | `move_component` | Move a placed footprint to a new X/Y position via KiCAD IPC. |
 | `rotate_component` | Set the rotation angle of a placed footprint via KiCAD IPC. |
+| `set_component_pad_relative_angle` | Set every pad angle in a footprint relative to its body through KiCad IPC. |
+| `flip_component` | Flip a placed footprint between F.Cu and B.Cu through KiCad IPC. |
 | `delete_component` | Remove a footprint from the board via KiCAD IPC. |
 | `find_component` | Find a footprint by reference designator and return its position. |
 | `get_component_pads` | Return pad positions and net assignments for a footprint. |
@@ -260,17 +283,17 @@ and dispatch. Reasons are recorded beside each entry in `DISABLED_TOOLS`.
 | `route_trace` | Route a trace segment between two points on a copper layer via KiCAD IPC. |
 | `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. |
 | `add_via` | Add a through-hole via at a position and assign it to a net via IPC. |
-| `add_copper_pour` | Add a copper fill zone polygon on a layer/net via S-expression insert. |
 | `delete_trace` | Delete a trace segment identified by its UUID via KiCAD IPC. |
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
 | `delete_via` | Delete a via identified by UUID through KiCad IPC. |
+| `modify_vias` | Update existing vias in place by UUID while preserving position, net, layers, lock state, and UUID. |
 | `query_vias` | List vias, optionally filtered by net. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
 | `modify_trace` | Modify a trace segment by deleting and re-adding it with new parameters. |
 | `create_netclass` | Add a netclass definition to the board's design rules (S-expression insert). |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
-### `pcb_export` ? 8 tools
+### `pcb_export` ? 7 tools
 **Purpose:** Gerber, PDF, SVG, 3D model, BOM, netlist, pick-and-place, and zone refill.
 **Source:** [`crates/konnect-core/src/tools/pcb_export.rs`](crates/konnect-core/src/tools/pcb_export.rs)
 
@@ -281,7 +304,6 @@ and dispatch. Reasons are recorded beside each entry in `DISABLED_TOOLS`.
 | `export_svg` | Export the PCB layout to an SVG file using kicad-cli. |
 | `export_3d` | Export the PCB as a 3D model (STEP or VRML) using kicad-cli. |
 | `export_bom` | Generate a Bill of Materials (BOM) CSV from the schematic's component data. |
-| `export_netlist` | Export the PCB netlist in KiCAD or IPC-D-356 format. |
 | `export_position_file` | Generate a component placement (pick-and-place) position file for SMT assembly. |
 | `refill_zones` | Refill all copper pour zones using kicad-cli (`zone-fill`). |
 
@@ -289,7 +311,7 @@ and dispatch. Reasons are recorded beside each entry in `DISABLED_TOOLS`.
 
 ## Library
 
-### `library` ? 13 tools
+### `library` ? 15 tools
 **Purpose:** Symbol libraries, footprint libraries, search and registration.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
@@ -297,6 +319,7 @@ and dispatch. Reasons are recorded beside each entry in `DISABLED_TOOLS`.
 |------|-------------|
 | `create_footprint` | Create a new footprint (`.kicad_mod`) file from a pad layout description. |
 | `edit_footprint_pad` | Edit the size, shape, or position of a pad in an existing `.kicad_mod`. |
+| `replace_footprint_pad_layout` | Atomically replace all pads in an existing `.kicad_mod` while preserving its graphics, fields, courtyard, attributes, and models. |
 | `register_footprint_library` | Register a local footprint library directory in the KiCAD global or project library table. |
 | `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library. |
@@ -357,7 +380,7 @@ and dispatch. Reasons are recorded beside each entry in `DISABLED_TOOLS`.
 
 ## Design Review
 
-### `design_review` ? 6 tools
+### `design_review` ? 5 tools
 **Purpose:** AI-powered design audits: decoupling, connections, power rails, DFM, BOM health.
 **Source:** [`crates/konnect-core/src/tools/design_review.rs`](crates/konnect-core/src/tools/design_review.rs)
 
@@ -366,8 +389,7 @@ and dispatch. Reasons are recorded beside each entry in `DISABLED_TOOLS`.
 | `audit_decoupling` | Check that all ICs have appropriate decoupling caps. Finds power pins without nearby caps and flags wrong values. |
 | `audit_connections` | Check for common connection mistakes: missing pull-ups on I2C/reset, missing series resistors on LEDs, floating inputs, shorted outputs. |
 | `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. |
-| `audit_manufacturing` | DFM checks for the configured fab house: component spacing, silkscreen overlap, via-in-pad, acid traps, board-outline issues. |
-| `run_design_review` | Run all available audit checks and produce a consolidated report. Call this when the user asks "is my board ready?" |
+| `run_design_review` | Run all available audit checks, including DFM, and produce a consolidated report. Call this when the user asks "is my board ready?" |
 | `check_bom_health` | Analyze the BOM for supply-chain risks: parts with no MPN, lifecycle warnings, low stock, unavailable from preferred distributors. |
 
 ---
@@ -399,7 +421,7 @@ and dispatch. Reasons are recorded beside each entry in `DISABLED_TOOLS`.
 | Tool | Description |
 |------|-------------|
 | `export_manufacturing_package` | Generate ALL files needed for PCB fab + assembly in one call: Gerbers, drill, fab-house BOM, pick-and-place. Targets JLCPCB, PCBWay, etc. |
-| `validate_for_manufacturing` | Pre-flight check before ordering: verifies the design is ready for the target fab house (board outline, design rules, BOM completeness, assembly constraints). |
+| `validate_for_manufacturing` | Canonical fab-house pre-flight before ordering: board outline, design rules, BOM completeness, and assembly constraints. Use `run_design_review` for the broader DFM audit. |
 
 ---
 

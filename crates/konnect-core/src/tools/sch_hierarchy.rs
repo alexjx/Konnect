@@ -35,11 +35,25 @@ pub fn tools() -> Vec<ToolDef> {
                     "y": { "type": "number", "description": "Top-left Y in mm. Default: 50" },
                     "width": { "type": "number", "description": "Sheet box width in mm. Default: 80" },
                     "height": { "type": "number", "description": "Sheet box height in mm. Default: 50" },
-                    "project_name": { "type": "string", "description": "Project name key for the page-number instance entry. Default: '' (matches this codebase's existing convention for symbol instances)" }
+                    "project_name": { "type": "string", "description": "Project name key for the page-number instance entry. Defaults to the single sibling .kicad_pro stem, then the schematic stem." },
+                    "parent_instance_path": { "type": "string", "description": "KiCad parent instance path. Defaults to /<parent schematic UUID>, which is correct for direct children of a root sheet; provide explicitly for deeper nesting." }
                 },
                 "required": ["schematic", "sheet_file"]
             }),
             |args, ctx| async move { handle_add_hierarchical_sheet(args, ctx).await }
+        ),
+        tool!(
+            "repair_hierarchical_sheet_instances",
+            "Repair every direct child sheet block in a root schematic so KiCad 10 sees a valid project/page instance entry. Use after copying or renaming a project, or when KiCad reports that it automatically fixed the schematic. Does not change sheet geometry, child files, symbols, wiring, or footprints.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to the root .kicad_sch file" },
+                    "project_name": { "type": "string", "description": "Defaults to the single sibling .kicad_pro stem, then the schematic stem." }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_repair_hierarchical_sheet_instances(args, ctx).await }
         ),
         tool!(
             "edit_sheet",
@@ -58,7 +72,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "width": { "type": "number" }, "height": { "type": "number" },
                     "sheet_name_x": { "type": "number", "description": "Explicit Sheetname field X position" },
                     "sheet_name_y": { "type": "number", "description": "Explicit Sheetname field Y position" },
-                    "project_name": { "type": "string", "description": "Default: ''" }
+                    "project_name": { "type": "string", "description": "Defaults to the project file stem." }
                 },
                 "required": ["schematic", "sheet_name"]
             }),
@@ -107,7 +121,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "source_sheet_name": { "type": "string" },
                     "new_sheet_name": { "type": "string" },
                     "new_file": { "type": "string", "description": "Filename for the copy, resolved relative to the parent's directory. Must not already exist." },
-                    "project_name": { "type": "string", "description": "Default: ''" }
+                    "project_name": { "type": "string", "description": "Defaults to the project file stem." },
+                    "parent_instance_path": { "type": "string", "description": "KiCad parent instance path. Defaults to /<parent schematic UUID> for a root sheet." }
                 },
                 "required": ["schematic", "source_sheet_name", "new_sheet_name", "new_file"]
             }),
@@ -123,7 +138,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Root schematic to start from" },
-                    "project_name": { "type": "string", "description": "Default: ''" }
+                    "project_name": { "type": "string", "description": "Defaults to the project file stem." }
                 },
                 "required": ["schematic"]
             }),
@@ -139,7 +154,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Root schematic to start from" },
-                    "project_name": { "type": "string", "description": "Default: ''" }
+                    "project_name": { "type": "string", "description": "Defaults to the project file stem." }
                 },
                 "required": ["schematic"]
             }),
@@ -158,7 +173,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Path to the parent .kicad_sch file" },
                     "sheet_name": { "type": "string" },
                     "side": { "type": "string", "enum": ["right", "left"], "description": "Which edge to place new pins on. Default: 'right'" },
-                    "project_name": { "type": "string", "description": "Default: ''" }
+                    "project_name": { "type": "string", "description": "Defaults to the project file stem." }
                 },
                 "required": ["schematic", "sheet_name"]
             }),
@@ -257,9 +272,65 @@ fn parent_dir(sch_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn resolve_project_name(args: &Value, sch_path: &Path) -> String {
+    if let Some(name) = opt_str(args, "project_name").filter(|name| !name.trim().is_empty()) {
+        return name.to_string();
+    }
+
+    if let Some(dir) = sch_path.parent() {
+        let mut project_stems = std::fs::read_dir(dir)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("kicad_pro"))
+            .filter_map(|path| {
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+            })
+            .collect::<Vec<_>>();
+        project_stems.sort();
+        project_stems.dedup();
+        if project_stems.len() == 1 {
+            return project_stems.remove(0);
+        }
+    }
+
+    sch_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "project".to_string())
+}
+
+fn parent_instance_path(args: &Value, parent: &cse::Schematic) -> anyhow::Result<String> {
+    if let Some(path) = opt_str(args, "parent_instance_path").filter(|path| !path.trim().is_empty())
+    {
+        return Ok(if path.starts_with('/') {
+            path.trim_end_matches('/').to_string()
+        } else {
+            format!("/{}", path.trim_end_matches('/'))
+        });
+    }
+
+    let uuid = parent
+        .uuid
+        .as_deref()
+        .filter(|uuid| !uuid.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Parent schematic has no UUID; refusing to create an invalid sheet instance"
+            )
+        })?;
+    Ok(format!("/{}", uuid))
+}
+
 fn create_blank_schematic(path: &Path) -> anyhow::Result<()> {
-    let template = "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n";
-    konnect_sexp::writer::write_atomic(path, template)?;
+    let uuid = uuid::Uuid::new_v4();
+    let template = format!(
+        "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n\t(sheet_instances\n\t\t(path \"/\"\n\t\t\t(page \"1\")\n\t\t)\n\t)\n)\n",
+        uuid
+    );
+    konnect_sexp::writer::write_atomic(path, &template)?;
     // Round-trip through cse so the file is normalised to its writer's format,
     // matching the existing `create_schematic` tool's behavior.
     let sch = cse::Schematic::load(path)?;
@@ -345,12 +416,13 @@ async fn handle_add_hierarchical_sheet(
     let y = opt_f64(args, "y").unwrap_or(50.0);
     let width = opt_f64(args, "width").unwrap_or(80.0);
     let height = opt_f64(args, "height").unwrap_or(50.0);
-    let project_name = opt_str(args, "project_name").unwrap_or("").to_string();
+    let project_name = resolve_project_name(args, &parent_path);
 
     let dir = parent_dir(&parent_path);
     let child_path = dir.join(&sheet_file);
 
     let mut parent = cse::Schematic::load(&parent_path)?;
+    let instance_path = parent_instance_path(args, &parent)?;
 
     if parent.sheets.by_name(&sheet_name).is_some() {
         return Ok(CallToolResult::error(format!(
@@ -374,7 +446,7 @@ async fn handle_add_hierarchical_sheet(
         width,
         height,
     );
-    sheet.set_page(&project_name, "/", &page);
+    sheet.set_page(&project_name, &instance_path, &page);
 
     let patched = link_sheet(
         &mut parent,
@@ -395,13 +467,68 @@ async fn handle_add_hierarchical_sheet(
     })))
 }
 
+async fn handle_repair_hierarchical_sheet_instances(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let root_path = get_path(args, "schematic")?;
+    let project_name = resolve_project_name(args, &root_path);
+    let mut root = cse::Schematic::load(&root_path)?;
+    let instance_path = parent_instance_path(args, &root)?;
+    let mut repaired = Vec::new();
+
+    for (index, sheet) in root.sheets.iter_mut().enumerate() {
+        let existing_page = sheet
+            .instances
+            .iter()
+            .find(|instance| instance.project_name == project_name)
+            .or_else(|| sheet.instances.first())
+            .map(|instance| instance.page.clone())
+            .unwrap_or_else(|| (index + 2).to_string());
+        let already_valid = sheet.instances.iter().any(|instance| {
+            instance.project_name == project_name
+                && instance.path == instance_path
+                && instance.page == existing_page
+        });
+        let same_project_count = sheet
+            .instances
+            .iter()
+            .filter(|instance| instance.project_name == project_name)
+            .count();
+
+        if already_valid && same_project_count == 1 {
+            continue;
+        }
+
+        sheet
+            .instances
+            .retain(|instance| instance.project_name != project_name);
+        sheet.set_page(&project_name, &instance_path, &existing_page);
+        repaired.push(json!({
+            "sheet": sheet.name(),
+            "page": existing_page,
+            "path": instance_path
+        }));
+    }
+
+    if !repaired.is_empty() {
+        root.overwrite()?;
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "project_name": project_name,
+        "repaired_count": repaired.len(),
+        "repaired": repaired
+    })))
+}
+
 async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let sheet_name = match require_str(args, "sheet_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let project_name = opt_str(args, "project_name").unwrap_or("").to_string();
+    let project_name = resolve_project_name(args, &sch_path);
 
     let mut sch = cse::Schematic::load(&sch_path)?;
     let sheet = match sch.sheets.by_name_mut(&sheet_name) {
@@ -551,9 +678,10 @@ async fn handle_duplicate_sheet(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let project_name = opt_str(args, "project_name").unwrap_or("").to_string();
+    let project_name = resolve_project_name(args, &sch_path);
 
     let mut parent = cse::Schematic::load(&sch_path)?;
+    let instance_path = parent_instance_path(args, &parent)?;
 
     if parent.sheets.by_name(&new_name).is_some() {
         return Ok(CallToolResult::error(format!(
@@ -613,7 +741,7 @@ async fn handle_duplicate_sheet(
         src_w,
         src_h,
     );
-    new_sheet.set_page(&project_name, "/", &page);
+    new_sheet.set_page(&project_name, &instance_path, &page);
 
     let patched = link_sheet(&mut parent, new_sheet, &new_child, &project_name, true)?;
     parent.overwrite()?;
@@ -632,7 +760,7 @@ async fn handle_get_sheet_hierarchy(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let root_path = get_path(args, "schematic")?;
-    let project_name = opt_str(args, "project_name").unwrap_or("").to_string();
+    let project_name = resolve_project_name(args, &root_path);
 
     if !root_path.exists() {
         return Ok(CallToolResult::error(format!(
@@ -711,7 +839,7 @@ async fn handle_renumber_sheet_pages(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let root_path = get_path(args, "schematic")?;
-    let project_name = opt_str(args, "project_name").unwrap_or("").to_string();
+    let project_name = resolve_project_name(args, &root_path);
 
     if !root_path.exists() {
         return Ok(CallToolResult::error(format!(
@@ -752,6 +880,7 @@ fn renumber_walk(
     let mut sch = cse::Schematic::load(path)?;
     let dir = parent_dir(path);
     let mut changed = false;
+    let schematic_uuid_path = sch.uuid.as_deref().map(|uuid| format!("/{}", uuid));
 
     // Snapshot the sheet order first: recursing below needs `sch` unborrowed.
     let sheet_order: Vec<(String, String)> = sch
@@ -765,7 +894,29 @@ fn renumber_walk(
         *next_page += 1;
         if let Some(sheet) = sch.sheets.by_name_mut(name) {
             if sheet.page(project_name) != Some(page.as_str()) {
-                sheet.set_page(project_name, "/", &page);
+                let mut updated_existing = false;
+                for instance in sheet
+                    .instances
+                    .iter_mut()
+                    .filter(|instance| instance.project_name == project_name)
+                {
+                    instance.page = page.clone();
+                    updated_existing = true;
+                }
+                if !updated_existing {
+                    let fallback_path = sheet
+                        .instances
+                        .first()
+                        .map(|instance| instance.path.clone())
+                        .or_else(|| schematic_uuid_path.clone())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Schematic '{}' has no UUID or existing sheet instance path",
+                                path.display()
+                            )
+                        })?;
+                    sheet.set_page(project_name, &fallback_path, &page);
+                }
                 changed = true;
             }
         }
@@ -1176,8 +1327,58 @@ mod tests {
             "power.kicad_sch"
         );
         assert_eq!(
-            parent.sheets.by_name("Power Supply").unwrap().page(""),
+            parent.sheets.by_name("Power Supply").unwrap().page("root"),
             Some("2")
+        );
+        let sheet = parent.sheets.by_name("Power Supply").unwrap();
+        assert_eq!(sheet.instances.len(), 1);
+        assert_eq!(
+            sheet.instances[0].path,
+            format!("/{}", parent.uuid.as_deref().unwrap())
+        );
+        let root_text = std::fs::read_to_string(&root).unwrap();
+        assert!(root_text.contains("(sheet_instances"));
+    }
+
+    #[tokio::test]
+    async fn repair_hierarchical_sheet_instances_restores_missing_project_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_file": "power.kicad_sch",
+                "sheet_name": "Power"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let mut broken = cse::Schematic::load(&root).unwrap();
+        broken
+            .sheets
+            .by_name_mut("Power")
+            .unwrap()
+            .instances
+            .clear();
+        broken.overwrite().unwrap();
+
+        let result = handle_repair_hierarchical_sheet_instances(
+            &json!({ "schematic": root.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let repaired = cse::Schematic::load(&root).unwrap();
+        let sheet = repaired.sheets.by_name("Power").unwrap();
+        assert_eq!(sheet.page("root"), Some("2"));
+        assert_eq!(
+            sheet.instances[0].path,
+            format!("/{}", repaired.uuid.as_deref().unwrap())
         );
     }
 
@@ -1215,8 +1416,8 @@ mod tests {
         .unwrap();
 
         let parent = cse::Schematic::load(&root).unwrap();
-        assert_eq!(parent.sheets.by_name("A").unwrap().page(""), Some("2"));
-        assert_eq!(parent.sheets.by_name("B").unwrap().page(""), Some("3"));
+        assert_eq!(parent.sheets.by_name("A").unwrap().page("root"), Some("2"));
+        assert_eq!(parent.sheets.by_name("B").unwrap().page("root"), Some("3"));
     }
 
     #[tokio::test]
@@ -1505,8 +1706,8 @@ mod tests {
         assert!(!result.is_error);
 
         let parent = cse::Schematic::load(&root).unwrap();
-        assert_eq!(parent.sheets.by_name("A").unwrap().page(""), Some("2"));
-        assert_eq!(parent.sheets.by_name("C").unwrap().page(""), Some("3"));
+        assert_eq!(parent.sheets.by_name("A").unwrap().page("root"), Some("2"));
+        assert_eq!(parent.sheets.by_name("C").unwrap().page("root"), Some("3"));
     }
 
     #[tokio::test]
@@ -1537,7 +1738,7 @@ mod tests {
         let child = cse::Schematic::load(&child_path).unwrap();
         let sym = child.symbols.by_reference("R1").unwrap();
         assert!(sym.has_instance_path(
-            "",
+            "root",
             &format!("/{}/", {
                 let parent = cse::Schematic::load(&root).unwrap();
                 parent.sheets.by_name("Reused").unwrap().uuid.clone()
