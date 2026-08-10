@@ -29,6 +29,7 @@ Before schematic writes, require one Markdown design document containing the fun
 - Root page: use pinless child-sheet blocks only; no circuit components or internal nets.
 - Give every root-page sheet block the same width and height. Choose the common width from the longest displayed title plus clear horizontal padding; no title may be wider than its block, and shorter titles do not produce shorter blocks.
 - Put each sheet title outside and above its block. Align the title's left edge with the block's left edge and keep a consistent vertical gap between the title baseline and the block's top edge.
+- Never leave a sheet block's built-in `Sheetname` or `Sheetfile` field visible at `(0,0)`. When the root page uses the separate external titles required above, hide both built-in fields through Konnect; otherwise position each field intentionally beside its own block. Export the root page and reject any clipped or overlapping sheet-property text at the page origin or outside the drawing border.
 - Verify equality and containment from rendered title and block bounds, not from nominal coordinates alone.
 - Arrange sheet boxes in page/signal-flow order with even spacing. Reserve the lower-right title block and description area; no sheet box, title, wire, or note may overlap it.
 - Child page: one independently understandable and testable function with one clear central subject.
