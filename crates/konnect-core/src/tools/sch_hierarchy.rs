@@ -13,6 +13,7 @@ use crate::tools::{get_path, opt_f64, opt_str, require_f64, require_str, ToolCon
 use konnect_schematic_editor as cse;
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 pub fn tools() -> Vec<ToolDef> {
@@ -35,6 +36,12 @@ pub fn tools() -> Vec<ToolDef> {
                     "y": { "type": "number", "description": "Top-left Y in mm. Default: 50" },
                     "width": { "type": "number", "description": "Sheet box width in mm. Default: 80" },
                     "height": { "type": "number", "description": "Sheet box height in mm. Default: 50" },
+                    "sheet_name_x": { "type": "number", "description": "Sheetname field X position. Defaults to the sheet X coordinate." },
+                    "sheet_name_y": { "type": "number", "description": "Sheetname field Y position. Defaults to 2.54 mm above the sheet." },
+                    "sheet_file_x": { "type": "number", "description": "Sheetfile field X position. Defaults to the sheet X coordinate." },
+                    "sheet_file_y": { "type": "number", "description": "Sheetfile field Y position. Defaults to 2.54 mm below the sheet." },
+                    "sheet_name_hidden": { "type": "boolean", "description": "Hide the built-in Sheetname field. Useful when a separate title text is used." },
+                    "sheet_file_hidden": { "type": "boolean", "description": "Hide the built-in Sheetfile field. Useful when a separate title text is used." },
                     "project_name": { "type": "string", "description": "Project name key for the page-number instance entry. Defaults to the single sibling .kicad_pro stem, then the schematic stem." },
                     "parent_instance_path": { "type": "string", "description": "KiCad parent instance path. Defaults to /<parent schematic UUID>, which is correct for direct children of a root sheet; provide explicitly for deeper nesting." }
                 },
@@ -57,8 +64,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_sheet",
-            "Rename, resize, reposition, or repoint (Sheetfile) an existing sheet. Provide \
-             at least one of: new_name, new_file, or both x+y, or both width+height. Does \
+            "Rename, resize, reposition, repoint (Sheetfile), or edit built-in sheet fields. Provide \
+             at least one editable field. Does \
              NOT rename the child file on disk when new_file is given — it only repoints \
              the reference; the file itself must already exist at that path.",
             json!({
@@ -72,6 +79,10 @@ pub fn tools() -> Vec<ToolDef> {
                     "width": { "type": "number" }, "height": { "type": "number" },
                     "sheet_name_x": { "type": "number", "description": "Explicit Sheetname field X position" },
                     "sheet_name_y": { "type": "number", "description": "Explicit Sheetname field Y position" },
+                    "sheet_file_x": { "type": "number", "description": "Explicit Sheetfile field X position" },
+                    "sheet_file_y": { "type": "number", "description": "Explicit Sheetfile field Y position" },
+                    "sheet_name_hidden": { "type": "boolean", "description": "Hide or show the built-in Sheetname field" },
+                    "sheet_file_hidden": { "type": "boolean", "description": "Hide or show the built-in Sheetfile field" },
                     "project_name": { "type": "string", "description": "Defaults to the project file stem." }
                 },
                 "required": ["schematic", "sheet_name"]
@@ -402,6 +413,214 @@ fn link_sheet(
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
+fn set_sheet_property_position(sheet: &mut cse::Sheet, name: &str, x: f64, y: f64) {
+    let Some(property) = sheet
+        .properties
+        .iter_mut()
+        .find(|property| property.name == name)
+    else {
+        return;
+    };
+    let rotation = property
+        .sub_nodes
+        .iter()
+        .find(|node| node.tag() == Some("at"))
+        .and_then(|node| node.scalar_args().get(2).cloned())
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let at = cse::sexp::SexpNode::List(vec![
+        cse::sexp::atom("at"),
+        cse::sexp::atom(cse::types::fmt_f64(x)),
+        cse::sexp::atom(cse::types::fmt_f64(y)),
+        cse::sexp::atom(cse::types::fmt_f64(rotation)),
+    ]);
+    if let Some(existing) = property
+        .sub_nodes
+        .iter_mut()
+        .find(|node| node.tag() == Some("at"))
+    {
+        *existing = at;
+    } else {
+        property.sub_nodes.insert(0, at);
+    }
+}
+
+fn set_sheet_property_hidden(sheet: &mut cse::Sheet, name: &str, hidden: bool) {
+    let Some(property) = sheet
+        .properties
+        .iter_mut()
+        .find(|property| property.name == name)
+    else {
+        return;
+    };
+    property.sub_nodes.retain(|node| node.tag() != Some("hide"));
+    if hidden {
+        let insert_at = property
+            .sub_nodes
+            .iter()
+            .position(|node| node.tag() == Some("effects"))
+            .unwrap_or(property.sub_nodes.len());
+        property.sub_nodes.insert(
+            insert_at,
+            cse::sexp::SexpNode::List(vec![cse::sexp::atom("hide"), cse::sexp::atom("yes")]),
+        );
+    }
+}
+
+fn matching_list_end(source: &str, start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in source[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(start + offset + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn tagged_list_ranges(source: &str, tag: &str) -> Vec<(usize, usize)> {
+    let needle = format!("({tag}");
+    let mut ranges = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = source[cursor..].find(&needle) {
+        let start = cursor + relative;
+        let tag_end = start + needle.len();
+        if source[tag_end..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_whitespace() || ch == ')')
+        {
+            if let Some(end) = matching_list_end(source, start) {
+                ranges.push((start, end));
+                cursor = end;
+                continue;
+            }
+        }
+        cursor = tag_end;
+    }
+    ranges
+}
+
+fn quoted_sexp_text(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn patch_property_hidden(block: &str, property_name: &str, hidden: bool) -> anyhow::Result<String> {
+    let needle = format!("(property \"{}\"", quoted_sexp_text(property_name));
+    let property_start = block
+        .find(&needle)
+        .ok_or_else(|| anyhow::anyhow!("Property '{}' not found in sheet", property_name))?;
+    let property_end = matching_list_end(block, property_start)
+        .ok_or_else(|| anyhow::anyhow!("Property '{}' is malformed", property_name))?;
+    let property = &block[property_start..property_end];
+    let mut updated = property.to_string();
+
+    for hide_value in ["yes", "no"] {
+        let hide = format!("(hide {hide_value})");
+        if let Some(pos) = updated.find(&hide) {
+            if hidden {
+                updated.replace_range(pos..pos + hide.len(), "(hide yes)");
+            } else {
+                let line_start = updated[..pos]
+                    .rfind('\n')
+                    .map(|index| index + 1)
+                    .unwrap_or(pos);
+                let line_end = updated[pos..]
+                    .find('\n')
+                    .map(|index| pos + index + 1)
+                    .unwrap_or(pos + hide.len());
+                updated.replace_range(line_start..line_end, "");
+            }
+            return Ok(format!(
+                "{}{}{}",
+                &block[..property_start],
+                updated,
+                &block[property_end..]
+            ));
+        }
+    }
+
+    if hidden {
+        if let Some(effects) = updated.find("(effects") {
+            let line_start = updated[..effects]
+                .rfind('\n')
+                .map(|index| index + 1)
+                .unwrap_or(effects);
+            let indent = &updated[line_start..effects];
+            updated.insert_str(line_start, &format!("{indent}(hide yes)\n"));
+        } else {
+            let property_line_start = block[..property_start]
+                .rfind('\n')
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            let property_indent = &block[property_line_start..property_start];
+            let child_indent = if property_indent.contains('\t') {
+                format!("{property_indent}\t")
+            } else {
+                format!("{property_indent}  ")
+            };
+            let close = updated
+                .rfind(')')
+                .ok_or_else(|| anyhow::anyhow!("Property '{}' is malformed", property_name))?;
+            updated.insert_str(close, &format!("\n{child_indent}(hide yes)"));
+        }
+    }
+
+    Ok(format!(
+        "{}{}{}",
+        &block[..property_start],
+        updated,
+        &block[property_end..]
+    ))
+}
+
+fn patch_sheet_visibility_in_source(
+    path: &Path,
+    sheet_name: &str,
+    sheet_name_hidden: Option<bool>,
+    sheet_file_hidden: Option<bool>,
+) -> anyhow::Result<()> {
+    let source = fs::read_to_string(path)?;
+    let name_needle = format!(
+        "(property \"Sheetname\" \"{}\"",
+        quoted_sexp_text(sheet_name)
+    );
+    let (start, end) = tagged_list_ranges(&source, "sheet")
+        .into_iter()
+        .find(|(start, end)| source[*start..*end].contains(&name_needle))
+        .ok_or_else(|| anyhow::anyhow!("Sheet '{}' not found", sheet_name))?;
+    let mut block = source[start..end].to_string();
+    if let Some(hidden) = sheet_name_hidden {
+        block = patch_property_hidden(&block, "Sheetname", hidden)?;
+    }
+    if let Some(hidden) = sheet_file_hidden {
+        block = patch_property_hidden(&block, "Sheetfile", hidden)?;
+    }
+    let mut updated = source;
+    updated.replace_range(start..end, &block);
+    fs::write(path, updated)?;
+    Ok(())
+}
+
 async fn handle_add_hierarchical_sheet(
     args: &Value,
     _ctx: &ToolContext,
@@ -446,6 +665,24 @@ async fn handle_add_hierarchical_sheet(
         width,
         height,
     );
+    set_sheet_property_position(
+        &mut sheet,
+        "Sheetname",
+        opt_f64(args, "sheet_name_x").unwrap_or(x),
+        opt_f64(args, "sheet_name_y").unwrap_or(y - 2.54),
+    );
+    set_sheet_property_position(
+        &mut sheet,
+        "Sheetfile",
+        opt_f64(args, "sheet_file_x").unwrap_or(x),
+        opt_f64(args, "sheet_file_y").unwrap_or(y + height + 2.54),
+    );
+    if let Some(hidden) = args.get("sheet_name_hidden").and_then(Value::as_bool) {
+        set_sheet_property_hidden(&mut sheet, "Sheetname", hidden);
+    }
+    if let Some(hidden) = args.get("sheet_file_hidden").and_then(Value::as_bool) {
+        set_sheet_property_hidden(&mut sheet, "Sheetfile", hidden);
+    }
     sheet.set_page(&project_name, &instance_path, &page);
 
     let patched = link_sheet(
@@ -530,6 +767,48 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     };
     let project_name = resolve_project_name(args, &sch_path);
 
+    let sheet_name_hidden = args.get("sheet_name_hidden").and_then(Value::as_bool);
+    let sheet_file_hidden = args.get("sheet_file_hidden").and_then(Value::as_bool);
+    let has_model_update = [
+        "new_name",
+        "new_file",
+        "x",
+        "y",
+        "width",
+        "height",
+        "sheet_name_x",
+        "sheet_name_y",
+        "sheet_file_x",
+        "sheet_file_y",
+    ]
+    .iter()
+    .any(|field| args.get(*field).is_some());
+    if !has_model_update && (sheet_name_hidden.is_some() || sheet_file_hidden.is_some()) {
+        patch_sheet_visibility_in_source(
+            &sch_path,
+            &sheet_name,
+            sheet_name_hidden,
+            sheet_file_hidden,
+        )?;
+        let sch = cse::Schematic::load(&sch_path)?;
+        let sheet = sch
+            .sheets
+            .by_name(&sheet_name)
+            .ok_or_else(|| anyhow::anyhow!("Sheet '{}' not found after update", sheet_name))?;
+        let mut changed = Vec::new();
+        if sheet_name_hidden.is_some() {
+            changed.push("sheet_name_visibility");
+        }
+        if sheet_file_hidden.is_some() {
+            changed.push("sheet_file_visibility");
+        }
+        return Ok(CallToolResult::json(&json!({
+            "edited": sheet_name,
+            "changed_fields": changed,
+            "sheet": sheet_json(sheet, &project_name)
+        })));
+    }
+
     let mut sch = cse::Schematic::load(&sch_path)?;
     let sheet = match sch.sheets.by_name_mut(&sheet_name) {
         Some(s) => s,
@@ -559,40 +838,25 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
         changed.push("size");
     }
     if let (Some(x), Some(y)) = (opt_f64(args, "sheet_name_x"), opt_f64(args, "sheet_name_y")) {
-        if let Some(property) = sheet
-            .properties
-            .iter_mut()
-            .find(|property| property.name == "Sheetname")
-        {
-            let rotation = property
-                .sub_nodes
-                .iter()
-                .find(|node| node.tag() == Some("at"))
-                .and_then(|node| node.scalar_args().get(2).cloned())
-                .and_then(|value| value.parse::<f64>().ok())
-                .unwrap_or(0.0);
-            let at = cse::sexp::SexpNode::List(vec![
-                cse::sexp::atom("at"),
-                cse::sexp::atom(cse::types::fmt_f64(x)),
-                cse::sexp::atom(cse::types::fmt_f64(y)),
-                cse::sexp::atom(cse::types::fmt_f64(rotation)),
-            ]);
-            if let Some(existing) = property
-                .sub_nodes
-                .iter_mut()
-                .find(|node| node.tag() == Some("at"))
-            {
-                *existing = at;
-            } else {
-                property.sub_nodes.insert(0, at);
-            }
-            changed.push("sheet_name_position");
-        }
+        set_sheet_property_position(sheet, "Sheetname", x, y);
+        changed.push("sheet_name_position");
+    }
+    if let (Some(x), Some(y)) = (opt_f64(args, "sheet_file_x"), opt_f64(args, "sheet_file_y")) {
+        set_sheet_property_position(sheet, "Sheetfile", x, y);
+        changed.push("sheet_file_position");
+    }
+    if let Some(hidden) = args.get("sheet_name_hidden").and_then(Value::as_bool) {
+        set_sheet_property_hidden(sheet, "Sheetname", hidden);
+        changed.push("sheet_name_visibility");
+    }
+    if let Some(hidden) = args.get("sheet_file_hidden").and_then(Value::as_bool) {
+        set_sheet_property_hidden(sheet, "Sheetfile", hidden);
+        changed.push("sheet_file_visibility");
     }
 
     if changed.is_empty() {
         return Ok(CallToolResult::error(
-            "No fields to change — provide at least one of: new_name, new_file, x+y, width+height, sheet_name_x+sheet_name_y",
+            "No fields to change — provide a name, file, geometry, field position, or field visibility update",
         ));
     }
 
@@ -1433,7 +1697,19 @@ mod tests {
         .unwrap();
 
         let result = handle_edit_sheet(
-            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "new_name": "Renamed", "width": 100.0, "height": 60.0, "sheet_name_x": 12.7, "sheet_name_y": 15.24 }),
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_name": "A",
+                "new_name": "Renamed",
+                "width": 100.0,
+                "height": 60.0,
+                "sheet_name_x": 12.7,
+                "sheet_name_y": 15.24,
+                "sheet_file_x": 12.7,
+                "sheet_file_y": 76.2,
+                "sheet_name_hidden": true,
+                "sheet_file_hidden": true
+            }),
             &ctx,
         )
         .await
@@ -1459,6 +1735,99 @@ mod tests {
             .unwrap();
         assert_eq!(name_at[0], "12.7");
         assert_eq!(name_at[1], "15.24");
+        for property_name in ["Sheetname", "Sheetfile"] {
+            let property = renamed
+                .properties
+                .iter()
+                .find(|property| property.name == property_name)
+                .unwrap();
+            assert!(property.sub_nodes.iter().any(|node| {
+                node.tag() == Some("hide") && node.scalar_args().first().copied() == Some("yes")
+            }));
+        }
+        let file_at = renamed
+            .properties
+            .iter()
+            .find(|property| property.name == "Sheetfile")
+            .and_then(|property| {
+                property
+                    .sub_nodes
+                    .iter()
+                    .find(|node| node.tag() == Some("at"))
+            })
+            .map(|node| node.scalar_args())
+            .unwrap();
+        assert_eq!(file_at[0], "12.7");
+        assert_eq!(file_at[1], "76.2");
+    }
+
+    #[tokio::test]
+    async fn add_sheet_never_places_builtin_fields_at_origin() {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_file": "a.kicad_sch",
+                "sheet_name": "A",
+                "x": 25.0,
+                "y": 50.0,
+                "width": 70.0,
+                "height": 28.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let sheet = parent.sheets.by_name("A").unwrap();
+        let positions: Vec<Vec<&str>> = ["Sheetname", "Sheetfile"]
+            .iter()
+            .map(|name| {
+                sheet
+                    .properties
+                    .iter()
+                    .find(|property| property.name == *name)
+                    .and_then(|property| {
+                        property
+                            .sub_nodes
+                            .iter()
+                            .find(|node| node.tag() == Some("at"))
+                    })
+                    .map(|node| node.scalar_args())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(&positions[0][..2], ["25", "47.46"]);
+        assert_eq!(&positions[1][..2], ["25", "80.54"]);
+    }
+
+    #[test]
+    fn visibility_only_edit_preserves_all_unrelated_source_text() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root.kicad_sch");
+        let before = r#"(kicad_sch
+  (text "unrelated sentinel" (at 12 34 0))
+  (sheet
+    (at 25 50)
+    (size 70 28)
+    (exclude_from_sim no)
+    (property "Sheetname" "A"
+      (at 0 0 0)
+      (effects (font (size 1.27 1.27))))
+    (property "Sheetfile" "a.kicad_sch"
+      (at 0 0 0)
+      (effects (font (size 1.27 1.27)))))
+)"#;
+        fs::write(&root, before).unwrap();
+
+        patch_sheet_visibility_in_source(&root, "A", Some(true), Some(true)).unwrap();
+
+        let after = fs::read_to_string(&root).unwrap();
+        assert_eq!(after.matches("(hide yes)").count(), 2);
+        assert_eq!(after.replace("      (hide yes)\n", ""), before);
     }
 
     #[tokio::test]
