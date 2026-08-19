@@ -60,6 +60,7 @@ fn layer_enum_to_name(layer: i32) -> &'static str {
             kiapi::board::types::BoardLayer::BlBCrtYd => "B.CrtYd",
             kiapi::board::types::BoardLayer::BlFFab => "F.Fab",
             kiapi::board::types::BoardLayer::BlBFab => "B.Fab",
+            kiapi::board::types::BoardLayer::BlDwgsUser => "Dwgs.User",
             kiapi::board::types::BoardLayer::BlEdgeCuts => "Edge.Cuts",
             _ => "Unknown",
         },
@@ -898,7 +899,11 @@ impl KiCadIpcClient {
         if response.status != kiapi::common::types::ItemRequestStatus::IrsOk as i32 {
             anyhow::bail!("DeleteItems request failed with status {}", response.status);
         }
-        if response.deleted_items.len() != requested_count {
+        // KiCad 10.0.x may report IRS_OK while omitting the optional
+        // per-item result array.  In that case the document-level status is
+        // the only success indication; requiring one result per item makes
+        // valid multi-item deletes (for example replacing Edge.Cuts) fail.
+        if !response.deleted_items.is_empty() && response.deleted_items.len() != requested_count {
             anyhow::bail!(
                 "DeleteItems returned {} item results for {} requested items",
                 response.deleted_items.len(),
@@ -1363,6 +1368,191 @@ impl KiCadIpcClient {
         self.delete_items(vec![uuid.to_string()])
     }
 
+    /// Query free-standing board polygon graphics, optionally filtered by layer.
+    pub fn get_board_polygons(&self, layer_filter: Option<&str>) -> Result<Vec<IpcBoardPolygon>> {
+        use kiapi::common::types::graphic_shape::Geometry;
+
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbShape)?;
+        let mut polygons = Vec::new();
+        for item in items {
+            let Ok(graphic) = kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let layer = layer_enum_to_name(graphic.layer);
+            if layer_filter.is_some_and(|filter| filter != layer) {
+                continue;
+            }
+            let Some(shape) = graphic.shape.as_ref() else {
+                continue;
+            };
+            let Some(Geometry::Polygon(polyset)) = shape.geometry.as_ref() else {
+                continue;
+            };
+            let outlines = polyset
+                .polygons
+                .iter()
+                .filter_map(|polygon| polygon.outline.as_ref())
+                .map(polyline_points)
+                .collect::<Vec<_>>();
+            if outlines.is_empty() {
+                continue;
+            }
+            let attributes = shape.attributes.as_ref();
+            let filled = attributes
+                .and_then(|attrs| attrs.fill.as_ref())
+                .is_some_and(|fill| {
+                    fill.fill_type == kiapi::common::types::GraphicFillType::GftFilled as i32
+                });
+            let stroke_width = attributes
+                .and_then(|attrs| attrs.stroke.as_ref())
+                .and_then(|stroke| stroke.width.as_ref())
+                .map(|width| crate::builders::nm_to_mm(width.value_nm))
+                .unwrap_or(0.0);
+            polygons.push(IpcBoardPolygon {
+                uuid: graphic
+                    .id
+                    .as_ref()
+                    .map(|id| id.value.clone())
+                    .unwrap_or_default(),
+                layer: layer.to_string(),
+                filled,
+                stroke_width,
+                outlines,
+            });
+        }
+        Ok(polygons)
+    }
+
+    /// Create one free-standing board polygon through KiCad IPC in an Undo commit.
+    pub fn add_board_polygon(
+        &self,
+        points: &[(f64, f64)],
+        layer: &str,
+        filled: bool,
+        stroke_width: f64,
+    ) -> Result<()> {
+        if points.len() < 3 {
+            anyhow::bail!("Board polygon requires at least 3 points");
+        }
+        if stroke_width < 0.0 {
+            anyhow::bail!("Board polygon stroke width must be non-negative");
+        }
+        if crate::builders::layer_from_name(layer) == kiapi::board::types::BoardLayer::BlUndefined {
+            anyhow::bail!("Unknown board layer '{}'", layer);
+        }
+
+        let mut polygon = crate::builders::board_polygon(layer, filled, &[points.to_vec()]);
+        let shape = polygon
+            .shape
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Polygon builder returned no shape"))?;
+        let attributes = shape.attributes.get_or_insert_with(Default::default);
+        let stroke = attributes.stroke.get_or_insert_with(Default::default);
+        stroke.width = Some(crate::builders::distance(stroke_width));
+
+        let any = crate::builders::pack_any(&polygon, "kiapi.board.types.BoardGraphicShape");
+        let commit = self.begin_commit()?;
+        let result = (|| {
+            self.create_items(vec![any])?;
+            self.push_commit(&commit, "Add board polygon")
+        })();
+        if result.is_err() {
+            let _ = self.drop_commit(&commit);
+        }
+        result
+    }
+
+    /// Replace one free-standing board polygon's outline through KiCad IPC.
+    /// The item UUID and all unspecified attributes remain unchanged.
+    pub fn update_board_polygon(
+        &self,
+        uuid: &str,
+        points: &[(f64, f64)],
+        layer: Option<&str>,
+        filled: Option<bool>,
+        stroke_width: Option<f64>,
+    ) -> Result<()> {
+        use kiapi::common::types::{
+            graphic_shape::Geometry, poly_line_node, GraphicFillAttributes, GraphicFillType,
+            PolyLine, PolyLineNode, PolySet, PolygonWithHoles,
+        };
+
+        if points.len() < 3 {
+            anyhow::bail!("Board polygon requires at least 3 points");
+        }
+
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbShape)?;
+        let mut target = items
+            .into_iter()
+            .filter_map(|item| {
+                kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).ok()
+            })
+            .find(|graphic| graphic.id.as_ref().is_some_and(|id| id.value == uuid))
+            .ok_or_else(|| anyhow::anyhow!("Board polygon '{}' not found", uuid))?;
+
+        let shape = target
+            .shape
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Board graphic '{}' has no shape", uuid))?;
+        if !matches!(shape.geometry, Some(Geometry::Polygon(_))) {
+            anyhow::bail!("Board graphic '{}' is not a polygon", uuid);
+        }
+        shape.geometry = Some(Geometry::Polygon(PolySet {
+            polygons: vec![PolygonWithHoles {
+                outline: Some(PolyLine {
+                    nodes: points
+                        .iter()
+                        .map(|&(x, y)| PolyLineNode {
+                            geometry: Some(poly_line_node::Geometry::Point(crate::builders::vec2(
+                                x, y,
+                            ))),
+                        })
+                        .collect(),
+                    closed: true,
+                }),
+                holes: vec![],
+            }],
+        }));
+
+        if let Some(layer) = layer {
+            let value = crate::builders::layer_from_name(layer);
+            if value == kiapi::board::types::BoardLayer::BlUndefined {
+                anyhow::bail!("Unknown board layer '{}'", layer);
+            }
+            target.layer = value as i32;
+        }
+        if filled.is_some() || stroke_width.is_some() {
+            let attrs = shape.attributes.get_or_insert_with(Default::default);
+            if let Some(filled) = filled {
+                let fill = attrs.fill.get_or_insert_with(|| GraphicFillAttributes {
+                    fill_type: GraphicFillType::GftUnfilled as i32,
+                    color: None,
+                });
+                fill.fill_type = if filled {
+                    GraphicFillType::GftFilled as i32
+                } else {
+                    GraphicFillType::GftUnfilled as i32
+                };
+            }
+            if let Some(width) = stroke_width {
+                let stroke = attrs.stroke.get_or_insert_with(Default::default);
+                stroke.width = Some(crate::builders::distance(width));
+            }
+        }
+
+        let any = crate::builders::pack_any(&target, "kiapi.board.types.BoardGraphicShape");
+        let commit = self.begin_commit()?;
+        let result = (|| {
+            self.update_items(vec![any])?;
+            self.push_commit(&commit, "Update board polygon")
+        })();
+        if result.is_err() {
+            let _ = self.drop_commit(&commit);
+        }
+        result
+    }
+
     /// Move a footprint to a new position.
     pub fn move_footprint(&self, reference: &str, x: f64, y: f64) -> Result<()> {
         // Find the footprint, update position, send UpdateItems
@@ -1471,6 +1661,64 @@ impl KiCadIpcClient {
                     }
                 }
             }
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// Move and rotate a footprint in one KiCad IPC transaction.
+    pub fn transform_footprint(&self, reference: &str, x: f64, y: f64, angle: f64) -> Result<()> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in &items {
+            let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let ref_text = fp
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            if ref_text != reference {
+                continue;
+            }
+
+            let mut update = fp.clone();
+            let old_position = update
+                .position
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no position", reference))?
+                .clone();
+            let old_angle = update
+                .orientation
+                .as_ref()
+                .map(|orientation| orientation.value_degrees)
+                .unwrap_or(0.0);
+            rotate_footprint_definition(
+                &mut update,
+                old_position.x_nm,
+                old_position.y_nm,
+                angle - old_angle,
+            )?;
+            let dx_nm = crate::builders::mm_to_nm(x) - old_position.x_nm;
+            let dy_nm = crate::builders::mm_to_nm(y) - old_position.y_nm;
+            translate_footprint_definition(&mut update, dx_nm, dy_nm)?;
+            update.position = Some(crate::builders::vec2(x, y));
+            update.orientation = Some(kiapi::common::types::Angle {
+                value_degrees: angle,
+            });
+
+            let any = crate::builders::pack_any(&update, "kiapi.board.types.FootprintInstance");
+            let commit = self.begin_commit()?;
+            let result = (|| {
+                self.update_items(vec![any])?;
+                self.push_commit(&commit, &format!("Transform footprint {reference}"))
+            })();
+            if result.is_err() {
+                let _ = self.drop_commit(&commit);
+            }
+            return result;
         }
         anyhow::bail!("Footprint '{}' not found", reference)
     }
@@ -1894,6 +2142,225 @@ impl KiCadIpcClient {
                     return Err(error);
                 }
             }
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// Atomically replace one rectangular courtyard primitive and optionally one
+    /// nested footprint zone outline while preserving the footprint identity and
+    /// every unrelated definition item. An empty `zone_points` slice leaves all
+    /// nested zones unchanged. Coordinates are board-absolute, matching the
+    /// transformed live KiCad 10 footprint definition returned by GetItems.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_footprint_mechanical_geometry(
+        &self,
+        reference: &str,
+        zone_index: usize,
+        zone_points: &[(f64, f64)],
+        zone_layers: &[String],
+        courtyard_layer: &str,
+        courtyard_index: usize,
+        courtyard_x1: f64,
+        courtyard_y1: f64,
+        courtyard_x2: f64,
+        courtyard_y2: f64,
+    ) -> Result<()> {
+        use kiapi::common::types::{
+            graphic_shape::Geometry, poly_line_node, GraphicRectangleAttributes, PolyLine,
+            PolyLineNode, PolySet, PolygonWithHoles,
+        };
+
+        if !zone_points.is_empty() && zone_points.len() < 3 {
+            anyhow::bail!("Footprint zone requires at least 3 points");
+        }
+        let courtyard_layer_value = crate::builders::layer_from_name(courtyard_layer);
+        if courtyard_layer_value == kiapi::board::types::BoardLayer::BlUndefined {
+            anyhow::bail!("Unknown courtyard layer '{}'", courtyard_layer);
+        }
+
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in items {
+            let Ok(mut footprint) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let ref_text = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            if ref_text != reference {
+                continue;
+            }
+
+            let definition = footprint
+                .definition
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no definition", reference))?;
+
+            let mut seen_zones = 0usize;
+            let mut zone_updated = zone_points.is_empty();
+            let mut seen_courtyards = 0usize;
+            let mut courtyard_updated = false;
+            for definition_item in &mut definition.items {
+                if !zone_points.is_empty()
+                    && definition_item.type_url.ends_with("kiapi.board.types.Zone")
+                {
+                    if seen_zones == zone_index {
+                        let mut zone =
+                            kiapi::board::types::Zone::decode(definition_item.value.as_slice())?;
+                        zone.outline = Some(PolySet {
+                            polygons: vec![PolygonWithHoles {
+                                outline: Some(PolyLine {
+                                    nodes: zone_points
+                                        .iter()
+                                        .map(|&(x, y)| PolyLineNode {
+                                            geometry: Some(poly_line_node::Geometry::Point(
+                                                crate::builders::vec2(x, y),
+                                            )),
+                                        })
+                                        .collect(),
+                                    closed: true,
+                                }),
+                                holes: vec![],
+                            }],
+                        });
+                        if !zone_layers.is_empty() {
+                            let mut replacement_layers = Vec::with_capacity(zone_layers.len());
+                            for layer_name in zone_layers {
+                                let layer = crate::builders::layer_from_name(layer_name);
+                                if layer == kiapi::board::types::BoardLayer::BlUndefined {
+                                    anyhow::bail!("Unknown zone layer '{}'", layer_name);
+                                }
+                                replacement_layers.push(layer as i32);
+                            }
+                            zone.layers = replacement_layers;
+                        }
+                        *definition_item =
+                            crate::builders::pack_any(&zone, "kiapi.board.types.Zone");
+                        zone_updated = true;
+                    }
+                    seen_zones += 1;
+                    continue;
+                }
+
+                if !definition_item
+                    .type_url
+                    .ends_with("kiapi.board.types.BoardGraphicShape")
+                {
+                    continue;
+                }
+                let mut graphic = kiapi::board::types::BoardGraphicShape::decode(
+                    definition_item.value.as_slice(),
+                )?;
+                if graphic.layer != courtyard_layer_value as i32 {
+                    continue;
+                }
+                let Some(shape) = graphic.shape.as_mut() else {
+                    continue;
+                };
+                if !matches!(shape.geometry, Some(Geometry::Rectangle(_))) {
+                    continue;
+                }
+                if seen_courtyards == courtyard_index {
+                    shape.geometry = Some(Geometry::Rectangle(GraphicRectangleAttributes {
+                        top_left: Some(crate::builders::vec2(courtyard_x1, courtyard_y1)),
+                        bottom_right: Some(crate::builders::vec2(courtyard_x2, courtyard_y2)),
+                        corner_radius: None,
+                    }));
+                    *definition_item =
+                        crate::builders::pack_any(&graphic, "kiapi.board.types.BoardGraphicShape");
+                    courtyard_updated = true;
+                }
+                seen_courtyards += 1;
+            }
+
+            if !zone_updated {
+                anyhow::bail!(
+                    "Footprint '{}' has no nested zone at index {}",
+                    reference,
+                    zone_index
+                );
+            }
+            if !courtyard_updated {
+                anyhow::bail!(
+                    "Footprint '{}' has no rectangular {} primitive at index {}",
+                    reference,
+                    courtyard_layer,
+                    courtyard_index
+                );
+            }
+
+            let update =
+                crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+            let commit = self.begin_commit()?;
+            let result = (|| {
+                self.update_items(vec![update])?;
+                self.push_commit(
+                    &commit,
+                    &format!("Update footprint mechanical geometry for {reference}"),
+                )
+            })();
+            if result.is_err() {
+                let _ = self.drop_commit(&commit);
+            }
+            return result;
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// Delete all nested zones (including keepouts) from one footprint while
+    /// preserving its identity, transform and every non-zone definition item.
+    pub fn delete_footprint_nested_zones(&self, reference: &str) -> Result<usize> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in items {
+            let Ok(mut footprint) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let ref_text = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            if ref_text != reference {
+                continue;
+            }
+
+            let definition = footprint
+                .definition
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no definition", reference))?;
+            let before = definition.items.len();
+            definition
+                .items
+                .retain(|item| !item.type_url.ends_with("kiapi.board.types.Zone"));
+            let removed = before - definition.items.len();
+            if removed == 0 {
+                return Ok(0);
+            }
+
+            let update =
+                crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+            let commit = self.begin_commit()?;
+            let result = (|| {
+                self.update_items(vec![update])?;
+                self.push_commit(
+                    &commit,
+                    &format!("Delete nested footprint zones from {reference}"),
+                )
+            })();
+            if result.is_err() {
+                let _ = self.drop_commit(&commit);
+            }
+            result?;
+            return Ok(removed);
         }
         anyhow::bail!("Footprint '{}' not found", reference)
     }
@@ -2497,6 +2964,15 @@ fn bounds_for_primitives(items: &[IpcCourtyardPrimitive]) -> Option<IpcBounds> {
 #[cfg(test)]
 mod courtyard_geometry_tests {
     use super::*;
+
+    #[test]
+    fn user_drawings_layer_has_canonical_kicad_name() {
+        assert_eq!(
+            layer_enum_to_name(kiapi::board::types::BoardLayer::BlDwgsUser as i32),
+            "Dwgs.User"
+        );
+    }
+
     #[test]
     fn absolute_rectangle_bounds_are_not_transformed_again() {
         use kiapi::common::types::{
@@ -3003,6 +3479,7 @@ impl KiCadIpcClient {
         clearance: f64,
         min_width: f64,
         points: &[(f64, f64)],
+        holes: &[Vec<(f64, f64)>],
     ) -> Result<()> {
         use kiapi::board::types::{
             zone, CopperZoneSettings, IslandRemovalMode, Zone, ZoneConnectionSettings,
@@ -3029,7 +3506,20 @@ impl KiCadIpcClient {
                         .collect(),
                     closed: true,
                 }),
-                holes: vec![],
+                holes: holes
+                    .iter()
+                    .map(|hole| PolyLine {
+                        nodes: hole
+                            .iter()
+                            .map(|&(x, y)| PolyLineNode {
+                                geometry: Some(poly_line_node::Geometry::Point(
+                                    crate::builders::vec2(x, y),
+                                )),
+                            })
+                            .collect(),
+                        closed: true,
+                    })
+                    .collect(),
             }],
         };
         let zone = Zone {
@@ -3069,6 +3559,55 @@ impl KiCadIpcClient {
             let _ = self.drop_commit(&commit);
             return result;
         }
+        self.refill_zones()
+    }
+
+    /// Replace the outline of one board-level copper zone while preserving all
+    /// electrical and fill settings. Coordinates are board-absolute.
+    pub fn update_copper_zone_outline(&self, uuid: &str, points: &[(f64, f64)]) -> Result<()> {
+        use kiapi::common::types::{
+            poly_line_node, PolyLine, PolyLineNode, PolySet, PolygonWithHoles,
+        };
+
+        if points.len() < 3 {
+            anyhow::bail!("Copper zone outline requires at least 3 points");
+        }
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbZone)?;
+        let mut target = items
+            .into_iter()
+            .filter_map(|item| kiapi::board::types::Zone::decode(item.value.as_slice()).ok())
+            .find(|zone| zone.id.as_ref().is_some_and(|id| id.value == uuid))
+            .ok_or_else(|| anyhow::anyhow!("Copper zone '{}' not found", uuid))?;
+
+        target.outline = Some(PolySet {
+            polygons: vec![PolygonWithHoles {
+                outline: Some(PolyLine {
+                    nodes: points
+                        .iter()
+                        .map(|&(x, y)| PolyLineNode {
+                            geometry: Some(poly_line_node::Geometry::Point(crate::builders::vec2(
+                                x, y,
+                            ))),
+                        })
+                        .collect(),
+                    closed: true,
+                }),
+                holes: vec![],
+            }],
+        });
+        target.filled = false;
+        target.filled_polygons.clear();
+
+        let update = crate::builders::pack_any(&target, "kiapi.board.types.Zone");
+        let commit = self.begin_commit()?;
+        let result = (|| {
+            self.update_items(vec![update])?;
+            self.push_commit(&commit, "Update copper zone outline")
+        })();
+        if result.is_err() {
+            let _ = self.drop_commit(&commit);
+        }
+        result?;
         self.refill_zones()
     }
 }

@@ -55,6 +55,7 @@ pub fn layer_from_name(name: &str) -> kiapi::board::types::BoardLayer {
         "B.CrtYd" | "B.Courtyard" => kiapi::board::types::BoardLayer::BlBCrtYd,
         "F.Fab" => kiapi::board::types::BoardLayer::BlFFab,
         "B.Fab" => kiapi::board::types::BoardLayer::BlBFab,
+        "Dwgs.User" | "User.Drawings" => kiapi::board::types::BoardLayer::BlDwgsUser,
         "Edge.Cuts" => kiapi::board::types::BoardLayer::BlEdgeCuts,
         _ => kiapi::board::types::BoardLayer::BlUndefined,
     }
@@ -462,6 +463,18 @@ pub fn board_text(
 mod tests {
     use super::*;
     use kiapi::common::types::graphic_shape::Geometry;
+
+    #[test]
+    fn user_drawings_layer_accepts_kicad_and_display_names() {
+        assert_eq!(
+            layer_from_name("Dwgs.User"),
+            kiapi::board::types::BoardLayer::BlDwgsUser
+        );
+        assert_eq!(
+            layer_from_name("User.Drawings"),
+            kiapi::board::types::BoardLayer::BlDwgsUser
+        );
+    }
 
     #[test]
     fn segment_populates_start_end_and_layer() {

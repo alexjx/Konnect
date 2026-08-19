@@ -302,6 +302,74 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_delete_board_text(args, ctx).await }
         ),
         tool!(
+            "query_board_polygons",
+            "List free-standing board polygon graphics through KiCad IPC, optionally filtered by layer.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "layer": { "type": "string" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_query_board_polygons(args, ctx).await }
+        ),
+        tool!(
+            "add_board_polygon",
+            "Create one free-standing board polygon through KiCad IPC.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "points": {
+                        "type": "array",
+                        "minItems": 3,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "x": { "type": "number" },
+                                "y": { "type": "number" }
+                            },
+                            "required": ["x", "y"]
+                        }
+                    },
+                    "layer": { "type": "string", "default": "F.SilkS" },
+                    "fill": { "type": "boolean", "default": true },
+                    "stroke_width": { "type": "number", "minimum": 0, "default": 0.1 }
+                },
+                "required": ["board", "points"]
+            }),
+            |args, ctx| async move { handle_add_board_polygon(args, ctx).await }
+        ),
+        tool!(
+            "update_board_polygon",
+            "Replace one free-standing board polygon outline by UUID through KiCad IPC while preserving unspecified attributes.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid": { "type": "string" },
+                    "points": {
+                        "type": "array",
+                        "minItems": 3,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "x": { "type": "number" },
+                                "y": { "type": "number" }
+                            },
+                            "required": ["x", "y"]
+                        }
+                    },
+                    "layer": { "type": "string" },
+                    "fill": { "type": "boolean" },
+                    "stroke_width": { "type": "number", "minimum": 0 }
+                },
+                "required": ["board", "uuid", "points"]
+            }),
+            |args, ctx| async move { handle_update_board_polygon(args, ctx).await }
+        ),
+        tool!(
             "add_zone",
             "Add a copper fill zone polygon on a specified layer and net.",
             json!({
@@ -315,12 +383,48 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Polygon vertices as [{x, y}]",
                         "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } } }
                     },
+                    "holes": {
+                        "type": "array",
+                        "description": "Optional polygon holes, each expressed as an array of [{x, y}] vertices",
+                        "items": {
+                            "type": "array",
+                            "minItems": 3,
+                            "items": {
+                                "type": "object",
+                                "properties": { "x": { "type": "number" }, "y": { "type": "number" } },
+                                "required": ["x", "y"]
+                            }
+                        }
+                    },
                     "clearance":  { "type": "number", "default": 0.2 },
                     "min_width":  { "type": "number", "default": 0.2 }
                 },
                 "required": ["board", "net_name", "layer", "points"]
             }),
             |args, ctx| async move { handle_add_zone(args, ctx).await }
+        ),
+        tool!(
+            "update_zone_outline",
+            "Replace the outline of one existing board-level copper zone by UUID through KiCad IPC while preserving its net, layer, clearance, fill settings, priority and identity.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid": { "type": "string" },
+                    "points": {
+                        "type": "array",
+                        "minItems": 3,
+                        "description": "Board-absolute polygon vertices as [{x, y}]",
+                        "items": {
+                            "type": "object",
+                            "properties": { "x": { "type": "number" }, "y": { "type": "number" } },
+                            "required": ["x", "y"]
+                        }
+                    }
+                },
+                "required": ["board", "uuid", "points"]
+            }),
+            |args, ctx| async move { handle_update_zone_outline(args, ctx).await }
         ),
         tool!(
             "import_svg_logo",
@@ -747,6 +851,123 @@ async fn handle_delete_board_text(
     }
 }
 
+async fn handle_query_board_polygons(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let layer_filter = args["layer"].as_str().map(String::from);
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
+        c.get_board_polygons(layer_filter.as_deref())
+    })
+    .await?
+    {
+        Ok(polygons) => Ok(CallToolResult::json(&json!({
+            "count": polygons.len(),
+            "polygons": polygons.iter().map(|polygon| json!({
+                "uuid": polygon.uuid,
+                "layer": polygon.layer,
+                "fill": polygon.filled,
+                "stroke_width": polygon.stroke_width,
+                "outlines": polygon.outlines
+            })).collect::<Vec<_>>()
+        }))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC query_board_polygons failed: {reason}"
+        ))),
+    }
+}
+
+fn parse_polygon_points(args: &serde_json::Value) -> Result<Vec<(f64, f64)>, &'static str> {
+    let Some(raw_points) = args["points"].as_array() else {
+        return Err("Missing or invalid 'points' array");
+    };
+    let points = raw_points
+        .iter()
+        .map(|point| match (point["x"].as_f64(), point["y"].as_f64()) {
+            (Some(x), Some(y)) => Ok((x, y)),
+            _ => Err("Every polygon point requires numeric x and y"),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if points.len() < 3 {
+        return Err("Board polygon requires at least 3 points");
+    }
+    Ok(points)
+}
+
+async fn handle_add_board_polygon(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let points = match parse_polygon_points(args) {
+        Ok(points) => points,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    let layer = args["layer"].as_str().unwrap_or("F.SilkS").to_string();
+    let fill = args["fill"].as_bool().unwrap_or(true);
+    let stroke_width = args["stroke_width"].as_f64().unwrap_or(0.1);
+    if stroke_width < 0.0 {
+        return Ok(CallToolResult::error("stroke_width must be non-negative"));
+    }
+
+    let points_ipc = points.clone();
+    let layer_ipc = layer.clone();
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |client| {
+        client.add_board_polygon(&points_ipc, &layer_ipc, fill, stroke_width)
+    })
+    .await?
+    {
+        Ok(()) => Ok(CallToolResult::json(&json!({
+            "point_count": points.len(),
+            "layer": layer,
+            "fill": fill,
+            "source": "ipc"
+        }))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC add_board_polygon failed: {reason}"
+        ))),
+    }
+}
+
+async fn handle_update_board_polygon(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let uuid = match require_str(args, "uuid") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let points = match parse_polygon_points(args) {
+        Ok(points) => points,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    let layer = args["layer"].as_str().map(String::from);
+    let fill = args["fill"].as_bool();
+    let stroke_width = args["stroke_width"].as_f64();
+    if stroke_width.is_some_and(|width| width < 0.0) {
+        return Ok(CallToolResult::error("stroke_width must be non-negative"));
+    }
+
+    let uuid_ipc = uuid.clone();
+    let points_ipc = points.clone();
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
+        c.update_board_polygon(&uuid_ipc, &points_ipc, layer.as_deref(), fill, stroke_width)
+    })
+    .await?
+    {
+        Ok(()) => Ok(CallToolResult::json(&json!({
+            "uuid": uuid,
+            "point_count": points.len(),
+            "source": "ipc"
+        }))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC update_board_polygon failed: {reason}"
+        ))),
+    }
+}
+
 async fn handle_add_zone(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -776,19 +997,95 @@ async fn handle_add_zone(
         return Ok(CallToolResult::error("Zone requires at least 3 points"));
     }
 
+    let holes: Vec<Vec<(f64, f64)>> = args["holes"]
+        .as_array()
+        .map(|hole_arrays| {
+            hole_arrays
+                .iter()
+                .filter_map(|hole| {
+                    let points: Vec<(f64, f64)> = hole
+                        .as_array()?
+                        .iter()
+                        .filter_map(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?)))
+                        .collect();
+                    (points.len() >= 3).then_some(points)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let net_ipc = net_name.clone();
     let layer_ipc = layer.clone();
     let points_ipc = points.clone();
+    let holes_ipc = holes.clone();
     match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
-        c.add_copper_zone(&net_ipc, &layer_ipc, clearance, min_width, &points_ipc)
+        c.add_copper_zone(
+            &net_ipc,
+            &layer_ipc,
+            clearance,
+            min_width,
+            &points_ipc,
+            &holes_ipc,
+        )
     })
     .await?
     {
         Ok(()) => Ok(CallToolResult::json(&json!({
-            "net": net_name, "layer": layer, "point_count": points.len(), "source": "ipc"
+            "net": net_name,
+            "layer": layer,
+            "point_count": points.len(),
+            "hole_count": holes.len(),
+            "source": "ipc"
         }))),
         Err(reason) => Ok(CallToolResult::error(format!(
             "KiCad IPC add_zone failed: {reason}"
+        ))),
+    }
+}
+
+async fn handle_update_zone_outline(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let uuid = match require_str(args, "uuid") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let Some(point_values) = args["points"].as_array() else {
+        return Ok(CallToolResult::error("Missing 'points' array"));
+    };
+    let mut points = Vec::with_capacity(point_values.len());
+    for point in point_values {
+        let Some(x) = point["x"].as_f64() else {
+            return Ok(CallToolResult::error("Every zone point requires numeric x"));
+        };
+        let Some(y) = point["y"].as_f64() else {
+            return Ok(CallToolResult::error("Every zone point requires numeric y"));
+        };
+        points.push((x, y));
+    }
+    if points.len() < 3 {
+        return Ok(CallToolResult::error(
+            "Zone outline requires at least 3 points",
+        ));
+    }
+
+    let uuid_ipc = uuid.clone();
+    let points_ipc = points.clone();
+    match with_ipc(ctx.ipc.clone(), board, move |client| {
+        client.update_copper_zone_outline(&uuid_ipc, &points_ipc)
+    })
+    .await?
+    {
+        Ok(()) => Ok(CallToolResult::json(&json!({
+            "uuid": uuid,
+            "point_count": points.len(),
+            "coordinate_space": "board_absolute",
+            "source": "ipc"
+        }))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC update_zone_outline failed: {reason}"
         ))),
     }
 }

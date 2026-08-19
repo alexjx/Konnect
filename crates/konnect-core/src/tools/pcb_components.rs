@@ -75,14 +75,15 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_component",
-            "Move a placed footprint by atomically updating its top-level PCB position. Close the PCB editor before calling so an in-memory board cannot overwrite the file.",
+            "Move a placed footprint, optionally changing its absolute rotation in the same atomic KiCad IPC commit.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":     { "type": "string" },
                     "reference": { "type": "string" },
                     "x":         { "type": "number" },
-                    "y":         { "type": "number" }
+                    "y":         { "type": "number" },
+                    "rotation":  { "type": "number", "description": "Optional absolute rotation angle in degrees" }
                 },
                 "required": ["board", "reference", "x", "y"]
             }),
@@ -468,6 +469,55 @@ pub fn pad_layout_tools() -> Vec<ToolDef> {
             "required": ["board", "reference", "pads"]
         }),
         |args, ctx| async move { handle_replace_component_pad_layout(args, ctx).await }
+    ), tool!(
+        "update_footprint_mechanical_geometry",
+        "Atomically replace one rectangular courtyard primitive and, when zone_points is supplied, one nested footprint zone polygon through KiCad IPC while preserving footprint identity, pads, nets, fields, placement and all unrelated graphics. Coordinates are board-absolute for live PCB footprint instances.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board": { "type": "string" },
+                "reference": { "type": "string" },
+                "zone_index": { "type": "integer", "minimum": 0 },
+                "zone_points": {
+                    "type": "array",
+                    "description": "Polygon vertices in board-absolute coordinates for the live PCB footprint instance.",
+                    "minItems": 3,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "x": { "type": "number" },
+                            "y": { "type": "number" }
+                        },
+                        "required": ["x", "y"]
+                    }
+                },
+                "zone_layers": {
+                    "type": "array",
+                    "description": "Optional replacement copper layers for the nested zone, for example ['F.Cu']. Omit to preserve existing layers.",
+                    "items": { "type": "string" }
+                },
+                "courtyard_layer": { "type": "string", "default": "F.CrtYd" },
+                "courtyard_index": { "type": "integer", "minimum": 0, "default": 0 },
+                "courtyard_x1": { "type": "number", "description": "Board-absolute X coordinate of the first courtyard corner." },
+                "courtyard_y1": { "type": "number", "description": "Board-absolute Y coordinate of the first courtyard corner." },
+                "courtyard_x2": { "type": "number", "description": "Board-absolute X coordinate of the opposite courtyard corner." },
+                "courtyard_y2": { "type": "number", "description": "Board-absolute Y coordinate of the opposite courtyard corner." }
+            },
+            "required": ["board", "reference", "courtyard_x1", "courtyard_y1", "courtyard_x2", "courtyard_y2"]
+        }),
+        |args, ctx| async move { handle_update_footprint_mechanical_geometry(args, ctx).await }
+    ), tool!(
+        "delete_footprint_nested_zones",
+        "Delete every nested zone/keepout from one live PCB footprint through KiCad IPC while preserving placement, pads, nets, fields and all non-zone graphics.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board": { "type": "string" },
+                "reference": { "type": "string" }
+            },
+            "required": ["board", "reference"]
+        }),
+        |args, ctx| async move { handle_delete_footprint_nested_zones(args, ctx).await }
     )]
 }
 
@@ -1140,13 +1190,27 @@ async fn handle_move_component(
     let before = ipc!(ctx, args, |c| c.get_footprint(&lookup_reference))
         .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", reference))?;
     let move_reference = reference.clone();
-    ipc!(ctx, args, |c| c.move_footprint(&move_reference, x, y));
+    let rotation = args.get("rotation").and_then(|value| value.as_f64());
+    if let Some(rotation) = rotation {
+        ipc!(ctx, args, |client| client.transform_footprint(
+            &move_reference,
+            x,
+            y,
+            rotation
+        ));
+    } else {
+        ipc!(ctx, args, |client| client.move_footprint(
+            &move_reference,
+            x,
+            y
+        ));
+    }
     Ok(CallToolResult::json(&json!({
         "moved": reference,
-        "from": { "x": before.position.x, "y": before.position.y },
+        "from": { "x": before.position.x, "y": before.position.y, "rotation": before.rotation },
         "x": x,
         "y": y,
-        "rotation": before.rotation,
+        "rotation": rotation.unwrap_or(before.rotation),
         "method": "kicad_ipc_commit"
     })))
 }
@@ -1447,6 +1511,128 @@ async fn handle_replace_component_pad_layout(
         }))
         .unwrap(),
     ))
+}
+
+async fn handle_update_footprint_mechanical_geometry(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let zone_index = args["zone_index"].as_u64().unwrap_or(0) as usize;
+    let zone_values = args.get("zone_points").and_then(|value| value.as_array());
+    let mut zone_points = Vec::with_capacity(zone_values.map_or(0, Vec::len));
+    if let Some(zone_values) = zone_values {
+        if zone_values.len() < 3 {
+            return Ok(CallToolResult::error(
+                "zone_points must contain at least 3 points when supplied",
+            ));
+        }
+        for point in zone_values {
+            let Some(x) = point["x"].as_f64() else {
+                return Ok(CallToolResult::error("Every zone point requires numeric x"));
+            };
+            let Some(y) = point["y"].as_f64() else {
+                return Ok(CallToolResult::error("Every zone point requires numeric y"));
+            };
+            zone_points.push((x, y));
+        }
+    }
+    let zone_layers = args["zone_layers"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| anyhow::anyhow!("Every zone layer must be a string"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let courtyard_layer = args["courtyard_layer"]
+        .as_str()
+        .unwrap_or("F.CrtYd")
+        .to_string();
+    let courtyard_index = args["courtyard_index"].as_u64().unwrap_or(0) as usize;
+    let courtyard_x1 = match require_f64(args, "courtyard_x1") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let courtyard_y1 = match require_f64(args, "courtyard_y1") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let courtyard_x2 = match require_f64(args, "courtyard_x2") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let courtyard_y2 = match require_f64(args, "courtyard_y2") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+
+    let reference_ipc = reference.clone();
+    let zone_points_ipc = zone_points.clone();
+    let zone_layers_ipc = zone_layers.clone();
+    let courtyard_layer_ipc = courtyard_layer.clone();
+    ipc!(ctx, args, |client| client
+        .update_footprint_mechanical_geometry(
+            &reference_ipc,
+            zone_index,
+            &zone_points_ipc,
+            &zone_layers_ipc,
+            &courtyard_layer_ipc,
+            courtyard_index,
+            courtyard_x1,
+            courtyard_y1,
+            courtyard_x2,
+            courtyard_y2,
+        ));
+
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "zone_index": zone_values.map(|_| json!(zone_index)).unwrap_or(serde_json::Value::Null),
+        "zone_points": zone_values.map_or(serde_json::Value::Null, |values| json!(values)),
+        "zone_coordinate_space": "board_absolute",
+        "zone_layers": if zone_layers.is_empty() { serde_json::Value::Null } else { json!(zone_layers) },
+        "courtyard_layer": courtyard_layer,
+        "courtyard_index": courtyard_index,
+        "courtyard_coordinate_space": "board_absolute",
+        "courtyard": {
+            "x1": courtyard_x1,
+            "y1": courtyard_y1,
+            "x2": courtyard_x2,
+            "y2": courtyard_y2
+        },
+        "source": "ipc"
+    })))
+}
+
+async fn handle_delete_footprint_nested_zones(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let reference_ipc = reference.clone();
+    let removed = ipc!(ctx, args, |client| client
+        .delete_footprint_nested_zones(&reference_ipc));
+
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "removed_zone_count": removed,
+        "source": "ipc"
+    })))
 }
 
 async fn handle_get_component_3d_models(

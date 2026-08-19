@@ -568,7 +568,7 @@ async fn handle_add_copper_pour(
     let layer_ipc = layer.clone();
     let pts_ipc = pts.clone();
     match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |c| {
-        c.add_copper_zone(&net_ipc, &layer_ipc, clearance, min_w, &pts_ipc)
+        c.add_copper_zone(&net_ipc, &layer_ipc, clearance, min_w, &pts_ipc, &[])
     })
     .await?
     {

@@ -111,6 +111,15 @@ pub struct IpcBoardText {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcBoardPolygon {
+    pub uuid: String,
+    pub layer: String,
+    pub filled: bool,
+    pub stroke_width: f64,
+    pub outlines: Vec<Vec<IpcVector2>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcNet {
     pub name: String,
     pub netcode: i32,

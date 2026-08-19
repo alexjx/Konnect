@@ -110,18 +110,6 @@ pub static DISABLED_TOOLS: &[DisabledTool] = &[
         reason: "UI state is unnecessary because PCB mutations name their target layer",
     },
     DisabledTool {
-        name: "add_board_text",
-        reason: "cosmetic board authoring is outside the current placement and routing workflow",
-    },
-    DisabledTool {
-        name: "query_board_texts",
-        reason: "board-text maintenance is outside the current placement and routing workflow",
-    },
-    DisabledTool {
-        name: "delete_board_text",
-        reason: "board-text maintenance is outside the current placement and routing workflow",
-    },
-    DisabledTool {
         name: "import_svg_logo",
         reason: "decorative artwork import is a specialized manual operation",
     },
@@ -239,9 +227,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_board",
-        description: "Board outline, layer inspection, zones, and mounting holes",
+        description: "Board outline, layers, zones, mounting holes, text, and polygon graphics",
         category: "pcb",
-        tool_count: 6,
+        tool_count: 13,
     },
     ToolsetMeta {
         name: "pcb_components",
@@ -265,7 +253,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "library",
         description: "Symbol libraries, footprint libraries, search and registration",
         category: "library",
-        tool_count: 15,
+        tool_count: 17,
     },
     ToolsetMeta {
         name: "integration",
