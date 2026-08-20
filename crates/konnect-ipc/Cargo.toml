@@ -12,6 +12,7 @@ tokio.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 # NNG + Protobuf for KiCAD 10 IPC API
 nng.workspace = true

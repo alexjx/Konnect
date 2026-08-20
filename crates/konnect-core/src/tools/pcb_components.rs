@@ -145,13 +145,22 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_component",
-            "Update the value or other properties of a placed footprint via KiCAD IPC.",
+            "Update supported properties of a placed footprint via KiCAD IPC. Assembly attributes are independently optional; omitted attributes are preserved.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":     { "type": "string" },
                     "reference": { "type": "string" },
-                    "value":     { "type": "string", "description": "New value string (optional)" }
+                    "value":     { "type": "string", "description": "New value string (currently query-only; edit in schematic and update PCB)" },
+                    "exclude_from_bom": { "type": "boolean", "description": "Exclude this footprint from the production BOM (optional)" },
+                    "dnp": { "type": "boolean", "description": "Mark this footprint Do Not Populate (optional)" },
+                    "x": { "type": "number", "description": "Reference text X position in board mm (optional)" },
+                    "y": { "type": "number", "description": "Reference text Y position in board mm (optional)" },
+                    "width": { "type": "number", "description": "Reference text width in mm (optional, >= 1.0)" },
+                    "height": { "type": "number", "description": "Reference text height in mm (optional, >= 1.0)" },
+                    "stroke_width": { "type": "number", "description": "Reference text stroke in mm (optional, >= 0.15)" },
+                    "rotation": { "type": "number", "description": "Reference text rotation in degrees (optional)" },
+                    "visible": { "type": "boolean", "description": "Reference text visibility (optional)" }
                 },
                 "required": ["board", "reference"]
             }),
@@ -193,8 +202,13 @@ pub fn tools() -> Vec<ToolDef> {
                     "reference": { "type": "string" },
                     "pad_nets": {
                         "type": "object",
-                        "description": "Map of pad number to existing board net name",
-                        "additionalProperties": { "type": "string" }
+                        "description": "Map of pad number to an existing board net name, or null to clear the pad net",
+                        "additionalProperties": {
+                            "oneOf": [
+                                { "type": "string" },
+                                { "type": "null" }
+                            ]
+                        }
                     }
                 },
                 "required": ["board", "reference", "pad_nets"]
@@ -439,6 +453,128 @@ pub fn tools() -> Vec<ToolDef> {
 
 pub fn pad_layout_tools() -> Vec<ToolDef> {
     vec![tool!(
+        "clone_component_instance",
+        "Clone a complete live footprint instance as a new reference while explicitly setting library identity, placement, schematic association and optional 3-D model filename.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board": { "type": "string" },
+                "source_reference": { "type": "string" },
+                "new_reference": { "type": "string" },
+                "value": { "type": "string" },
+                "footprint": { "type": "string", "description": "Library:Footprint" },
+                "x": { "type": "number" }, "y": { "type": "number" },
+                "rotation": { "type": "number", "default": 0 },
+                "layer": { "type": "string", "default": "F.Cu" },
+                "symbol_path": { "type": "string" },
+                "sheet_name": { "type": "string" },
+                "sheet_file": { "type": "string" },
+                "model_filename": { "type": "string" },
+                "exclude_from_bom": { "type": "boolean", "default": false },
+                "dnp": { "type": "boolean", "default": false }
+            },
+            "required": ["board", "source_reference", "new_reference", "value", "footprint", "x", "y", "symbol_path", "sheet_name", "sheet_file"]
+        }),
+        |args, ctx| async move { handle_clone_component_instance(args, ctx).await }
+    ), tool!(
+        "replace_component_footprint",
+        "Atomically replace one live footprint with an exact library footprint while preserving its KIID and schematic association; pad nets are assigned explicitly by pad number.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board": { "type": "string" },
+                "reference": { "type": "string" },
+                "footprint": { "type": "string", "description": "Library:Footprint" },
+                "value": { "type": "string" },
+                "x": { "type": "number" },
+                "y": { "type": "number" },
+                "rotation": { "type": "number", "default": 0 },
+                "layer": { "type": "string", "default": "F.Cu" },
+                "pad_nets": {
+                    "type": "object",
+                    "description": "Exact pad-number to existing PCB net-name mapping",
+                    "additionalProperties": { "type": "string" }
+                },
+                "exclude_from_bom": { "type": "boolean", "default": false },
+                "dnp": { "type": "boolean", "default": false }
+            },
+            "required": ["board", "reference", "footprint", "value", "x", "y", "pad_nets"]
+        }),
+        |args, ctx| async move { handle_replace_component_footprint(args, ctx).await }
+    ), tool!(
+        "replace_footprint_user_texts",
+        "Atomically replace all non-field user texts in one live footprint with explicit board-absolute text definitions.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board": { "type": "string" },
+                "reference": { "type": "string" },
+                "texts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": { "type": "string" },
+                            "layer": { "type": "string" },
+                            "x": { "type": "number" },
+                            "y": { "type": "number" },
+                            "rotation": { "type": "number", "default": 0 },
+                            "size": { "type": "number" },
+                            "stroke_width": { "type": "number" }
+                        },
+                        "required": ["text", "layer", "x", "y", "size", "stroke_width"]
+                    }
+                }
+            },
+            "required": ["board", "reference", "texts"]
+        }),
+        |args, ctx| async move { handle_replace_footprint_user_texts(args, ctx).await }
+    ), tool!(
+        "normalize_two_pad_smd_footprint",
+        "Atomically replace a live footprint's library identity and optional two-pad SMD nominal pad geometry while preserving UUIDs, placement, graphics, fields, assembly attributes, pad nets and tracks.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board": { "type": "string" },
+                "reference": { "type": "string" },
+                "library_nickname": { "type": "string" },
+                "entry_name": { "type": "string" },
+                "value": { "type": "string", "description": "Optional displayed footprint value; defaults to entry_name" },
+                "description": { "type": "string" },
+                "keywords": { "type": "string" },
+                "pad_spacing": { "type": "number", "exclusiveMinimum": 0 },
+                "pad_width": { "type": "number", "exclusiveMinimum": 0 },
+                "pad_height": { "type": "number", "exclusiveMinimum": 0 }
+                ,"pad_roundrect_ratio": { "type": "number", "minimum": 0, "maximum": 0.5 }
+                ,"courtyard_half_span": { "type": "number", "exclusiveMinimum": 0 }
+                ,"silk_segment_half_length": { "type": "number", "exclusiveMinimum": 0 }
+            },
+            "required": ["board", "reference", "library_nickname", "entry_name"]
+        }),
+        |args, ctx| async move { handle_normalize_two_pad_smd_footprint(args, ctx).await }
+    ), tool!(
+        "set_component_3d_model",
+        "Replace all embedded 3-D models in one live footprint with one explicitly defined model.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board": { "type": "string" },
+                "reference": { "type": "string" },
+                "filename": { "type": "string" },
+                "offset_x": { "type": "number", "default": 0 },
+                "offset_y": { "type": "number", "default": 0 },
+                "offset_z": { "type": "number", "default": 0 },
+                "rotation_x": { "type": "number", "default": 0 },
+                "rotation_y": { "type": "number", "default": 0 },
+                "rotation_z": { "type": "number", "default": 0 },
+                "scale_x": { "type": "number", "default": 1 },
+                "scale_y": { "type": "number", "default": 1 },
+                "scale_z": { "type": "number", "default": 1 }
+            },
+            "required": ["board", "reference", "filename"]
+        }),
+        |args, ctx| async move { handle_set_component_3d_model(args, ctx).await }
+    ), tool!(
         "replace_component_pad_layout",
         "Atomically replace every pad in one live footprint via KiCad IPC while preserving footprint placement, graphics, fields, courtyard and existing numbered-pad nets.",
         json!({
@@ -460,7 +596,8 @@ pub fn pad_layout_tools() -> Vec<ToolDef> {
                             "width": { "type": "number" },
                             "height": { "type": "number" },
                             "drill_width": { "type": "number" },
-                            "drill_height": { "type": "number" }
+                            "drill_height": { "type": "number" },
+                            "roundrect_ratio": { "type": "number", "minimum": 0, "maximum": 0.5, "description": "Optional corner radius ratio for roundrect pads" }
                         },
                         "required": ["number", "type", "shape", "x", "y", "width", "height", "drill_width", "drill_height"]
                     }
@@ -469,6 +606,38 @@ pub fn pad_layout_tools() -> Vec<ToolDef> {
             "required": ["board", "reference", "pads"]
         }),
         |args, ctx| async move { handle_replace_component_pad_layout(args, ctx).await }
+    ), tool!(
+        "replace_footprint_graphic_segments",
+        "Atomically replace all nested footprint graphic shapes on selected layers with explicit straight segments through KiCad IPC. Pads, nets, fields, user text, placement, 3-D models and unrelated layers are preserved. Coordinates are board-absolute for live KiCad 10 footprint instances.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board": { "type": "string" },
+                "reference": { "type": "string" },
+                "layers": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string" }
+                },
+                "segments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "layer": { "type": "string" },
+                            "width": { "type": "number", "exclusiveMinimum": 0 },
+                            "x1": { "type": "number" },
+                            "y1": { "type": "number" },
+                            "x2": { "type": "number" },
+                            "y2": { "type": "number" }
+                        },
+                        "required": ["layer", "width", "x1", "y1", "x2", "y2"]
+                    }
+                }
+            },
+            "required": ["board", "reference", "layers", "segments"]
+        }),
+        |args, ctx| async move { handle_replace_footprint_graphic_segments(args, ctx).await }
     ), tool!(
         "update_footprint_mechanical_geometry",
         "Atomically replace one rectangular courtyard primitive and, when zone_points is supplied, one nested footprint zone polygon through KiCad IPC while preserving footprint identity, pads, nets, fields, placement and all unrelated graphics. Coordinates are board-absolute for live PCB footprint instances.",
@@ -506,6 +675,35 @@ pub fn pad_layout_tools() -> Vec<ToolDef> {
             "required": ["board", "reference", "courtyard_x1", "courtyard_y1", "courtyard_x2", "courtyard_y2"]
         }),
         |args, ctx| async move { handle_update_footprint_mechanical_geometry(args, ctx).await }
+    ), tool!(
+        "set_footprint_graphics_layer",
+        "Atomically move all nested graphic shapes and user text on one layer of a live footprint to another layer and optionally update exact-match user texts through KiCad IPC while preserving placement, pads, nets, fields and unrelated graphics.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board": { "type": "string" },
+                "reference": { "type": "string" },
+                "from_layer": { "type": "string" },
+                "to_layer": { "type": "string" },
+                "text_updates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "match_text": { "type": "string" },
+                            "new_text": { "type": "string" },
+                            "x": { "type": "number", "description": "Board-absolute X coordinate in mm" },
+                            "y": { "type": "number", "description": "Board-absolute Y coordinate in mm" },
+                            "rotation": { "type": "number" },
+                            "layer": { "type": "string" }
+                        },
+                        "required": ["match_text"]
+                    }
+                }
+            },
+            "required": ["board", "reference", "from_layer", "to_layer"]
+        }),
+        |args, ctx| async move { handle_set_footprint_graphics_layer(args, ctx).await }
     ), tool!(
         "delete_footprint_nested_zones",
         "Delete every nested zone/keepout from one live PCB footprint through KiCad IPC while preserving placement, pads, nets, fields and all non-zone graphics.",
@@ -546,6 +744,7 @@ async fn handle_edit_footprint_reference(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
     let reference = match require_str(args, "reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -1168,6 +1367,113 @@ async fn handle_place_component(
     })))
 }
 
+async fn handle_replace_component_footprint(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let footprint = match require_str(args, "footprint") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let (library_nickname, entry_name) = match footprint.split_once(':') {
+        Some(parts) => parts,
+        None => {
+            return Ok(CallToolResult::error(
+                "footprint must use the Library:Footprint form",
+            ))
+        }
+    };
+    let kicad_root = std::path::Path::new(&ctx.config.kicad_cli)
+        .parent()
+        .and_then(std::path::Path::parent);
+    let Some(kicad_root) = kicad_root else {
+        return Ok(CallToolResult::error(
+            "Cannot derive the KiCad installation root from kicad_cli",
+        ));
+    };
+    let footprint_path = kicad_root
+        .join("share")
+        .join("kicad")
+        .join("footprints")
+        .join(format!("{}.pretty", library_nickname))
+        .join(format!("{}.kicad_mod", entry_name));
+    let library_contents = match tokio::fs::read_to_string(&footprint_path).await {
+        Ok(contents) => contents,
+        Err(error) => {
+            return Ok(CallToolResult::error(format!(
+                "Cannot read library footprint '{}': {}",
+                footprint_path.display(),
+                error
+            )))
+        }
+    };
+    let value = match require_str(args, "value") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let x = match require_f64(args, "x") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let y = match require_f64(args, "y") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let rotation = args["rotation"].as_f64().unwrap_or(0.0);
+    let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
+    let exclude_from_bom = args["exclude_from_bom"].as_bool().unwrap_or(false);
+    let dnp = args["dnp"].as_bool().unwrap_or(false);
+    let pad_nets: Vec<(String, String)> = match args["pad_nets"].as_object() {
+        Some(mapping) => {
+            let mut values = Vec::with_capacity(mapping.len());
+            for (pad, net) in mapping {
+                let Some(net) = net.as_str() else {
+                    return Ok(CallToolResult::error(format!(
+                        "pad_nets['{}'] must be a string",
+                        pad
+                    )));
+                };
+                values.push((pad.clone(), net.to_string()));
+            }
+            values
+        }
+        None => return Ok(CallToolResult::error("pad_nets must be an object")),
+    };
+
+    let reference_ipc = reference.clone();
+    let footprint_ipc = footprint.clone();
+    let library_contents_ipc = library_contents.clone();
+    let value_ipc = value.clone();
+    let result = ipc!(ctx, args, |client| client.replace_footprint_from_library(
+        &reference_ipc,
+        &footprint_ipc,
+        &library_contents_ipc,
+        &value_ipc,
+        x,
+        y,
+        rotation,
+        &layer,
+        &pad_nets,
+        exclude_from_bom,
+        dnp,
+    ));
+    Ok(CallToolResult::json(&json!({
+        "reference": result.reference,
+        "value": result.value,
+        "footprint": result.footprint,
+        "x": result.position.x,
+        "y": result.position.y,
+        "rotation": result.rotation,
+        "layer": result.layer,
+        "exclude_from_bom": result.exclude_from_bom,
+        "dnp": result.dnp
+    })))
+}
+
 async fn handle_move_component(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1374,21 +1680,104 @@ async fn handle_edit_component(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    // IPC doesn't have a direct "set value" command; re-get the footprint and report
-    // For now this is a query + informational response. Full field edits require S-expr.
     let reference = match require_str(args, "reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let fp = ipc!(ctx, args, |c| {
-        c.get_footprint(&reference)?
-            .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", reference))
-    });
+    let before_reference = reference.clone();
+    let before = ipc!(ctx, args, |client| client
+        .get_footprint(&before_reference)?
+        .ok_or_else(|| anyhow::anyhow!(
+            "Footprint '{}' not found",
+            before_reference
+        )));
+    let requested_exclude = args
+        .get("exclude_from_bom")
+        .and_then(|value| value.as_bool());
+    let requested_dnp = args.get("dnp").and_then(|value| value.as_bool());
+    let width = optional_f64(args, "width");
+    let height = optional_f64(args, "height");
+    let stroke = optional_f64(args, "stroke_width");
+    let x = optional_f64(args, "x");
+    let y = optional_f64(args, "y");
+    let rotation = optional_f64(args, "rotation");
+    let visible = args.get("visible").and_then(|value| value.as_bool());
+    if width.is_some_and(|value| value < 1.0) || height.is_some_and(|value| value < 1.0) {
+        return Ok(CallToolResult::error(
+            "JLCPCB text width/height must be >= 1.0 mm",
+        ));
+    }
+    if stroke.is_some_and(|value| value < 0.15) {
+        return Ok(CallToolResult::error(
+            "JLCPCB silkscreen stroke width must be >= 0.15 mm",
+        ));
+    }
+    let exclude_from_bom = requested_exclude.unwrap_or(before.exclude_from_bom);
+    let dnp = requested_dnp.unwrap_or(before.dnp);
+    if requested_exclude.is_some() || requested_dnp.is_some() {
+        let update_reference = reference.clone();
+        ipc!(ctx, args, |client| client
+            .set_footprint_assembly_attributes(
+                &update_reference,
+                exclude_from_bom,
+                dnp
+            ));
+    }
+    let edits_reference_text = [x, y, width, height, stroke, rotation]
+        .into_iter()
+        .any(|value| value.is_some())
+        || visible.is_some();
+    if edits_reference_text {
+        let text_reference = reference.clone();
+        ipc!(ctx, args, |client| client.edit_reference_text(
+            &text_reference,
+            x,
+            y,
+            width,
+            height,
+            stroke,
+            rotation,
+            visible
+        ));
+    }
+    let after_reference = reference.clone();
+    let after = ipc!(ctx, args, |client| client
+        .get_footprint(&after_reference)?
+        .ok_or_else(|| anyhow::anyhow!(
+            "Footprint '{}' missing after update",
+            after_reference
+        )));
+    if after.exclude_from_bom != exclude_from_bom || after.dnp != dnp {
+        return Ok(CallToolResult::error(format!(
+            "KiCad did not retain requested assembly attributes for '{}'",
+            reference
+        )));
+    }
+
     Ok(CallToolResult::json(&json!({
-        "reference": fp.reference,
-        "value": fp.value,
-        "footprint": fp.footprint,
-        "note": "Field edits via IPC are not yet supported. Edit in the schematic (edit_schematic_component), then open the PCB in KiCAD and run Tools > Update PCB from Schematic."
+        "reference": reference,
+        "before": {
+            "exclude_from_bom": before.exclude_from_bom,
+            "dnp": before.dnp
+        },
+        "after": {
+            "exclude_from_bom": after.exclude_from_bom,
+            "dnp": after.dnp
+        },
+        "value": after.value,
+        "footprint": after.footprint,
+        "method": if requested_exclude.is_some() || requested_dnp.is_some() {
+            "kicad_ipc_commit"
+        } else if edits_reference_text {
+            "kicad_ipc_reference_text_commit"
+        } else {
+            "query_only"
+        },
+        "note": if args.get("value").is_some() {
+            "Value edits via IPC are not yet supported; edit the schematic and update PCB."
+        } else {
+            ""
+        }
     })))
 }
 
@@ -1412,6 +1801,8 @@ async fn handle_find_component(
         "definition_anchor": { "x": fp.definition_anchor.x, "y": fp.definition_anchor.y },
         "definition_item_samples": fp.definition_item_samples,
         "definition_item_types": fp.definition_item_types,
+        "exclude_from_bom": fp.exclude_from_bom,
+        "dnp": fp.dnp,
         "rotation": fp.rotation, "layer": fp.layer
     })))
 }
@@ -1464,13 +1855,17 @@ async fn handle_set_component_pad_nets(
     }
     let mut pad_nets = Vec::with_capacity(mapping.len());
     for (pad_number, net_name) in mapping {
-        let Some(net_name) = net_name.as_str() else {
+        let parsed_net_name = if net_name.is_null() {
+            None
+        } else if let Some(net_name) = net_name.as_str() {
+            Some(net_name.to_string())
+        } else {
             return Ok(CallToolResult::error(format!(
-                "Net name for pad '{}' must be a string",
+                "Net assignment for pad '{}' must be a string or null",
                 pad_number
             )));
         };
-        pad_nets.push((pad_number.clone(), net_name.to_string()));
+        pad_nets.push((pad_number.clone(), parsed_net_name));
     }
 
     let reference_ipc = reference.clone();
@@ -1511,6 +1906,103 @@ async fn handle_replace_component_pad_layout(
         }))
         .unwrap(),
     ))
+}
+
+async fn handle_normalize_two_pad_smd_footprint(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let reference = require_str(args, "reference")
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?
+        .to_string();
+    let library_nickname = require_str(args, "library_nickname")
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?
+        .to_string();
+    let entry_name = require_str(args, "entry_name")
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?
+        .to_string();
+    let description = args["description"].as_str().map(str::to_string);
+    let keywords = args["keywords"].as_str().map(str::to_string);
+    let value = args["value"].as_str().map(str::to_string);
+    let spacing = args["pad_spacing"].as_f64();
+    let width = args["pad_width"].as_f64();
+    let height = args["pad_height"].as_f64();
+    let pad_roundrect_ratio = args["pad_roundrect_ratio"].as_f64();
+    let courtyard_half_span = args["courtyard_half_span"].as_f64();
+    let silk_segment_half_length = args["silk_segment_half_length"].as_f64();
+    let reference_ipc = reference.clone();
+    let library_nickname_ipc = library_nickname.clone();
+    let entry_name_ipc = entry_name.clone();
+    let description_ipc = description.clone();
+    let keywords_ipc = keywords.clone();
+    let value_ipc = value.clone();
+    let changed_pads = ipc!(ctx, args, |client| client.normalize_two_pad_smd_footprint(
+        &reference_ipc,
+        &library_nickname_ipc,
+        &entry_name_ipc,
+        value_ipc.as_deref(),
+        description_ipc.as_deref(),
+        keywords_ipc.as_deref(),
+        spacing,
+        width,
+        height,
+        pad_roundrect_ratio,
+        courtyard_half_span,
+        silk_segment_half_length,
+    ));
+    Ok(CallToolResult::json(&json!({
+        "success": true,
+        "reference": reference,
+        "footprint": format!("{}:{}", library_nickname, entry_name),
+        "changed_pads": changed_pads,
+        "source": "ipc"
+    })))
+}
+
+async fn handle_set_component_3d_model(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let filename = match require_str(args, "filename") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let offset = [
+        args["offset_x"].as_f64().unwrap_or(0.0),
+        args["offset_y"].as_f64().unwrap_or(0.0),
+        args["offset_z"].as_f64().unwrap_or(0.0),
+    ];
+    let rotation = [
+        args["rotation_x"].as_f64().unwrap_or(0.0),
+        args["rotation_y"].as_f64().unwrap_or(0.0),
+        args["rotation_z"].as_f64().unwrap_or(0.0),
+    ];
+    let scale = [
+        args["scale_x"].as_f64().unwrap_or(1.0),
+        args["scale_y"].as_f64().unwrap_or(1.0),
+        args["scale_z"].as_f64().unwrap_or(1.0),
+    ];
+    let reference_ipc = reference.clone();
+    let filename_ipc = filename.clone();
+    ipc!(ctx, args, |client| client.set_footprint_3d_model(
+        &reference_ipc,
+        &filename_ipc,
+        offset,
+        rotation,
+        scale,
+    ));
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "filename": filename,
+        "offset_mm": offset,
+        "rotation": rotation,
+        "scale": scale,
+        "source": "ipc"
+    })))
 }
 
 async fn handle_update_footprint_mechanical_geometry(
@@ -1615,6 +2107,52 @@ async fn handle_update_footprint_mechanical_geometry(
     })))
 }
 
+async fn handle_replace_footprint_graphic_segments(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let layers: Vec<String> = match args.get("layers").and_then(|value| value.as_array()) {
+        Some(values) if !values.is_empty() => values
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect(),
+        _ => {
+            return Ok(CallToolResult::error(
+                "'layers' must be a non-empty string array",
+            ))
+        }
+    };
+    if layers.len()
+        != args
+            .get("layers")
+            .and_then(|value| value.as_array())
+            .map_or(0, Vec::len)
+    {
+        return Ok(CallToolResult::error(
+            "every 'layers' entry must be a string",
+        ));
+    }
+    let segments = match args.get("segments").and_then(|value| value.as_array()) {
+        Some(values) => values.clone(),
+        None => return Ok(CallToolResult::error("'segments' must be an array")),
+    };
+
+    let reference_ipc = reference.clone();
+    let layers_ipc = layers.clone();
+    let (removed, added) = ipc!(ctx, args, |client| client
+        .replace_footprint_graphic_segments(&reference_ipc, &layers_ipc, &segments));
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "layers": layers,
+        "removed": removed,
+        "added": added
+    })))
+}
+
 async fn handle_delete_footprint_nested_zones(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1631,6 +2169,91 @@ async fn handle_delete_footprint_nested_zones(
     Ok(CallToolResult::json(&json!({
         "reference": reference,
         "removed_zone_count": removed,
+        "source": "ipc"
+    })))
+}
+
+async fn handle_set_footprint_graphics_layer(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let from_layer = match require_str(args, "from_layer") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let to_layer = match require_str(args, "to_layer") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let mut text_updates = Vec::new();
+    if let Some(values) = args.get("text_updates").and_then(|value| value.as_array()) {
+        for value in values {
+            let Some(match_text) = value.get("match_text").and_then(|item| item.as_str()) else {
+                return Ok(CallToolResult::error(
+                    "Every text_updates item requires match_text",
+                ));
+            };
+            text_updates.push(konnect_ipc::IpcFootprintUserTextUpdate {
+                match_text: match_text.to_string(),
+                new_text: value
+                    .get("new_text")
+                    .and_then(|item| item.as_str())
+                    .map(str::to_string),
+                x: value.get("x").and_then(|item| item.as_f64()),
+                y: value.get("y").and_then(|item| item.as_f64()),
+                rotation: value.get("rotation").and_then(|item| item.as_f64()),
+                layer: value
+                    .get("layer")
+                    .and_then(|item| item.as_str())
+                    .map(str::to_string),
+            });
+        }
+    }
+    let reference_ipc = reference.clone();
+    let from_layer_ipc = from_layer.clone();
+    let to_layer_ipc = to_layer.clone();
+    let text_updates_ipc = text_updates.clone();
+    let (shapes_changed, texts_changed, texts_updated) = ipc!(ctx, args, |client| client
+        .set_footprint_graphics_layer(
+            &reference_ipc,
+            &from_layer_ipc,
+            &to_layer_ipc,
+            &text_updates_ipc,
+        ));
+
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "from_layer": from_layer,
+        "to_layer": to_layer,
+        "shapes_changed": shapes_changed,
+        "texts_changed": texts_changed,
+        "texts_updated": texts_updated,
+        "source": "ipc"
+    })))
+}
+
+async fn handle_replace_footprint_user_texts(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let specs = args["texts"].as_array().cloned().unwrap_or_default();
+    let reference_ipc = reference.clone();
+    let (removed, added) = ipc!(ctx, args, |client| client
+        .replace_footprint_user_texts(&reference_ipc, &specs));
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "removed": removed,
+        "added": added,
         "source": "ipc"
     })))
 }
@@ -1733,6 +2356,8 @@ async fn handle_get_component_list(
                 "footprint": fp.footprint,
                 "x": fp.position.x, "y": fp.position.y,
                 "rotation": fp.rotation, "layer": fp.layer
+                ,"exclude_from_bom": fp.exclude_from_bom
+                ,"dnp": fp.dnp
             })
         })
         .collect();
@@ -1879,6 +2504,79 @@ async fn handle_duplicate_component(
         "duplicated_from": reference,
         "new_reference": fp.reference,
         "x": fp.position.x, "y": fp.position.y
+    })))
+}
+
+async fn handle_clone_component_instance(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let source_reference = match require_str(args, "source_reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let new_reference = match require_str(args, "new_reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let value = match require_str(args, "value") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let footprint = match require_str(args, "footprint") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let x = match require_f64(args, "x") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let y = match require_f64(args, "y") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let rotation = args["rotation"].as_f64().unwrap_or(0.0);
+    let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
+    let symbol_path = match require_str(args, "symbol_path") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let sheet_name = match require_str(args, "sheet_name") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let sheet_file = match require_str(args, "sheet_file") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let model_filename = args["model_filename"].as_str().map(str::to_string);
+    let exclude_from_bom = args["exclude_from_bom"].as_bool().unwrap_or(false);
+    let dnp = args["dnp"].as_bool().unwrap_or(false);
+    let source_ipc = source_reference.clone();
+    let new_ipc = new_reference.clone();
+    let result = ipc!(ctx, args, |client| client.clone_footprint_instance(
+        &source_ipc,
+        &new_ipc,
+        &value,
+        &footprint,
+        x,
+        y,
+        rotation,
+        &layer,
+        &symbol_path,
+        &sheet_name,
+        &sheet_file,
+        model_filename.as_deref(),
+        exclude_from_bom,
+        dnp
+    ));
+    Ok(CallToolResult::json(&json!({
+        "reference": result.reference,
+        "footprint": result.footprint,
+        "x": result.position.x,
+        "y": result.position.y,
+        "rotation": result.rotation,
+        "layer": result.layer
     })))
 }
 

@@ -216,14 +216,18 @@ fn mutate_property_round_trips() {
         let mut sch = Schematic::load(tmp.path()).unwrap();
         let r1 = sch.symbols.by_reference_mut("R1").unwrap();
         r1.set_value_str("4.7k");
+        r1.in_bom = false;
         r1.dnp = true;
+        r1.move_to(105.0, 110.0);
         sch.overwrite().unwrap();
     }
 
     let sch2 = Schematic::load(tmp.path()).unwrap();
     let r1 = sch2.symbols.by_reference("R1").unwrap();
     assert_eq!(r1.value_str(), Some("4.7k"));
+    assert_eq!(r1.in_bom, false);
     assert_eq!(r1.dnp, true);
+    assert_eq!(r1.position(), (105.0, 110.0));
 }
 
 #[test]

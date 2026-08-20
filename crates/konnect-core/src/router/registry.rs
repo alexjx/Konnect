@@ -22,8 +22,8 @@ pub static DISABLED_TOOLS: &[DisabledTool] = &[
         reason: "layer-stack mutation has no verified IPC implementation",
     },
     DisabledTool {
-        name: "edit_component",
-        reason: "PCB footprint field editing is query-only until IPC supports it",
+        name: "edit_footprint_reference",
+        reason: "superseded by edit_component, which edits reference text and assembly attributes",
     },
     DisabledTool {
         name: "add_net",
@@ -229,7 +229,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_board",
         description: "Board outline, layers, zones, mounting holes, text, and polygon graphics",
         category: "pcb",
-        tool_count: 13,
+        tool_count: 15,
     },
     ToolsetMeta {
         name: "pcb_components",
@@ -253,7 +253,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "library",
         description: "Symbol libraries, footprint libraries, search and registration",
         category: "library",
-        tool_count: 17,
+        tool_count: 24,
     },
     ToolsetMeta {
         name: "integration",

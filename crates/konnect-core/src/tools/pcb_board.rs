@@ -302,6 +302,33 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_delete_board_text(args, ctx).await }
         ),
         tool!(
+            "update_board_text_layer",
+            "Move one free-standing board text item to another layer through KiCad IPC while preserving its UUID, content, position, rotation and typography.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid": { "type": "string" },
+                    "layer": { "type": "string" }
+                },
+                "required": ["board", "uuid", "layer"]
+            }),
+            |args, ctx| async move { handle_update_board_text_layer(args, ctx).await }
+        ),
+        tool!(
+            "delete_board_polygon",
+            "Delete one free-standing board polygon by UUID through KiCad IPC.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid": { "type": "string" }
+                },
+                "required": ["board", "uuid"]
+            }),
+            |args, ctx| async move { handle_delete_board_polygon(args, ctx).await }
+        ),
+        tool!(
             "query_board_polygons",
             "List free-standing board polygon graphics through KiCad IPC, optionally filtered by layer.",
             json!({
@@ -847,6 +874,59 @@ async fn handle_delete_board_text(
         Ok(()) => Ok(CallToolResult::json(&json!({ "deleted_uuid": uuid }))),
         Err(reason) => Ok(CallToolResult::error(format!(
             "KiCad IPC delete_board_text failed: {reason}"
+        ))),
+    }
+}
+
+async fn handle_update_board_text_layer(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let uuid = match require_str(args, "uuid") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let layer = match require_str(args, "layer") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let uuid_ipc = uuid.clone();
+    let layer_ipc = layer.clone();
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |client| {
+        client.update_board_text_layer(&uuid_ipc, &layer_ipc)
+    })
+    .await?
+    {
+        Ok(()) => Ok(CallToolResult::json(&json!({
+            "uuid": uuid,
+            "layer": layer,
+            "source": "ipc"
+        }))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC update_board_text_layer failed: {reason}"
+        ))),
+    }
+}
+
+async fn handle_delete_board_polygon(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let _board_path = get_path(args, "board")?;
+    let uuid = match require_str(args, "uuid") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let uuid_ipc = uuid.clone();
+    match with_ipc(ctx.ipc.clone(), get_path(args, "board")?, move |client| {
+        client.delete_board_polygon(&uuid_ipc)
+    })
+    .await?
+    {
+        Ok(()) => Ok(CallToolResult::json(&json!({ "deleted_uuid": uuid }))),
+        Err(reason) => Ok(CallToolResult::error(format!(
+            "KiCad IPC delete_board_polygon failed: {reason}"
         ))),
     }
 }

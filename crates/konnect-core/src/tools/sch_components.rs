@@ -65,7 +65,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_schematic_component",
-            "Update fields (Reference, Value, Footprint, custom properties) of a symbol instance.",
+            "Update fields and assembly attributes of a symbol instance. Unspecified DNP/BOM attributes are preserved.",
             json!({
                 "type": "object",
                 "properties": {
@@ -75,6 +75,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "value": { "type": "string", "description": "New value (optional)" },
                     "footprint": { "type": "string", "description": "New footprint (optional)" },
                     "datasheet": { "type": "string", "description": "New datasheet URL (optional)" },
+                    "in_bom": { "type": "boolean", "description": "Include this symbol in the BOM (optional; omitted preserves the current value)" },
+                    "dnp": { "type": "boolean", "description": "Mark this symbol Do Not Populate (optional; omitted preserves the current value)" },
                     "reference_x": { "type": "number", "description": "Reference field X position (optional)" },
                     "reference_y": { "type": "number", "description": "Reference field Y position (optional)" },
                     "reference_rotation": { "type": "number", "description": "Reference field rotation (optional)" },
@@ -729,13 +731,27 @@ async fn handle_edit_schematic_component(
     .iter()
     .any(|key| args.get(*key).and_then(|value| value.as_f64()).is_some());
 
-    if has_property_layout {
+    let in_bom = args.get("in_bom").and_then(|value| value.as_bool());
+    let dnp = args.get("dnp").and_then(|value| value.as_bool());
+    if has_property_layout || in_bom.is_some() || dnp.is_some() {
         let active_reference = opt_str(args, "new_reference").unwrap_or(&reference);
         let mut sch = cse::Schematic::load(&sch_path)?;
         let sym = sch
             .symbols
             .by_reference_mut(active_reference)
             .ok_or_else(|| anyhow::anyhow!("Component '{}' not found", active_reference))?;
+        if let Some(value) = in_bom {
+            if sym.in_bom != value {
+                sym.in_bom = value;
+                changed.push(format!("in_bom → {}", value));
+            }
+        }
+        if let Some(value) = dnp {
+            if sym.dnp != value {
+                sym.dnp = value;
+                changed.push(format!("dnp → {}", value));
+            }
+        }
         let (symbol_x, symbol_y) = sym.position();
 
         let mut update_layout = |name: &str, x_key: &str, y_key: &str, rotation_key: &str| {
@@ -834,6 +850,8 @@ async fn handle_get_schematic_component(
                 "rotation": rotation,
                 "mirror_x": mirror.contains('x'),
                 "mirror_y": mirror.contains('y'),
+                "in_bom": sym.in_bom,
+                "dnp": sym.dnp,
                 "uuid": sym.uuid
             })))
         }
@@ -869,6 +887,8 @@ async fn handle_list_schematic_components(
                 "rotation": rotation,
                 "mirror_x": mirror.contains('x'),
                 "mirror_y": mirror.contains('y')
+                ,"in_bom": sym.in_bom
+                ,"dnp": sym.dnp
             })
         })
         .collect();

@@ -115,8 +115,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_edit_schematic_components",
-            "Apply field updates (Value, Footprint, custom properties) to multiple components \
-             in a single atomic file write.",
+            "Apply field and assembly-attribute updates to multiple components in a single atomic file write. Unspecified DNP/BOM attributes are preserved.",
             json!({
                 "type": "object",
                 "properties": {
@@ -130,6 +129,8 @@ pub fn tools() -> Vec<ToolDef> {
                                 "reference": { "type": "string" },
                                 "value": { "type": "string" },
                                 "footprint": { "type": "string" },
+                                "in_bom": { "type": "boolean" },
+                                "dnp": { "type": "boolean" },
                                 "fields": {
                                     "type": "object",
                                     "description": "Additional property fields as key:value pairs"
@@ -260,6 +261,29 @@ pub fn tools() -> Vec<ToolDef> {
     ]
 }
 
+#[cfg(test)]
+mod assembly_attribute_range_tests {
+    use super::{find_symbol_block, symbol_scalar_range};
+
+    #[test]
+    fn finds_tab_indented_symbol_and_assembly_attributes() {
+        let schematic = r#"(kicad_sch
+	(symbol
+		(lib_id "Device:C")
+		(in_bom yes)
+		(dnp no)
+		(property "Reference" "C15")
+	)
+)"#;
+
+        assert!(find_symbol_block(schematic, "C15").is_some());
+        let (bom_start, bom_end) = symbol_scalar_range(schematic, "C15", "in_bom").unwrap();
+        let (dnp_start, dnp_end) = symbol_scalar_range(schematic, "C15", "dnp").unwrap();
+        assert_eq!(&schematic[bom_start..bom_end], "yes");
+        assert_eq!(&schematic[dnp_start..dnp_end], "no");
+    }
+}
+
 // ─── Private helpers ──────────────────────────────────────────────────────────
 
 /// Find the `(symbol ...)` block for a reference designator.
@@ -268,7 +292,11 @@ fn find_symbol_block(content: &str, reference: &str) -> Option<(usize, usize)> {
     let search_pat = format!(r#"(property "Reference" "{reference}""#);
     let ref_offset = content.find(&search_pat)?;
     let before = &content[..ref_offset];
-    let sym_start = before.rfind("\n  (symbol").map(|p| p + 1)?;
+    let sym_start = ["\n  (symbol", "\n\t(symbol"]
+        .iter()
+        .filter_map(|pattern| before.rfind(pattern))
+        .max()
+        .map(|position| position + 1)?;
     find_block_with_leading_whitespace(content, sym_start)
 }
 
@@ -277,11 +305,7 @@ fn find_symbol_block(content: &str, reference: &str) -> Option<(usize, usize)> {
 /// `reference`. Only the bytes inside the opening quote are included (i.e. the
 /// replacement does NOT need to include surrounding quotes).
 fn field_value_range(content: &str, reference: &str, field: &str) -> Option<(usize, usize)> {
-    let ref_search = format!(r#"(property "Reference" "{reference}""#);
-    let ref_pos = content.find(&ref_search)?;
-    let before = &content[..ref_pos];
-    let sym_start = before.rfind("\n  (symbol").map(|p| p + 1)?;
-    let (_, sym_end) = find_block_with_leading_whitespace(content, sym_start)?;
+    let (sym_start, sym_end) = find_symbol_block(content, reference)?;
     let sym_block = &content[sym_start..sym_end];
 
     let field_search = format!(r#"(property "{field}" ""#);
@@ -290,6 +314,20 @@ fn field_value_range(content: &str, reference: &str, field: &str) -> Option<(usi
     // find the closing quote of the current value
     let val_end = val_start + content[val_start..].find('"')?;
     Some((val_start, val_end))
+}
+
+/// Return the byte range of a scalar child such as `(in_bom yes)` or
+/// `(dnp no)` inside one placed symbol.
+fn symbol_scalar_range(content: &str, reference: &str, field: &str) -> Option<(usize, usize)> {
+    let (sym_start, sym_end) = find_symbol_block(content, reference)?;
+    let sym_block = &content[sym_start..sym_end];
+    let search = format!("({field} ");
+    let field_rel = sym_block.find(&search)?;
+    let value_start = sym_start + field_rel + search.len();
+    let value_end = value_start
+        + content[value_start..sym_end]
+            .find(|character: char| character.is_whitespace() || character == ')')?;
+    Some((value_start, value_end))
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -811,6 +849,22 @@ async fn handle_batch_edit(
                         component_changes.push(format!("{} → {}", field, new_val));
                     }
                     None => errors.push(format!("Field '{}' not found on '{}'", field, reference)),
+                }
+            }
+        }
+
+        for (field, key) in &[("in_bom", "in_bom"), ("dnp", "dnp")] {
+            if let Some(value) = edit_spec[*key].as_bool() {
+                match symbol_scalar_range(&content, reference, field) {
+                    Some((start, end)) => {
+                        let keyword = if value { "yes" } else { "no" };
+                        file_edits.push(SexpEdit::replace(start, end, keyword.to_string()));
+                        component_changes.push(format!("{} → {}", field, value));
+                    }
+                    None => errors.push(format!(
+                        "Assembly attribute '{}' not found on '{}'",
+                        field, reference
+                    )),
                 }
             }
         }

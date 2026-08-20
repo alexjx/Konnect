@@ -17,6 +17,8 @@ pub struct IpcFootprint {
     pub definition_item_types: Vec<String>,
     pub rotation: f64,
     pub layer: String,
+    pub exclude_from_bom: bool,
+    pub dnp: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +81,16 @@ pub struct IpcFootprintText {
     pub rotation: f64,
     pub layer: String,
     pub visible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcFootprintUserTextUpdate {
+    pub match_text: String,
+    pub new_text: Option<String>,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub rotation: Option<f64>,
+    pub layer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

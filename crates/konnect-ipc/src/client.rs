@@ -195,6 +195,26 @@ pub struct KiCadIpcClient {
     document: Option<OpenBoardDocument>,
 }
 
+fn update_footprint_pad_nets(
+    definition: &mut kiapi::board::types::Footprint,
+    resolved: &std::collections::HashMap<&str, Option<kiapi::board::types::Net>>,
+) -> Result<std::collections::HashSet<String>> {
+    let mut changed = std::collections::HashSet::new();
+    for item in &mut definition.items {
+        if !item.type_url.ends_with("kiapi.board.types.Pad") {
+            continue;
+        }
+        let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+        let Some(net) = resolved.get(pad.number.as_str()) else {
+            continue;
+        };
+        pad.net = net.clone();
+        *item = crate::builders::pack_any(&pad, "kiapi.board.types.Pad");
+        changed.insert(pad.number);
+    }
+    Ok(changed)
+}
+
 impl KiCadIpcClient {
     /// Create a client connecting to the given IPC socket path.
     /// If empty, tries KICAD_API_SOCKET environment variable.
@@ -550,6 +570,17 @@ impl KiCadIpcClient {
                             .collect()
                     })
                     .unwrap_or_default();
+                let instance_attributes = fp.attributes.as_ref();
+                let definition_attributes = fp
+                    .definition
+                    .as_ref()
+                    .and_then(|definition| definition.attributes.as_ref());
+                let exclude_from_bom = instance_attributes
+                    .is_some_and(|attributes| attributes.exclude_from_bill_of_materials)
+                    || definition_attributes
+                        .is_some_and(|attributes| attributes.exclude_from_bill_of_materials);
+                let dnp = instance_attributes.is_some_and(|attributes| attributes.do_not_populate)
+                    || definition_attributes.is_some_and(|attributes| attributes.do_not_populate);
                 footprints.push(IpcFootprint {
                     reference: ref_text,
                     value: val_text,
@@ -575,6 +606,8 @@ impl KiCadIpcClient {
                         .map(|a| a.value_degrees)
                         .unwrap_or(0.0),
                     layer: layer_enum_to_name(fp.layer).to_string(),
+                    exclude_from_bom,
+                    dnp,
                 });
             }
         }
@@ -771,7 +804,7 @@ impl KiCadIpcClient {
     }
 
     /// Parse KiCad S-expression items and create them in the active editor.
-    pub fn parse_and_create_items(&self, contents: String) -> Result<()> {
+    fn parse_and_create_items_returning(&self, contents: String) -> Result<Vec<prost_types::Any>> {
         let doc = self.get_board_document()?;
         let cmd = kiapi::common::commands::ParseAndCreateItemsFromString {
             document: Some(doc),
@@ -790,6 +823,7 @@ impl KiCadIpcClient {
         if response.created_items.is_empty() {
             anyhow::bail!("ParseAndCreateItemsFromString created no items");
         }
+        let mut created = Vec::with_capacity(response.created_items.len());
         for (index, result) in response.created_items.iter().enumerate() {
             let status = result.status.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -805,8 +839,19 @@ impl KiCadIpcClient {
                     status.error_message
                 );
             }
+            let item = result.item.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ParseAndCreateItemsFromString result {} has no created item",
+                    index
+                )
+            })?;
+            created.push(item);
         }
-        Ok(())
+        Ok(created)
+    }
+
+    pub fn parse_and_create_items(&self, contents: String) -> Result<()> {
+        self.parse_and_create_items_returning(contents).map(|_| ())
     }
 
     /// Replace all Edge.Cuts shapes with a rounded rectangular outline in one Undo commit.
@@ -1368,6 +1413,37 @@ impl KiCadIpcClient {
         self.delete_items(vec![uuid.to_string()])
     }
 
+    /// Delete one free-standing board polygon by UUID.
+    pub fn delete_board_polygon(&self, uuid: &str) -> Result<()> {
+        self.delete_items(vec![uuid.to_string()])
+    }
+
+    /// Move one free-standing board text item to another layer while preserving
+    /// its UUID, content, position, rotation and typography.
+    pub fn update_board_text_layer(&self, uuid: &str, layer: &str) -> Result<()> {
+        let target_layer = crate::builders::layer_from_name(layer);
+        if target_layer == kiapi::board::types::BoardLayer::BlUndefined {
+            anyhow::bail!("Unknown board layer '{}'", layer);
+        }
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbText)?;
+        let mut target = items
+            .into_iter()
+            .filter_map(|item| kiapi::board::types::BoardText::decode(item.value.as_slice()).ok())
+            .find(|text| text.id.as_ref().is_some_and(|id| id.value == uuid))
+            .ok_or_else(|| anyhow::anyhow!("Board text '{}' not found", uuid))?;
+        target.layer = target_layer as i32;
+        let any = crate::builders::pack_any(&target, "kiapi.board.types.BoardText");
+        let commit = self.begin_commit()?;
+        let result = (|| {
+            self.update_items(vec![any])?;
+            self.push_commit(&commit, &format!("Move board text to {layer}"))
+        })();
+        if result.is_err() {
+            let _ = self.drop_commit(&commit);
+        }
+        result
+    }
+
     /// Query free-standing board polygon graphics, optionally filtered by layer.
     pub fn get_board_polygons(&self, layer_filter: Option<&str>) -> Result<Vec<IpcBoardPolygon>> {
         use kiapi::common::types::graphic_shape::Geometry;
@@ -1894,18 +1970,21 @@ impl KiCadIpcClient {
     pub fn set_footprint_pad_nets(
         &self,
         reference: &str,
-        pad_nets: &[(String, String)],
+        pad_nets: &[(String, Option<String>)],
     ) -> Result<()> {
-        let resolved: std::collections::HashMap<&str, kiapi::board::types::Net> = pad_nets
+        let resolved: std::collections::HashMap<&str, Option<kiapi::board::types::Net>> = pad_nets
             .iter()
             .map(|(pad_number, net_name)| {
                 Ok((
                     pad_number.as_str(),
-                    kiapi::board::types::Net {
-                        code: Some(kiapi::board::types::NetCode {
-                            value: self.resolve_net_code(net_name)?,
+                    match net_name {
+                        Some(net_name) => Some(kiapi::board::types::Net {
+                            code: Some(kiapi::board::types::NetCode {
+                                value: self.resolve_net_code(net_name)?,
+                            }),
+                            name: net_name.clone(),
                         }),
-                        name: net_name.clone(),
+                        None => None,
                     },
                 ))
             })
@@ -1933,19 +2012,7 @@ impl KiCadIpcClient {
                 .definition
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no definition", reference))?;
-            let mut changed = std::collections::HashSet::new();
-            for item in &mut definition.items {
-                if !item.type_url.ends_with("kiapi.board.types.Pad") {
-                    continue;
-                }
-                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
-                let Some(net) = resolved.get(pad.number.as_str()) else {
-                    continue;
-                };
-                pad.net = Some(net.clone());
-                *item = crate::builders::pack_any(&pad, "kiapi.board.types.Pad");
-                changed.insert(pad.number);
-            }
+            let changed = update_footprint_pad_nets(definition, &resolved)?;
 
             let missing: Vec<_> = resolved
                 .keys()
@@ -1995,8 +2062,9 @@ impl KiCadIpcClient {
         description: Option<&str>,
     ) -> Result<usize> {
         use kiapi::board::types::{
-            BoardLayer, DrillProperties, DrillShape, Pad, PadStack, PadStackLayer, PadStackShape,
-            PadStackType, PadType, UnconnectedLayerRemoval,
+            BoardLayer, DrillProperties, DrillShape, Pad, PadStack, PadStackLayer,
+            PadStackOuterLayer, PadStackShape, PadStackType, PadType, SolderMaskMode,
+            SolderPasteMode, UnconnectedLayerRemoval,
         };
         use kiapi::common::types::LockedState;
 
@@ -2082,11 +2150,47 @@ impl KiCadIpcClient {
                 let height = read("height")?;
                 let drill_width = read("drill_width")?;
                 let drill_height = read("drill_height")?;
+                let roundrect_ratio = spec["roundrect_ratio"].as_f64().unwrap_or(0.0);
+                if !(0.0..=0.5).contains(&roundrect_ratio) {
+                    anyhow::bail!("pad roundrect_ratio must be between 0 and 0.5");
+                }
                 let copper = |layer| PadStackLayer {
                     layer,
                     shape: pad_shape as i32,
                     size: Some(crate::builders::vec2(width, height)),
+                    corner_rounding_ratio: if pad_shape == PadStackShape::PssRoundrect {
+                        roundrect_ratio
+                    } else {
+                        0.0
+                    },
                     ..Default::default()
+                };
+                let outer_layers = (pad_type == PadType::PtPth).then_some(PadStackOuterLayer {
+                    solder_mask_mode: SolderMaskMode::SmmUnmasked as i32,
+                    solder_paste_mode: SolderPasteMode::SpmNoPaste as i32,
+                    ..Default::default()
+                });
+                // A plated through-hole pad must own copper geometry on every
+                // possible copper layer, not only F.Cu/B.Cu.  KiCad serializes
+                // that uniform stack as `*.Cu`; omitting internal shapes leaves
+                // an apparently valid pad that collides with In*.Cu zones.
+                let pth_copper_layers: Vec<i32> =
+                    (BoardLayer::BlFCu as i32..=BoardLayer::BlBCu as i32).collect();
+                let mut enabled_layers = if pad_type == PadType::PtPth {
+                    pth_copper_layers.clone()
+                } else {
+                    vec![BoardLayer::BlFCu as i32, BoardLayer::BlBCu as i32]
+                };
+                if pad_type == PadType::PtPth {
+                    enabled_layers.extend([BoardLayer::BlFMask as i32, BoardLayer::BlBMask as i32]);
+                }
+                let copper_layers = if pad_type == PadType::PtPth {
+                    pth_copper_layers.iter().copied().map(copper).collect()
+                } else {
+                    vec![
+                        copper(BoardLayer::BlFCu as i32),
+                        copper(BoardLayer::BlBCu as i32),
+                    ]
                 };
                 let pad = Pad {
                     id: None,
@@ -2096,7 +2200,7 @@ impl KiCadIpcClient {
                     r#type: pad_type as i32,
                     pad_stack: Some(PadStack {
                         r#type: PadStackType::PstNormal as i32,
-                        layers: vec![BoardLayer::BlFCu as i32, BoardLayer::BlBCu as i32],
+                        layers: enabled_layers,
                         drill: Some(DrillProperties {
                             start_layer: BoardLayer::BlFCu as i32,
                             end_layer: BoardLayer::BlBCu as i32,
@@ -2109,10 +2213,9 @@ impl KiCadIpcClient {
                             ..Default::default()
                         }),
                         unconnected_layer_removal: UnconnectedLayerRemoval::UlrKeep as i32,
-                        copper_layers: vec![
-                            copper(BoardLayer::BlFCu as i32),
-                            copper(BoardLayer::BlBCu as i32),
-                        ],
+                        copper_layers,
+                        front_outer_layers: outer_layers,
+                        back_outer_layers: outer_layers,
                         ..Default::default()
                     }),
                     position: Some(crate::builders::vec2(x, y)),
@@ -2136,6 +2239,327 @@ impl KiCadIpcClient {
                         return Err(error);
                     }
                     return Ok(pad_specs.len());
+                }
+                Err(error) => {
+                    let _ = self.drop_commit(&commit);
+                    return Err(error);
+                }
+            }
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// Normalize a live footprint's library identity and, for a two-pad SMD
+    /// device, its nominal pad geometry without replacing the footprint
+    /// instance.  This preserves the instance UUID, placement, fields,
+    /// assembly attributes, pad UUIDs, nets, and every non-pad graphic.
+    pub fn normalize_two_pad_smd_footprint(
+        &self,
+        reference: &str,
+        library_nickname: &str,
+        entry_name: &str,
+        value_text: Option<&str>,
+        description: Option<&str>,
+        keywords: Option<&str>,
+        pad_spacing_mm: Option<f64>,
+        pad_width_mm: Option<f64>,
+        pad_height_mm: Option<f64>,
+        pad_roundrect_ratio: Option<f64>,
+        courtyard_half_span_mm: Option<f64>,
+        silk_segment_half_length_mm: Option<f64>,
+    ) -> Result<usize> {
+        use kiapi::board::types::Pad;
+        use kiapi::common::types::LibraryIdentifier;
+
+        let geometry = match (pad_spacing_mm, pad_width_mm, pad_height_mm) {
+            (None, None, None) => None,
+            (Some(spacing), Some(width), Some(height))
+                if spacing > 0.0 && width > 0.0 && height > 0.0 =>
+            {
+                Some((spacing, width, height))
+            }
+            _ => anyhow::bail!(
+                "pad_spacing, pad_width, and pad_height must be supplied together and be positive"
+            ),
+        };
+
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in items {
+            let Ok(mut footprint) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let ref_text = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            if ref_text != reference {
+                continue;
+            }
+
+            if let Some(description) = description {
+                footprint
+                    .attributes
+                    .get_or_insert_with(Default::default)
+                    .description = description.to_string();
+                if let Some(value) = footprint
+                    .description_field
+                    .as_mut()
+                    .and_then(|field| field.text.as_mut())
+                    .and_then(|text| text.text.as_mut())
+                {
+                    value.text = description.to_string();
+                }
+            }
+            if let Some(keywords) = keywords {
+                footprint
+                    .attributes
+                    .get_or_insert_with(Default::default)
+                    .keywords = keywords.to_string();
+            }
+
+            let definition = footprint
+                .definition
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no definition", reference))?;
+            definition.id = Some(LibraryIdentifier {
+                library_nickname: library_nickname.to_string(),
+                entry_name: entry_name.to_string(),
+            });
+            let attributes = definition.attributes.get_or_insert_with(Default::default);
+            if let Some(description) = description {
+                attributes.description = description.to_string();
+            }
+            if let Some(keywords) = keywords {
+                attributes.keywords = keywords.to_string();
+            }
+            if let Some(description) = description {
+                if let Some(value) = definition
+                    .description_field
+                    .as_mut()
+                    .and_then(|field| field.text.as_mut())
+                    .and_then(|text| text.text.as_mut())
+                {
+                    value.text = description.to_string();
+                }
+            }
+            let target_value = value_text.unwrap_or(entry_name);
+            if let Some(value) = footprint
+                .value_field
+                .as_mut()
+                .and_then(|field| field.text.as_mut())
+                .and_then(|text| text.text.as_mut())
+            {
+                value.text = target_value.to_string();
+            }
+            if let Some(value) = definition
+                .value_field
+                .as_mut()
+                .and_then(|field| field.text.as_mut())
+                .and_then(|text| text.text.as_mut())
+            {
+                value.text = target_value.to_string();
+            }
+
+            let mut changed_pads = 0usize;
+            if let Some((spacing, width, height)) = geometry {
+                let mut decoded: Vec<(usize, Pad)> = definition
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| item.type_url.ends_with("kiapi.board.types.Pad"))
+                    .filter_map(|(index, item)| {
+                        Pad::decode(item.value.as_slice())
+                            .ok()
+                            .map(|pad| (index, pad))
+                    })
+                    .filter(|(_, pad)| !pad.number.is_empty())
+                    .collect();
+                decoded.sort_by(|(_, left), (_, right)| left.number.cmp(&right.number));
+                if decoded.len() != 2 {
+                    anyhow::bail!(
+                        "Footprint '{}' must have exactly two numbered pads; found {}",
+                        reference,
+                        decoded.len()
+                    );
+                }
+                let first = decoded[0]
+                    .1
+                    .position
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Pad 1 has no position"))?;
+                let second = decoded[1]
+                    .1
+                    .position
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Pad 2 has no position"))?;
+                let x1 = crate::builders::nm_to_mm(first.x_nm);
+                let y1 = crate::builders::nm_to_mm(first.y_nm);
+                let x2 = crate::builders::nm_to_mm(second.x_nm);
+                let y2 = crate::builders::nm_to_mm(second.y_nm);
+                let dx = x2 - x1;
+                let dy = y2 - y1;
+                let length = (dx * dx + dy * dy).sqrt();
+                if length <= 1e-12 {
+                    anyhow::bail!("Footprint '{}' pads share one position", reference);
+                }
+                let cx = (x1 + x2) / 2.0;
+                let cy = (y1 + y2) / 2.0;
+                let ux = dx / length;
+                let uy = dy / length;
+
+                for (ordinal, (index, mut pad)) in decoded.into_iter().enumerate() {
+                    let sign = if ordinal == 0 { -1.0 } else { 1.0 };
+                    pad.position = Some(crate::builders::vec2(
+                        cx + sign * ux * spacing / 2.0,
+                        cy + sign * uy * spacing / 2.0,
+                    ));
+                    let stack = pad.pad_stack.as_mut().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Footprint '{}' pad {} has no pad stack",
+                            reference,
+                            pad.number
+                        )
+                    })?;
+                    for layer in &mut stack.copper_layers {
+                        layer.size = Some(crate::builders::vec2(width, height));
+                        if let Some(ratio) = pad_roundrect_ratio {
+                            if !(0.0..=0.5).contains(&ratio) {
+                                anyhow::bail!("pad_roundrect_ratio must be between 0 and 0.5");
+                            }
+                            layer.corner_rounding_ratio = ratio;
+                        }
+                    }
+                    definition.items[index] =
+                        crate::builders::pack_any(&pad, "kiapi.board.types.Pad");
+                    changed_pads += 1;
+                }
+
+                if let Some(target_half_span) = courtyard_half_span_mm {
+                    if target_half_span <= 0.0 {
+                        anyhow::bail!("courtyard_half_span must be positive");
+                    }
+                    use kiapi::common::types::graphic_shape::Geometry;
+                    for item in &mut definition.items {
+                        if !item
+                            .type_url
+                            .ends_with("kiapi.board.types.BoardGraphicShape")
+                        {
+                            continue;
+                        }
+                        let Ok(mut graphic) =
+                            kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+                        else {
+                            continue;
+                        };
+                        let layer = layer_enum_to_name(graphic.layer);
+                        if layer != "F.CrtYd" && layer != "B.CrtYd" {
+                            continue;
+                        }
+                        let Some(shape) = graphic.shape.as_mut() else {
+                            continue;
+                        };
+                        let Some(Geometry::Rectangle(rectangle)) = shape.geometry.as_mut() else {
+                            continue;
+                        };
+                        let (Some(first), Some(second)) =
+                            (rectangle.top_left.as_mut(), rectangle.bottom_right.as_mut())
+                        else {
+                            continue;
+                        };
+                        if ux.abs() >= uy.abs() {
+                            let center = (first.x_nm + second.x_nm) / 2;
+                            let half = crate::builders::mm_to_nm(target_half_span);
+                            first.x_nm = center - half;
+                            second.x_nm = center + half;
+                        } else {
+                            let center = (first.y_nm + second.y_nm) / 2;
+                            let half = crate::builders::mm_to_nm(target_half_span);
+                            first.y_nm = center - half;
+                            second.y_nm = center + half;
+                        }
+                        *item = crate::builders::pack_any(
+                            &graphic,
+                            "kiapi.board.types.BoardGraphicShape",
+                        );
+                    }
+                }
+
+                if let Some(half_length) = silk_segment_half_length_mm {
+                    if half_length <= 0.0 {
+                        anyhow::bail!("silk_segment_half_length must be positive");
+                    }
+                    use kiapi::common::types::graphic_shape::Geometry;
+                    for item in &mut definition.items {
+                        if !item
+                            .type_url
+                            .ends_with("kiapi.board.types.BoardGraphicShape")
+                        {
+                            continue;
+                        }
+                        let Ok(mut graphic) =
+                            kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+                        else {
+                            continue;
+                        };
+                        let layer = layer_enum_to_name(graphic.layer);
+                        if layer != "F.SilkS" && layer != "B.SilkS" {
+                            continue;
+                        }
+                        let Some(shape) = graphic.shape.as_mut() else {
+                            continue;
+                        };
+                        let Some(Geometry::Segment(segment)) = shape.geometry.as_mut() else {
+                            continue;
+                        };
+                        let (Some(start), Some(end)) =
+                            (segment.start.as_mut(), segment.end.as_mut())
+                        else {
+                            continue;
+                        };
+                        let sx = crate::builders::nm_to_mm(start.x_nm);
+                        let sy = crate::builders::nm_to_mm(start.y_nm);
+                        let ex = crate::builders::nm_to_mm(end.x_nm);
+                        let ey = crate::builders::nm_to_mm(end.y_nm);
+                        let center_x = (sx + ex) / 2.0;
+                        let center_y = (sy + ey) / 2.0;
+                        let direction = if (ex - sx) * ux + (ey - sy) * uy >= 0.0 {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                        start.x_nm =
+                            crate::builders::mm_to_nm(center_x - direction * ux * half_length);
+                        start.y_nm =
+                            crate::builders::mm_to_nm(center_y - direction * uy * half_length);
+                        end.x_nm =
+                            crate::builders::mm_to_nm(center_x + direction * ux * half_length);
+                        end.y_nm =
+                            crate::builders::mm_to_nm(center_y + direction * uy * half_length);
+                        *item = crate::builders::pack_any(
+                            &graphic,
+                            "kiapi.board.types.BoardGraphicShape",
+                        );
+                    }
+                }
+            }
+
+            let update =
+                crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+            let commit = self.begin_commit()?;
+            match self.update_items(vec![update]) {
+                Ok(()) => {
+                    if let Err(error) =
+                        self.push_commit(&commit, &format!("Normalize footprint for {reference}"))
+                    {
+                        let _ = self.drop_commit(&commit);
+                        return Err(error);
+                    }
+                    return Ok(changed_pads);
                 }
                 Err(error) => {
                     let _ = self.drop_commit(&commit);
@@ -2312,6 +2736,386 @@ impl KiCadIpcClient {
         anyhow::bail!("Footprint '{}' not found", reference)
     }
 
+    /// Atomically replace footprint graphic shapes on selected layers with
+    /// explicit straight segments. KiCad 10 exposes and consumes footprint
+    /// child geometry in board-absolute coordinates through IPC.
+    pub fn replace_footprint_graphic_segments(
+        &self,
+        reference: &str,
+        layers: &[String],
+        segment_specs: &[serde_json::Value],
+    ) -> Result<(usize, usize)> {
+        use kiapi::board::types::{BoardGraphicShape, BoardLayer};
+
+        if layers.is_empty() {
+            anyhow::bail!("At least one target layer is required");
+        }
+        let selected_layers: std::collections::HashSet<i32> = layers
+            .iter()
+            .map(|layer_name| {
+                let layer = crate::builders::layer_from_name(layer_name);
+                if layer == BoardLayer::BlUndefined {
+                    anyhow::bail!("Unknown graphic layer '{}'", layer_name);
+                }
+                Ok(layer as i32)
+            })
+            .collect::<Result<_>>()?;
+
+        let mut replacement_segments = Vec::with_capacity(segment_specs.len());
+        for spec in segment_specs {
+            let layer_name = spec["layer"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("segment layer must be a string"))?;
+            let layer = crate::builders::layer_from_name(layer_name);
+            if layer == BoardLayer::BlUndefined {
+                anyhow::bail!("Unknown segment layer '{}'", layer_name);
+            }
+            if !selected_layers.contains(&(layer as i32)) {
+                anyhow::bail!(
+                    "Segment layer '{}' is not present in the replacement layer set",
+                    layer_name
+                );
+            }
+            let number = |name: &str| {
+                spec[name]
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("segment '{}' must be numeric", name))
+            };
+            let width = number("width")?;
+            if width <= 0.0 {
+                anyhow::bail!("segment width must be positive");
+            }
+            replacement_segments.push(crate::builders::board_segment(
+                layer_name,
+                width,
+                number("x1")?,
+                number("y1")?,
+                number("x2")?,
+                number("y2")?,
+            ));
+        }
+
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in items {
+            let Ok(mut footprint) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let footprint_reference = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            if footprint_reference != reference {
+                continue;
+            }
+
+            let definition = footprint
+                .definition
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no definition", reference))?;
+            let before = definition.items.len();
+            definition.items.retain(|item| {
+                if !item
+                    .type_url
+                    .ends_with("kiapi.board.types.BoardGraphicShape")
+                {
+                    return true;
+                }
+                BoardGraphicShape::decode(item.value.as_slice())
+                    .map(|graphic| !selected_layers.contains(&graphic.layer))
+                    .unwrap_or(true)
+            });
+            let removed = before - definition.items.len();
+            let added = replacement_segments.len();
+            definition
+                .items
+                .extend(replacement_segments.iter().map(|segment| {
+                    crate::builders::pack_any(segment, "kiapi.board.types.BoardGraphicShape")
+                }));
+
+            let update =
+                crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+            let commit = self.begin_commit()?;
+            let result = (|| {
+                self.update_items(vec![update])?;
+                self.push_commit(
+                    &commit,
+                    &format!("Replace footprint graphics for {reference}"),
+                )
+            })();
+            if result.is_err() {
+                let _ = self.drop_commit(&commit);
+            }
+            result?;
+            return Ok((removed, added));
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// Replace all non-field footprint texts with exact board-absolute text
+    /// definitions while preserving fields, pads, graphics and association.
+    pub fn replace_footprint_user_texts(
+        &self,
+        reference: &str,
+        text_specs: &[serde_json::Value],
+    ) -> Result<(usize, usize)> {
+        let mut replacements = Vec::with_capacity(text_specs.len());
+        for spec in text_specs {
+            let text = spec["text"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("user text must be a string"))?;
+            let layer = spec["layer"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("user text layer must be a string"))?;
+            let number = |name: &str| {
+                spec[name]
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("user text '{}' must be numeric", name))
+            };
+            let size = number("size")?;
+            let stroke_width = number("stroke_width")?;
+            if size <= 0.0 || stroke_width <= 0.0 {
+                anyhow::bail!("user text size and stroke_width must be positive");
+            }
+            let mut board_text = crate::builders::board_text(
+                layer,
+                text,
+                number("x")?,
+                number("y")?,
+                size,
+                spec["rotation"].as_f64().unwrap_or(0.0),
+                false,
+            );
+            if let Some(attributes) = board_text
+                .text
+                .as_mut()
+                .and_then(|value| value.attributes.as_mut())
+            {
+                attributes.stroke_width = Some(crate::builders::distance(stroke_width));
+            }
+            replacements.push(board_text);
+        }
+
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in items {
+            let Ok(mut footprint) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let footprint_reference = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            if footprint_reference != reference {
+                continue;
+            }
+            let definition = footprint
+                .definition
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no definition", reference))?;
+            let before = definition.items.len();
+            definition
+                .items
+                .retain(|item| !item.type_url.ends_with("kiapi.board.types.BoardText"));
+            let removed = before - definition.items.len();
+            let added = replacements.len();
+            definition.items.extend(
+                replacements
+                    .iter()
+                    .map(|text| crate::builders::pack_any(text, "kiapi.board.types.BoardText")),
+            );
+            let update =
+                crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+            let commit = self.begin_commit()?;
+            let result = (|| {
+                self.update_items(vec![update])?;
+                self.push_commit(
+                    &commit,
+                    &format!("Replace footprint user texts for {reference}"),
+                )
+            })();
+            if result.is_err() {
+                let _ = self.drop_commit(&commit);
+            }
+            result?;
+            return Ok((removed, added));
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// Atomically move every nested graphic shape and user text on one source
+    /// layer to another layer in a single footprint. Pads, nets, fields,
+    /// placement and all graphics on other layers remain unchanged.
+    pub fn set_footprint_graphics_layer(
+        &self,
+        reference: &str,
+        from_layer: &str,
+        to_layer: &str,
+        text_updates: &[IpcFootprintUserTextUpdate],
+    ) -> Result<(usize, usize, usize)> {
+        let from = crate::builders::layer_from_name(from_layer);
+        let to = crate::builders::layer_from_name(to_layer);
+        if from == kiapi::board::types::BoardLayer::BlUndefined {
+            anyhow::bail!("Unknown source layer '{}'", from_layer);
+        }
+        if to == kiapi::board::types::BoardLayer::BlUndefined {
+            anyhow::bail!("Unknown destination layer '{}'", to_layer);
+        }
+
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in items {
+            let Ok(mut footprint) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let ref_text = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            if ref_text != reference {
+                continue;
+            }
+
+            let definition = footprint
+                .definition
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no definition", reference))?;
+            let mut shapes_changed = 0usize;
+            let mut texts_changed = 0usize;
+            for definition_item in &mut definition.items {
+                if definition_item
+                    .type_url
+                    .ends_with("kiapi.board.types.BoardGraphicShape")
+                {
+                    let mut graphic = kiapi::board::types::BoardGraphicShape::decode(
+                        definition_item.value.as_slice(),
+                    )?;
+                    if graphic.layer == from as i32 {
+                        graphic.layer = to as i32;
+                        *definition_item = crate::builders::pack_any(
+                            &graphic,
+                            "kiapi.board.types.BoardGraphicShape",
+                        );
+                        shapes_changed += 1;
+                    }
+                } else if definition_item
+                    .type_url
+                    .ends_with("kiapi.board.types.BoardText")
+                {
+                    let mut text =
+                        kiapi::board::types::BoardText::decode(definition_item.value.as_slice())?;
+                    if text.layer == from as i32 {
+                        text.layer = to as i32;
+                        *definition_item =
+                            crate::builders::pack_any(&text, "kiapi.board.types.BoardText");
+                        texts_changed += 1;
+                    }
+                }
+            }
+
+            let mut texts_updated = 0usize;
+            for update in text_updates {
+                let mut matches = 0usize;
+                for definition_item in &mut definition.items {
+                    if !definition_item
+                        .type_url
+                        .ends_with("kiapi.board.types.BoardText")
+                    {
+                        continue;
+                    }
+                    let mut board_text =
+                        kiapi::board::types::BoardText::decode(definition_item.value.as_slice())?;
+                    let Some(text) = board_text.text.as_mut() else {
+                        continue;
+                    };
+                    if text.text != update.match_text {
+                        continue;
+                    }
+                    matches += 1;
+                    if let Some(value) = &update.new_text {
+                        text.text = value.clone();
+                    }
+                    if update.x.is_some() || update.y.is_some() {
+                        let old = text
+                            .position
+                            .clone()
+                            .unwrap_or_else(|| crate::builders::vec2(0.0, 0.0));
+                        text.position = Some(crate::builders::vec2(
+                            update
+                                .x
+                                .unwrap_or_else(|| crate::builders::nm_to_mm(old.x_nm)),
+                            update
+                                .y
+                                .unwrap_or_else(|| crate::builders::nm_to_mm(old.y_nm)),
+                        ));
+                    }
+                    if let Some(rotation) = update.rotation {
+                        let attributes = text.attributes.get_or_insert_with(Default::default);
+                        attributes.angle = Some(kiapi::common::types::Angle {
+                            value_degrees: rotation,
+                        });
+                    }
+                    if let Some(layer_name) = &update.layer {
+                        let layer = crate::builders::layer_from_name(layer_name);
+                        if layer == kiapi::board::types::BoardLayer::BlUndefined {
+                            anyhow::bail!("Unknown user-text layer '{}'", layer_name);
+                        }
+                        board_text.layer = layer as i32;
+                    }
+                    *definition_item =
+                        crate::builders::pack_any(&board_text, "kiapi.board.types.BoardText");
+                }
+                if matches != 1 {
+                    anyhow::bail!(
+                        "Footprint '{}' user text '{}' matched {} items; expected exactly one",
+                        reference,
+                        update.match_text,
+                        matches
+                    );
+                }
+                texts_updated += 1;
+            }
+
+            if shapes_changed == 0 && texts_changed == 0 && texts_updated == 0 {
+                anyhow::bail!(
+                    "Footprint '{}' has no nested graphics on layer '{}'",
+                    reference,
+                    from_layer
+                );
+            }
+
+            let update =
+                crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+            let commit = self.begin_commit()?;
+            let result = (|| {
+                self.update_items(vec![update])?;
+                self.push_commit(
+                    &commit,
+                    &format!(
+                        "Move footprint graphics for {reference} from {from_layer} to {to_layer}"
+                    ),
+                )
+            })();
+            if result.is_err() {
+                let _ = self.drop_commit(&commit);
+            }
+            return result.map(|_| (shapes_changed, texts_changed, texts_updated));
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
     /// Delete all nested zones (including keepouts) from one footprint while
     /// preserving its identity, transform and every non-zone definition item.
     pub fn delete_footprint_nested_zones(&self, reference: &str) -> Result<usize> {
@@ -2413,6 +3217,73 @@ impl KiCadIpcClient {
                 });
             }
             return Ok(models);
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// Replace all embedded 3-D models in one live footprint with one model.
+    pub fn set_footprint_3d_model(
+        &self,
+        reference: &str,
+        filename: &str,
+        offset_mm: [f64; 3],
+        rotation: [f64; 3],
+        scale: [f64; 3],
+    ) -> Result<()> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in items {
+            let Ok(mut footprint) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let ref_text = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            if ref_text != reference {
+                continue;
+            }
+            let definition = footprint
+                .definition
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no definition", reference))?;
+            definition.items.retain(|item| {
+                !item
+                    .type_url
+                    .ends_with("kiapi.board.types.Footprint3DModel")
+            });
+            let vector = |values: [f64; 3]| kiapi::common::types::Vector3D {
+                x_nm: values[0],
+                y_nm: values[1],
+                z_nm: values[2],
+            };
+            let model = kiapi::board::types::Footprint3DModel {
+                filename: filename.to_string(),
+                scale: Some(vector(scale)),
+                rotation: Some(vector(rotation)),
+                offset: Some(vector(offset_mm)),
+                visible: true,
+                opacity: 1.0,
+            };
+            definition.items.push(crate::builders::pack_any(
+                &model,
+                "kiapi.board.types.Footprint3DModel",
+            ));
+            let update =
+                crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+            let commit = self.begin_commit()?;
+            let result = (|| {
+                self.update_items(vec![update])?;
+                self.push_commit(&commit, &format!("Set 3-D model for {reference}"))
+            })();
+            if result.is_err() {
+                let _ = self.drop_commit(&commit);
+            }
+            return result;
         }
         anyhow::bail!("Footprint '{}' not found", reference)
     }
@@ -2650,6 +3521,51 @@ impl KiCadIpcClient {
         self.delete_items(vec![kiid])
     }
 
+    /// Set assembly attributes on one footprint while preserving every other
+    /// instance and definition field returned by KiCad.  KiCad may expose the
+    /// attributes on the instance, the embedded definition, or both, so keep
+    /// the two representations synchronized.
+    pub fn set_footprint_assembly_attributes(
+        &self,
+        reference: &str,
+        exclude_from_bom: bool,
+        dnp: bool,
+    ) -> Result<()> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in items {
+            let Ok(mut footprint) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let ref_text = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            if ref_text != reference {
+                continue;
+            }
+
+            update_footprint_assembly_attributes(&mut footprint, exclude_from_bom, dnp)?;
+
+            let update =
+                crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+            let commit = self.begin_commit()?;
+            let result = (|| {
+                self.update_items(vec![update])?;
+                self.push_commit(&commit, &format!("Set assembly attributes for {reference}"))
+            })();
+            if result.is_err() {
+                let _ = self.drop_commit(&commit);
+            }
+            return result;
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
     /// Place a footprint — currently requires KiCAD's ParseAndCreateItemsFromString.
     pub fn place_footprint(
         &self,
@@ -2692,7 +3608,297 @@ impl KiCadIpcClient {
             definition_item_types: Vec::new(),
             rotation,
             layer: layer.to_string(),
+            exclude_from_bom: false,
+            dnp: false,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn clone_footprint_instance(
+        &self,
+        source_reference: &str,
+        new_reference: &str,
+        value: &str,
+        lib_id: &str,
+        x: f64,
+        y: f64,
+        rotation: f64,
+        layer: &str,
+        symbol_path: &str,
+        sheet_name: &str,
+        sheet_file: &str,
+        model_filename: Option<&str>,
+        exclude_from_bom: bool,
+        dnp: bool,
+    ) -> Result<IpcFootprint> {
+        use kiapi::common::types::{Angle, Kiid, LibraryIdentifier, SheetPath};
+
+        if self.get_footprint(new_reference)?.is_some() {
+            anyhow::bail!("Footprint '{}' already exists", new_reference);
+        }
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let mut clone = items
+            .into_iter()
+            .filter_map(|item| {
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).ok()
+            })
+            .find(|footprint| {
+                footprint
+                    .reference_field
+                    .as_ref()
+                    .and_then(|field| field.text.as_ref())
+                    .and_then(|text| text.text.as_ref())
+                    .is_some_and(|text| text.text == source_reference)
+            })
+            .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", source_reference))?;
+        let (library_nickname, entry_name) = lib_id
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("Footprint id must be Library:Footprint"))?;
+        let set_text = |field: &mut Option<kiapi::board::types::Field>, text: &str| -> Result<()> {
+            let value = field
+                .as_mut()
+                .and_then(|field| field.text.as_mut())
+                .and_then(|board_text| board_text.text.as_mut())
+                .ok_or_else(|| anyhow::anyhow!("Footprint field is missing"))?;
+            value.text = text.to_string();
+            Ok(())
+        };
+        clone.id = Some(Kiid {
+            value: uuid::Uuid::new_v4().to_string(),
+        });
+        clone.position = Some(crate::builders::vec2(x, y));
+        clone.orientation = Some(Angle {
+            value_degrees: rotation,
+        });
+        clone.layer = crate::builders::layer_from_name(layer) as i32;
+        clone.symbol_path = Some(SheetPath {
+            path: symbol_path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| Kiid {
+                    value: segment.to_string(),
+                })
+                .collect(),
+            path_human_readable: sheet_name.to_string(),
+        });
+        clone.symbol_sheet_name = sheet_name.to_string();
+        clone.symbol_sheet_filename = sheet_file.to_string();
+        set_text(&mut clone.reference_field, new_reference)?;
+        set_text(&mut clone.value_field, value)?;
+        let instance_reference_field = clone.reference_field.clone();
+        let instance_value_field = clone.value_field.clone();
+        let definition = clone
+            .definition
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Source footprint has no definition"))?;
+        definition.id = Some(LibraryIdentifier {
+            library_nickname: library_nickname.to_string(),
+            entry_name: entry_name.to_string(),
+        });
+        if definition.reference_field.is_none() {
+            definition.reference_field = instance_reference_field;
+        }
+        if definition.value_field.is_none() {
+            definition.value_field = instance_value_field;
+        }
+        set_text(&mut definition.reference_field, new_reference)?;
+        set_text(&mut definition.value_field, value)?;
+        if let Some(filename) = model_filename {
+            for item in &mut definition.items {
+                if !item
+                    .type_url
+                    .ends_with("kiapi.board.types.Footprint3DModel")
+                {
+                    continue;
+                }
+                let mut model =
+                    kiapi::board::types::Footprint3DModel::decode(item.value.as_slice())?;
+                model.filename = filename.to_string();
+                *item = crate::builders::pack_any(&model, "kiapi.board.types.Footprint3DModel");
+            }
+        }
+        update_footprint_assembly_attributes(&mut clone, exclude_from_bom, dnp)?;
+        let commit = self.begin_commit()?;
+        let result = (|| {
+            self.create_items(vec![crate::builders::pack_any(
+                &clone,
+                "kiapi.board.types.FootprintInstance",
+            )])?;
+            self.push_commit(&commit, &format!("Clone footprint as {new_reference}"))
+        })();
+        if result.is_err() {
+            let _ = self.drop_commit(&commit);
+        }
+        result?;
+        self.get_footprint(new_reference)?
+            .ok_or_else(|| anyhow::anyhow!("Cloned footprint '{}' not found", new_reference))
+    }
+
+    /// Replace one live footprint with an exact library footprint while preserving
+    /// the existing footprint KIID and schematic association.  Pad nets are assigned
+    /// explicitly by pad number so connector polarity changes are deliberate.
+    pub fn replace_footprint_from_library(
+        &self,
+        reference: &str,
+        lib_id: &str,
+        library_contents: &str,
+        value: &str,
+        x: f64,
+        y: f64,
+        rotation: f64,
+        layer: &str,
+        pad_nets: &[(String, String)],
+        exclude_from_bom: bool,
+        dnp: bool,
+    ) -> Result<IpcFootprint> {
+        let footprints = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let old = footprints
+            .into_iter()
+            .filter_map(|item| {
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).ok()
+            })
+            .find(|footprint| {
+                footprint
+                    .reference_field
+                    .as_ref()
+                    .and_then(|field| field.text.as_ref())
+                    .and_then(|text| text.text.as_ref())
+                    .is_some_and(|text| text.text == reference)
+            })
+            .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", reference))?;
+
+        let resolved: std::collections::HashMap<&str, Option<kiapi::board::types::Net>> = pad_nets
+            .iter()
+            .map(|(pad_number, net_name)| {
+                Ok((
+                    pad_number.as_str(),
+                    Some(kiapi::board::types::Net {
+                        code: Some(kiapi::board::types::NetCode {
+                            value: self.resolve_net_code(net_name)?,
+                        }),
+                        name: net_name.clone(),
+                    }),
+                ))
+            })
+            .collect::<Result<_>>()?;
+
+        // Library footprints carry file-only metadata that is not valid inside a
+        // board footprint instance.  Strip it before using KiCad's paste parser.
+        let board_footprint = library_contents
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("(version ")
+                    && !trimmed.starts_with("(generator ")
+                    && !trimmed.starts_with("(generator_version ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let first_line_end = board_footprint.find('\n').unwrap_or(board_footprint.len());
+        let board_footprint = format!(
+            "(footprint \"{}\"{}",
+            lib_id,
+            &board_footprint[first_line_end..]
+        );
+        let root_layer_start = board_footprint
+            .find("(layer \"")
+            .ok_or_else(|| anyhow::anyhow!("Library footprint has no top-level layer"))?;
+        let root_layer_end = board_footprint[root_layer_start..]
+            .find(')')
+            .map(|offset| root_layer_start + offset + 1)
+            .ok_or_else(|| anyhow::anyhow!("Library footprint top-level layer is malformed"))?;
+        let mut sexp = String::with_capacity(board_footprint.len() + 128);
+        sexp.push_str(&board_footprint[..root_layer_start]);
+        sexp.push_str(&format!("(layer \"{layer}\")"));
+        sexp.push_str(&format!("\n\t(uuid \"{}\")", uuid::Uuid::new_v4()));
+        sexp.push_str(&format!("\n\t(at {x} {y} {rotation})"));
+        sexp.push_str(&board_footprint[root_layer_end..]);
+
+        let commit = self.begin_commit()?;
+        let result = (|| {
+            let created = self.parse_and_create_items_returning(sexp)?;
+            let mut created_footprints = created.into_iter().filter_map(|item| {
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).ok()
+            });
+            let mut replacement = created_footprints
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Library paste created no footprint"))?;
+            if created_footprints.next().is_some() {
+                anyhow::bail!("Library paste unexpectedly created multiple footprints");
+            }
+            let temporary_id = replacement
+                .id
+                .as_ref()
+                .map(|id| id.value.clone())
+                .ok_or_else(|| anyhow::anyhow!("Created footprint has no KIID"))?;
+
+            replacement.id = old.id.clone();
+            replacement.symbol_path = old.symbol_path.clone();
+            replacement.symbol_sheet_name = old.symbol_sheet_name.clone();
+            replacement.symbol_sheet_filename = old.symbol_sheet_filename.clone();
+            replacement.symbol_footprint_filters = old.symbol_footprint_filters.clone();
+
+            let set_field_text = |field: &mut Option<kiapi::board::types::Field>, text: &str| {
+                let field = field
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Footprint field is missing"))?;
+                let board_text = field
+                    .text
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Footprint field has no board text"))?;
+                let text_value = board_text
+                    .text
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Footprint field has no text value"))?;
+                text_value.text = text.to_string();
+                Ok::<(), anyhow::Error>(())
+            };
+            set_field_text(&mut replacement.reference_field, reference)?;
+            set_field_text(&mut replacement.value_field, value)?;
+            let definition = replacement
+                .definition
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Created footprint has no definition"))?;
+            let (library_nickname, entry_name) = lib_id
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("Footprint id must be Library:Footprint"))?;
+            definition.id = Some(kiapi::common::types::LibraryIdentifier {
+                library_nickname: library_nickname.to_string(),
+                entry_name: entry_name.to_string(),
+            });
+            set_field_text(&mut definition.reference_field, reference)?;
+            set_field_text(&mut definition.value_field, value)?;
+
+            let changed = update_footprint_pad_nets(definition, &resolved)?;
+            let missing: Vec<_> = resolved
+                .keys()
+                .filter(|pad_number| !changed.contains(**pad_number))
+                .copied()
+                .collect();
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "Library footprint '{}' does not contain requested pad(s): {}",
+                    lib_id,
+                    missing.join(", ")
+                );
+            }
+            update_footprint_assembly_attributes(&mut replacement, exclude_from_bom, dnp)?;
+
+            self.delete_items(vec![temporary_id])?;
+            self.update_items(vec![crate::builders::pack_any(
+                &replacement,
+                "kiapi.board.types.FootprintInstance",
+            )])?;
+            self.push_commit(&commit, &format!("Replace footprint for {reference}"))?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = self.drop_commit(&commit);
+            return Err(error);
+        }
+
+        self.get_footprint(reference)?
+            .ok_or_else(|| anyhow::anyhow!("Replacement footprint '{}' not found", reference))
     }
 
     /// Get board extents (bounding box of all items).
@@ -2961,6 +4167,25 @@ fn bounds_for_primitives(items: &[IpcCourtyardPrimitive]) -> Option<IpcBounds> {
     })
 }
 
+fn update_footprint_assembly_attributes(
+    footprint: &mut kiapi::board::types::FootprintInstance,
+    exclude_from_bom: bool,
+    dnp: bool,
+) -> Result<()> {
+    let instance_attributes = footprint.attributes.get_or_insert_with(Default::default);
+    instance_attributes.exclude_from_bill_of_materials = exclude_from_bom;
+    instance_attributes.do_not_populate = dnp;
+
+    let definition = footprint
+        .definition
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("Footprint has no embedded definition"))?;
+    let definition_attributes = definition.attributes.get_or_insert_with(Default::default);
+    definition_attributes.exclude_from_bill_of_materials = exclude_from_bom;
+    definition_attributes.do_not_populate = dnp;
+    Ok(())
+}
+
 #[cfg(test)]
 mod courtyard_geometry_tests {
     use super::*;
@@ -3054,6 +4279,88 @@ mod via_dimension_tests {
         let mut via = crate::builders::build_via("GND", 1, 12.5, 24.5, 0.3, 0.6);
         let error = update_via_dimensions(&mut via, Some(0.6), None).unwrap_err();
         assert!(error.to_string().contains("must be greater than drill"));
+    }
+}
+
+#[cfg(test)]
+mod footprint_assembly_attribute_tests {
+    use super::*;
+
+    #[test]
+    fn assembly_attribute_update_preserves_unrelated_flags() {
+        use kiapi::board::types::{Footprint, FootprintAttributes, FootprintInstance};
+
+        let mut footprint = FootprintInstance {
+            attributes: Some(FootprintAttributes {
+                not_in_schematic: true,
+                exclude_from_position_files: true,
+                exempt_from_courtyard_requirement: true,
+                ..Default::default()
+            }),
+            definition: Some(Footprint {
+                attributes: Some(FootprintAttributes {
+                    description: "keep me".to_string(),
+                    allow_soldermask_bridges: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        update_footprint_assembly_attributes(&mut footprint, true, true).unwrap();
+        let instance = footprint.attributes.as_ref().unwrap();
+        let definition = footprint
+            .definition
+            .as_ref()
+            .unwrap()
+            .attributes
+            .as_ref()
+            .unwrap();
+        assert!(instance.exclude_from_bill_of_materials);
+        assert!(instance.do_not_populate);
+        assert!(instance.not_in_schematic);
+        assert!(instance.exclude_from_position_files);
+        assert!(instance.exempt_from_courtyard_requirement);
+        assert!(definition.exclude_from_bill_of_materials);
+        assert!(definition.do_not_populate);
+        assert_eq!(definition.description, "keep me");
+        assert!(definition.allow_soldermask_bridges);
+    }
+}
+
+#[cfg(test)]
+mod footprint_pad_net_tests {
+    use super::*;
+    use prost::Message;
+
+    fn pad(number: &str, net_name: &str, net_code: i32) -> prost_types::Any {
+        let pad = kiapi::board::types::Pad {
+            number: number.to_string(),
+            net: Some(kiapi::board::types::Net {
+                code: Some(kiapi::board::types::NetCode { value: net_code }),
+                name: net_name.to_string(),
+            }),
+            ..Default::default()
+        };
+        crate::builders::pack_any(&pad, "kiapi.board.types.Pad")
+    }
+
+    #[test]
+    fn clearing_one_pad_net_preserves_unrequested_pad_nets() {
+        let mut definition = kiapi::board::types::Footprint {
+            items: vec![pad("30", "UART_RX", 10), pad("31", "UART_TX", 11)],
+            ..Default::default()
+        };
+        let resolved = std::collections::HashMap::from([("30", None)]);
+
+        let changed = update_footprint_pad_nets(&mut definition, &resolved).unwrap();
+        assert_eq!(changed, std::collections::HashSet::from(["30".to_string()]));
+
+        let pad30 = kiapi::board::types::Pad::decode(definition.items[0].value.as_slice()).unwrap();
+        let pad31 = kiapi::board::types::Pad::decode(definition.items[1].value.as_slice()).unwrap();
+        assert!(pad30.net.is_none());
+        assert_eq!(pad31.net.unwrap().name, "UART_TX");
     }
 }
 
