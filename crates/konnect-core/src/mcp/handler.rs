@@ -15,6 +15,20 @@ use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
+/// Process-wide MCP capability surface. It is immutable after startup because
+/// stdio and HTTP share one handler and one router.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExposureProfile {
+    /// Preserve the historical raw toolset behavior.
+    #[default]
+    Legacy,
+    /// Expose workflows alongside raw toolsets for diagnostics and migration.
+    Expert,
+    /// Expose only workflows and observability; raw capabilities cannot dispatch.
+    Workflow,
+}
+
 /// Clone-able handle to the MCP request handler.
 /// Multiple transports (STDIO + HTTP) share the same handler.
 #[derive(Clone)]
@@ -28,15 +42,25 @@ pub struct McpHandler {
     /// silently dropped on stdio — the cause of issue #19.
     notif_sinks: Arc<RwLock<Vec<mpsc::Sender<String>>>>,
     observer: CallObserver,
+    exposure_profile: ExposureProfile,
 }
 
 impl McpHandler {
     pub async fn new(config: crate::tools::ServerConfig) -> anyhow::Result<Self> {
+        Self::new_with_profile(config, ExposureProfile::Legacy).await
+    }
+
+    pub async fn new_with_profile(
+        config: crate::tools::ServerConfig,
+        exposure_profile: ExposureProfile,
+    ) -> anyhow::Result<Self> {
         let router = Arc::new(ToolRouter::new());
 
         // Load only the starter kit at startup so baseline `tools/list` stays small
         // (~2K tokens, not ~23K). The LLM expands on demand via `load_toolset`.
-        router.load_starter_kit().await;
+        if exposure_profile != ExposureProfile::Workflow {
+            router.load_starter_kit().await;
+        }
 
         let observer = CallObserver::new(Some(default_calls_log_path()));
         let ctx = Arc::new(crate::tools::ToolContext::new_with_observer(
@@ -50,6 +74,7 @@ impl McpHandler {
             sse_senders: Arc::new(RwLock::new(Vec::new())),
             notif_sinks: Arc::new(RwLock::new(Vec::new())),
             observer,
+            exposure_profile,
         })
     }
 
@@ -121,10 +146,27 @@ impl McpHandler {
 
             // ── Tool listing ───────────────────────────────────────────────
             "tools/list" => {
-                // Meta-tools (always visible) + all domain tools (pre-loaded at startup)
-                let mut tools = meta_tools::meta_tool_descriptions();
-                for def in self.ctx.router.active_tools().await {
-                    tools.push(def.to_mcp_description());
+                let mut tools = if self.exposure_profile == ExposureProfile::Workflow {
+                    meta_tools::meta_tool_descriptions()
+                        .into_iter()
+                        .filter(|tool| {
+                            matches!(tool.name.as_str(), "get_recent_calls" | "server_stats")
+                        })
+                        .collect()
+                } else {
+                    meta_tools::meta_tool_descriptions()
+                };
+                if self.exposure_profile != ExposureProfile::Legacy {
+                    tools.extend(
+                        crate::tools::workflow::tools()
+                            .into_iter()
+                            .map(|tool| tool.to_mcp_description()),
+                    );
+                }
+                if self.exposure_profile != ExposureProfile::Workflow {
+                    for def in self.ctx.router.active_tools().await {
+                        tools.push(def.to_mcp_description());
+                    }
                 }
                 let result = ListToolsResult {
                     tools,
@@ -212,17 +254,82 @@ impl McpHandler {
         name: &str,
         args: &Value,
     ) -> (CallToolResult, CallStatus, Option<String>) {
-        // Meta-tools always win.
-        if let Some(result) = meta_tools::handle_meta_tool(name, args, &self.ctx).await {
-            if name == "load_toolset" || name == "unload_toolset" {
-                self.notify_tools_list_changed().await;
+        let routing_meta = matches!(
+            name,
+            "list_toolboxes" | "load_toolset" | "unload_toolset" | "get_active_toolsets"
+        );
+        // Workflow mode keeps observability but cannot use routing meta-tools to
+        // reveal or activate raw capabilities.
+        if !(self.exposure_profile == ExposureProfile::Workflow && routing_meta) {
+            if let Some(result) = meta_tools::handle_meta_tool(name, args, &self.ctx).await {
+                if name == "load_toolset" || name == "unload_toolset" {
+                    self.notify_tools_list_changed().await;
+                }
+                let status = if result.is_error {
+                    CallStatus::Error
+                } else {
+                    CallStatus::Ok
+                };
+                return (result, status, None);
             }
-            let status = if result.is_error {
-                CallStatus::Error
-            } else {
-                CallStatus::Ok
+        }
+
+        if self.exposure_profile != ExposureProfile::Legacy {
+            if let Some(tool_def) = crate::tools::workflow::tools()
+                .into_iter()
+                .find(|tool| tool.name == name)
+            {
+                return match (tool_def.handler)(args, self.ctx.clone()).await {
+                    Ok(result) => {
+                        let status = if result.is_error {
+                            CallStatus::Error
+                        } else {
+                            CallStatus::Ok
+                        };
+                        let error_kind = extract_error_kind(&result);
+                        (result, status, error_kind)
+                    }
+                    Err(error) => {
+                        let kind = if matches!(name, "plan_schematic_edit" | "plan_pcb_edit") {
+                            ToolErrorKind::InvalidPlan {
+                                reason: error.to_string(),
+                            }
+                        } else {
+                            ToolErrorKind::HandlerError {
+                                reason: error.to_string(),
+                            }
+                        };
+                        let code = kind.short_code().to_string();
+                        (
+                            CallToolResult::error_kind(kind, format!("Tool error: {error}")),
+                            CallStatus::Error,
+                            Some(code),
+                        )
+                    }
+                };
+            }
+        }
+
+        let is_workflow_tool = crate::tools::workflow::tools()
+            .iter()
+            .any(|tool| tool.name == name);
+        let is_raw_or_routing =
+            routing_meta || self.ctx.router.find_toolset_for_tool(name).is_some();
+        if (self.exposure_profile == ExposureProfile::Workflow && is_raw_or_routing)
+            || (self.exposure_profile == ExposureProfile::Legacy && is_workflow_tool)
+        {
+            let kind = ToolErrorKind::CapabilityNotExposed {
+                tool: name.to_string(),
+                profile: format!("{:?}", self.exposure_profile).to_lowercase(),
             };
-            return (result, status, None);
+            return (
+                CallToolResult::error_kind(
+                    kind,
+                    format!("Tool '{name}' is not exposed by the active profile"),
+                ),
+                CallStatus::NotFound,
+                Some("capability_not_exposed".into()),
+            );
         }
 
         // Loaded domain tool?
@@ -324,4 +431,71 @@ fn result_content_bytes(result: &CallToolResult) -> usize {
             ToolContent::Image { data, .. } => data.len(),
         })
         .sum()
+}
+
+#[cfg(test)]
+mod exposure_tests {
+    use super::*;
+
+    fn config() -> crate::tools::ServerConfig {
+        crate::tools::ServerConfig {
+            kicad_cli: "kicad-cli".into(),
+            kicad_binary: "kicad".into(),
+            ipc_address: "ipc:///unused".into(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+        }
+    }
+
+    async fn listed_names(profile: ExposureProfile) -> Vec<String> {
+        let handler = McpHandler::new_with_profile(config(), profile)
+            .await
+            .unwrap();
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/list"
+            }))
+            .await
+            .unwrap();
+        response.result.unwrap()["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn workflow_profile_lists_only_workflows_and_observability() {
+        let names = listed_names(ExposureProfile::Workflow).await;
+        assert_eq!(names.len(), 9);
+        assert!(names.contains(&"inspect_design".into()));
+        assert!(names.contains(&"get_recent_calls".into()));
+        assert!(names.contains(&"server_stats".into()));
+        assert!(!names.contains(&"load_toolset".into()));
+        assert!(!names.contains(&"get_project_info".into()));
+    }
+
+    #[tokio::test]
+    async fn legacy_surface_is_unchanged_and_expert_adds_workflows() {
+        let legacy = listed_names(ExposureProfile::Legacy).await;
+        let expert = listed_names(ExposureProfile::Expert).await;
+        assert_eq!(legacy.len(), 18);
+        assert!(!legacy.contains(&"inspect_design".into()));
+        assert_eq!(expert.len(), legacy.len() + 7);
+        assert!(expert.contains(&"inspect_design".into()));
+    }
+
+    #[tokio::test]
+    async fn workflow_profile_blocks_raw_dispatch_and_router_bypass() {
+        let handler = McpHandler::new_with_profile(config(), ExposureProfile::Workflow)
+            .await
+            .unwrap();
+        for name in ["get_project_info", "load_toolset"] {
+            let (result, status, kind) = handler.dispatch_tool(name, &json!({})).await;
+            assert!(result.is_error, "{name} unexpectedly dispatched");
+            assert_eq!(status, CallStatus::NotFound);
+            assert_eq!(kind.as_deref(), Some("capability_not_exposed"));
+        }
+    }
 }

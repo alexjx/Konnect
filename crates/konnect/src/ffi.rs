@@ -49,7 +49,7 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             project_dir: config.project_dir.clone(),
             jlcpcb_db_path: config.jlcpcb_db_path.clone(),
         };
-        match McpHandler::new(server_config).await {
+        match McpHandler::new_with_profile(server_config, config.exposure_profile).await {
             Ok(handler) => match config.transport {
                 TransportMode::Stdio => {
                     let _ = crate::transport::stdio::run_stdio(handler).await;

@@ -1,7 +1,7 @@
-//! The 6 always-visible meta-tools.
+//! The 6 legacy/expert meta-tools (workflow mode keeps only observability).
 //!
 //! Discovery / routing:
-//!   list_toolboxes()          — show all 17 toolsets with descriptions and load state
+//!   list_toolboxes()          — show all 18 toolsets with descriptions and load state
 //!   load_toolset(name)        — activate a toolset, expose its tools in tools/list
 //!   unload_toolset(name)      — deactivate a toolset, remove its tools from tools/list
 //!   get_active_toolsets()     — list currently loaded toolsets
@@ -18,7 +18,7 @@ use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::tools::ToolContext;
 use serde_json::{json, Value};
 
-/// Return the 4 meta-tool MCP descriptions (always in the tools/list response).
+/// Return all 6 meta-tool MCP descriptions; the handler filters by exposure profile.
 pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
     vec![
         McpToolDescription {

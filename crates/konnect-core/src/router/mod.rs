@@ -193,6 +193,31 @@ mod tests {
     }
 
     #[test]
+    fn tool_directory_headings_match_registry_counts() {
+        let directory = include_str!("../../../../tool-directory.md");
+        let total: usize = registry::ALL_TOOLSETS
+            .iter()
+            .map(|toolset| toolset.tool_count)
+            .sum();
+        assert!(
+            directory.contains(&format!("**{total} raw tools**")),
+            "tool-directory.md total is stale"
+        );
+        for toolset in registry::ALL_TOOLSETS {
+            let noun = if toolset.tool_count == 1 {
+                "tool"
+            } else {
+                "tools"
+            };
+            let heading = format!("### `{}` — {} {}", toolset.name, toolset.tool_count, noun);
+            assert!(
+                directory.contains(&heading),
+                "tool-directory.md is missing '{heading}'"
+            );
+        }
+    }
+
+    #[test]
     fn disabled_tools_are_implemented_but_not_exposed() {
         let mut raw_owner = std::collections::HashMap::new();
         for meta in registry::ALL_TOOLSETS {

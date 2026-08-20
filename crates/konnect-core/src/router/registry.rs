@@ -173,7 +173,7 @@ pub static DISABLED_TOOLS: &[DisabledTool] = &[
 
 /// Toolsets auto-loaded when the server starts.
 ///
-/// Kept minimal so that baseline `tools/list` context stays small (~17 tools
+/// Kept minimal so that baseline `tools/list` context stays small (18 tools
 /// including meta-tools ≈ 2K tokens). The LLM expands its toolbelt on demand
 /// via `load_toolset(...)`.
 ///

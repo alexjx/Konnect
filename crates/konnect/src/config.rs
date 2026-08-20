@@ -4,6 +4,10 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// MCP capability exposure: legacy, expert, or workflow.
+    #[serde(default)]
+    pub exposure_profile: konnect_core::mcp::handler::ExposureProfile,
+
     /// Path to the kicad-cli binary
     #[serde(default = "default_kicad_cli")]
     pub kicad_cli: String,
@@ -117,6 +121,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            exposure_profile: Default::default(),
             kicad_cli: default_kicad_cli(),
             kicad_binary: default_kicad_binary(),
             project_dir: None,
@@ -188,6 +193,7 @@ mod tests {
         for bad in [
             r#"{"transport": 42}"#,
             r#"{"transport": "carrier-pigeon"}"#,
+            r#"{"exposure_profile": "unsafe"}"#,
             r#"{"kicad_cli": ["a", "b"]}"#,
             r#"{"log_level": {"nested": true}}"#,
         ] {
@@ -227,6 +233,20 @@ mod tests {
         let f = write_temp("toml", "");
         let c = Config::load_from(f.path()).unwrap();
         assert_eq!(c.log_level, "info");
+        assert!(matches!(
+            c.exposure_profile,
+            konnect_core::mcp::handler::ExposureProfile::Legacy
+        ));
+    }
+
+    #[test]
+    fn workflow_exposure_profile_parses_from_json() {
+        let f = write_temp("json", r#"{"exposure_profile": "workflow"}"#);
+        let c = Config::load_from(f.path()).unwrap();
+        assert!(matches!(
+            c.exposure_profile,
+            konnect_core::mcp::handler::ExposureProfile::Workflow
+        ));
     }
 
     #[test]

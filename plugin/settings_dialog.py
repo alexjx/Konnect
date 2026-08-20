@@ -23,11 +23,14 @@ DEFAULT_SETTINGS = {
     "jlcpcb_db_path": "",
     "log_level": "info",
     "transport": "stdio",
+    "exposure_profile": "legacy",
 }
 
 LOG_LEVELS = ["error", "warn", "info", "debug", "trace"]
 
 TRANSPORTS = ["stdio", "http", "both"]
+
+EXPOSURE_PROFILES = ["legacy", "expert", "workflow"]
 
 
 # ─── Settings I/O ────────────────────────────────────────────────────────────
@@ -179,7 +182,7 @@ class KonnectSettingsDialog(wx.Dialog):
 
         # ── Advanced section ─────────────────────────────────────────
         adv_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Advanced")
-        agrid = wx.FlexGridSizer(3, 2, 5, 5)
+        agrid = wx.FlexGridSizer(4, 2, 5, 5)
         agrid.AddGrowableCol(1, 1)
 
         agrid.Add(wx.StaticText(panel, label="IPC Socket:"), 0, wx.ALIGN_CENTER_VERTICAL)
@@ -193,6 +196,10 @@ class KonnectSettingsDialog(wx.Dialog):
         agrid.Add(wx.StaticText(panel, label="Transport:"), 0, wx.ALIGN_CENTER_VERTICAL)
         self.transport_ctrl = wx.Choice(panel, choices=TRANSPORTS)
         agrid.Add(self.transport_ctrl, 1, wx.EXPAND)
+
+        agrid.Add(wx.StaticText(panel, label="Tool Profile:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.exposure_profile_ctrl = wx.Choice(panel, choices=EXPOSURE_PROFILES)
+        agrid.Add(self.exposure_profile_ctrl, 1, wx.EXPAND)
 
         adv_box.Add(agrid, 0, wx.EXPAND | wx.ALL, 5)
         main_sizer.Add(adv_box, 0, wx.EXPAND | wx.ALL, 8)
@@ -253,6 +260,12 @@ class KonnectSettingsDialog(wx.Dialog):
         else:
             self.transport_ctrl.SetSelection(0)  # "stdio"
 
+        profile = self.settings.get("exposure_profile", "legacy")
+        if profile in EXPOSURE_PROFILES:
+            self.exposure_profile_ctrl.SetSelection(EXPOSURE_PROFILES.index(profile))
+        else:
+            self.exposure_profile_ctrl.SetSelection(0)  # "legacy"
+
     def _collect_settings(self):
         """Read current field values into a settings dict."""
         return {
@@ -261,6 +274,7 @@ class KonnectSettingsDialog(wx.Dialog):
             "jlcpcb_db_path": self.jlcpcb_ctrl.GetValue().strip(),
             "log_level": LOG_LEVELS[self.log_level_ctrl.GetSelection()],
             "transport": TRANSPORTS[self.transport_ctrl.GetSelection()],
+            "exposure_profile": EXPOSURE_PROFILES[self.exposure_profile_ctrl.GetSelection()],
         }
 
     def _update_server_status(self):

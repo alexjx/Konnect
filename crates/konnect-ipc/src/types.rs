@@ -28,6 +28,25 @@ pub struct IpcFootprintItemSample {
     pub y: f64,
 }
 
+/// One absolute footprint transform in a board edit transaction.
+///
+/// Omitted fields retain their current value. At least one of `position` or
+/// `rotation` must be supplied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcFootprintTransform {
+    pub reference: String,
+    pub position: Option<IpcVector2>,
+    pub rotation: Option<f64>,
+}
+
+/// Live footprint state expected after an atomic transform transaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcFootprintTransformState {
+    pub reference: String,
+    pub position: IpcVector2,
+    pub rotation: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpcBounds {
     pub min: IpcVector2,

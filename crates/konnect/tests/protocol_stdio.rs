@@ -13,11 +13,31 @@ struct McpProcess {
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
     next_id: i64,
+    _config_dir: Option<tempfile::TempDir>,
 }
 
 impl McpProcess {
     fn spawn() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        Self::spawn_with_profile(None)
+    }
+
+    fn spawn_with_profile(profile: Option<&str>) -> Self {
+        let config_dir = profile.map(|profile| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("settings.json"),
+                serde_json::to_vec(&json!({ "exposure_profile": profile })).unwrap(),
+            )
+            .unwrap();
+            dir
+        });
+        let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+        if let Some(dir) = &config_dir {
+            command
+                .arg("--config")
+                .arg(dir.path().join("settings.json"));
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -30,6 +50,7 @@ impl McpProcess {
             stdin,
             reader,
             next_id: 1,
+            _config_dir: config_dir,
         };
         // MCP handshake
         let init = p.request(
@@ -116,6 +137,28 @@ impl McpProcess {
     fn tool_body(result: &Value) -> Value {
         let text = result["content"][0]["text"].as_str().unwrap_or("{}");
         serde_json::from_str(text).unwrap_or(Value::Null)
+    }
+}
+
+#[test]
+fn workflow_profile_is_enforced_over_real_stdio() {
+    let mut p = McpProcess::spawn_with_profile(Some("workflow"));
+    let list = p.request("tools/list", json!({}));
+    let names: Vec<_> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 9);
+    assert!(names.contains(&"inspect_design"));
+    assert!(!names.contains(&"load_toolset"));
+    assert!(!names.contains(&"get_project_info"));
+
+    for raw in ["get_project_info", "load_toolset"] {
+        let result = p.call_tool(raw, json!({}));
+        let body = McpProcess::tool_body(&result);
+        assert_eq!(body["error"]["kind"], "capability_not_exposed");
     }
 }
 

@@ -10,16 +10,30 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **18 toolsets** organized into 10 categories
-- **174 exposed workflow tools** + **6 always-visible meta-tools** = **180 total**
+- **193 raw tools** + **7 guarded workflow tools** + **6 meta-tools** = **206 expert-profile capabilities**
 - **40 retained implementations are temporarily hidden** by
   `router/registry.rs::DISABLED_TOOLS`; removing an entry restores exposure
   without restoring code.
-- **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop.
+- **Exposure profiles**: `legacy` preserves starter-kit/on-demand raw tools; `expert` adds all 7 workflows; `workflow` exposes only those workflows plus two observability tools and rejects raw dispatch with `capability_not_exposed`.
+- **Discovery pattern (legacy/expert)**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
-## Meta-tools (always visible)
+## Meta-tools
 
 Six tools, grouped into *discovery/routing* and *observability*.
+The workflow profile exposes only the two observability entries.
+
+## Guarded workflow tools (expert/workflow profiles)
+
+| Tool | Purpose |
+|---|---|
+| `inspect_design` | Aggregate read-only project, schematic, and board inspection. |
+| `plan_schematic_edit` | Validate typed component field or grid-snapped move operations without changing the target file. |
+| `plan_pcb_edit` | Bind the exact live board, fingerprint it, and preflight absolute footprint transforms against projected courtyard geometry. |
+| `get_change_set` | Read lifecycle, typed operations, allow-list, fingerprints, diff, and stable error data. |
+| `apply_change_set` | Reject stale state, serialize concurrent calls, and apply one atomic file/IPC transaction. |
+| `verify_change_set` | Verify the post-state; a PCB is saved only after live state and courtyard checks pass. |
+| `discard_change_set` | Discard an untouched planned change set. |
 
 ### Discovery / routing
 
@@ -84,7 +98,7 @@ single export operation.
 
 ## Project
 
-### `project` ? 6 tools
+### `project` — 6 tools
 **Purpose:** Create, open, save, inspect, and snapshot KiCAD projects.
 **Source:** [`crates/konnect-core/src/tools/project.rs`](crates/konnect-core/src/tools/project.rs)
 
@@ -101,7 +115,7 @@ single export operation.
 
 ## Schematic
 
-### `sch_components` ? 17 tools
+### `sch_components` — 17 tools
 **Purpose:** Add, edit, move, rotate, and delete schematic symbols.
 **Source:** [`crates/konnect-core/src/tools/sch_components.rs`](crates/konnect-core/src/tools/sch_components.rs)
 
@@ -125,7 +139,7 @@ single export operation.
 | `replace_component` | Replace a component's `lib_id` with a new library symbol (swap the component type). |
 | `get_schematic_view` | Render the schematic to a PNG image (base64-encoded) via kicad-cli. |
 
-### `sch_wiring` ? 20 tools
+### `sch_wiring` — 20 tools
 **Purpose:** Wires, net labels, junctions, no-connects, and pin-to-pin connections.
 **Source:** [`crates/konnect-core/src/tools/sch_wiring.rs`](crates/konnect-core/src/tools/sch_wiring.rs)
 
@@ -152,7 +166,7 @@ single export operation.
 | `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. |
 | `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing). Use `connect_pins` if you have references instead of coordinates. |
 
-### `sch_analysis` ? 16 tools
+### `sch_analysis` — 16 tools
 **Purpose:** Net connectivity, pin queries, trace paths, overlap/orphan detection.
 **Source:** [`crates/konnect-core/src/tools/sch_analysis.rs`](crates/konnect-core/src/tools/sch_analysis.rs)
 
@@ -175,7 +189,7 @@ single export operation.
 | `check_schematic_overlaps` | Find overlapping symbols or labels that may indicate placement errors. |
 | `get_schematic_connection_islands` | Return connected-item envelopes and clearance conflicts for placement review. |
 
-### `sch_batch` ? 11 tools
+### `sch_batch` — 11 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
 **Source:** [`crates/konnect-core/src/tools/sch_batch.rs`](crates/konnect-core/src/tools/sch_batch.rs)
 
@@ -193,7 +207,7 @@ single export operation.
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
 
-### `sch_export` ? 6 tools
+### `sch_export` — 6 tools
 **Purpose:** Export schematic to SVG/PDF/netlist, run ERC.
 **Source:** [`crates/konnect-core/src/tools/sch_export.rs`](crates/konnect-core/src/tools/sch_export.rs)
 
@@ -206,7 +220,7 @@ single export operation.
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 
-### `sch_hierarchy` ? 13 tools
+### `sch_hierarchy` — 13 tools
 **Purpose:** Hierarchical sheets: add/edit/move/delete/duplicate and repair sheet instances, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
 **Source:** [`crates/konnect-core/src/tools/sch_hierarchy.rs`](crates/konnect-core/src/tools/sch_hierarchy.rs)
 
@@ -230,7 +244,7 @@ single export operation.
 
 ## PCB
 
-### `pcb_board` ? 6 tools
+### `pcb_board` — 15 tools
 **Purpose:** Board outline, layer inspection, zones, and mounting holes.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
@@ -243,7 +257,7 @@ single export operation.
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net. |
 
-### `pcb_components` ? 24 tools
+### `pcb_components` — 24 tools
 **Purpose:** Place, move, rotate, align, and duplicate PCB footprints.
 **Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
 
@@ -274,7 +288,7 @@ single export operation.
 | `auto_place_references` | Place footprint references using live geometry and collision checks. |
 | `get_board_2d_view` | Render the PCB as a 2D image using kicad-cli; returns base64 PNG. |
 
-### `pcb_routing` ? 12 tools
+### `pcb_routing` — 12 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
@@ -293,7 +307,7 @@ single export operation.
 | `create_netclass` | Add a netclass definition to the board's design rules (S-expression insert). |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
-### `pcb_export` ? 7 tools
+### `pcb_export` — 7 tools
 **Purpose:** Gerber, PDF, SVG, 3D model, BOM, netlist, pick-and-place, and zone refill.
 **Source:** [`crates/konnect-core/src/tools/pcb_export.rs`](crates/konnect-core/src/tools/pcb_export.rs)
 
@@ -311,7 +325,7 @@ single export operation.
 
 ## Library
 
-### `library` ? 15 tools
+### `library` — 24 tools
 **Purpose:** Symbol libraries, footprint libraries, search and registration.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
@@ -336,7 +350,7 @@ single export operation.
 
 ## Integration
 
-### `integration` ? 1 tool
+### `integration` — 1 tool
 **Purpose:** Exact-device datasheet URL lookup.
 **Source:** [`crates/konnect-core/src/tools/integration.rs`](crates/konnect-core/src/tools/integration.rs)
 
@@ -348,7 +362,7 @@ single export operation.
 
 ## Verification
 
-### `verification` ? 4 tools
+### `verification` — 4 tools
 **Purpose:** DRC, design-rule inspection, KiCAD status, and clearance checks.
 **Source:** [`crates/konnect-core/src/tools/verification.rs`](crates/konnect-core/src/tools/verification.rs)
 
@@ -363,7 +377,7 @@ single export operation.
 
 ## Configuration
 
-### `config` ? 6 tools
+### `config` — 6 tools
 **Purpose:** User preferences, project rules, design rules, fab constraints. **Call `load_user_config` at session start.**
 **Source:** [`crates/konnect-core/src/tools/config.rs`](crates/konnect-core/src/tools/config.rs)
 
@@ -380,7 +394,7 @@ single export operation.
 
 ## Design Review
 
-### `design_review` ? 5 tools
+### `design_review` — 5 tools
 **Purpose:** AI-powered design audits: decoupling, connections, power rails, DFM, BOM health.
 **Source:** [`crates/konnect-core/src/tools/design_review.rs`](crates/konnect-core/src/tools/design_review.rs)
 
@@ -396,7 +410,7 @@ single export operation.
 
 ## Templates
 
-### `templates` ? 4 tools
+### `templates` — 4 tools
 **Purpose:** Reference circuit library — USB-C, LDO, buck converter, STM32, I2C, LED — verified component values.
 **Source:** [`crates/konnect-core/src/tools/templates.rs`](crates/konnect-core/src/tools/templates.rs)
 
@@ -414,7 +428,7 @@ single export operation.
 
 ## Manufacturing
 
-### `manufacturing` ? 2 tools
+### `manufacturing` — 2 tools
 **Purpose:** Export a manufacturing package and validate fabrication readiness.
 **Source:** [`crates/konnect-core/src/tools/manufacturing.rs`](crates/konnect-core/src/tools/manufacturing.rs)
 

@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
         project_dir: config.project_dir.clone(),
         jlcpcb_db_path: config.jlcpcb_db_path.clone(),
     };
-    let handler = McpHandler::new(server_config).await?;
+    let handler = McpHandler::new_with_profile(server_config, config.exposure_profile).await?;
 
     match config.transport {
         TransportMode::Stdio => {

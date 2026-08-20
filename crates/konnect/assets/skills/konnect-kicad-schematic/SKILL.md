@@ -9,9 +9,9 @@ Use Konnect for every schematic write. Never edit `.kicad_sch` text directly. Do
 
 ## Konnect discovery and preflight
 
-- Start with `list_toolboxes` and `get_active_toolsets`; load only the current toolsets required by the task.
-- Use `project` and `config` for project state and design rules; use `sch_components`, `sch_wiring`, `sch_analysis`, `sch_batch`, `sch_export`, `sch_hierarchy`, `library`, `templates`, `verification`, and `design_review` as applicable.
-- Do not guess a tool or toolset name. If a capability is missing, rediscover the current registry and stop if Konnect cannot perform the required write safely.
+- Prefer Konnect's workflow interface when available: inspect with `inspect_design`, create a typed plan with `plan_schematic_edit`, review the returned change set, then use `apply_change_set` and `verify_change_set`. Never bypass a stale-plan, precondition, allow-list, or verification failure.
+- In `expert` or `legacy` exposure mode, start with `list_toolboxes` and `get_active_toolsets`; load only the current toolsets required by the task. Use raw tools only for a capability the workflow interface does not yet support, and preserve the same inspect-before-write and re-query-after-write discipline.
+- Do not guess a workflow, tool, or toolset name. Rediscover the available interface after an unavailable-capability error and stop if Konnect cannot perform the required write safely.
 - Identify the exact `.kicad_pro` and target page before mutation. Re-query the changed objects afterward and save through Konnect.
 
 ## Existing work and design authority

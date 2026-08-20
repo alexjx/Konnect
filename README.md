@@ -11,10 +11,11 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**174 exposed tools across 18 on-demand toolsets.** Schematic capture, PCB layout and
+**193 verified raw tools across 18 on-demand toolsets, plus 7 workflow tools.** Schematic capture, PCB layout and
 route planning, ERC/DRC, design-review audits, reference circuits, and a full
-manufacturing export pipeline. Agents begin with 18 tools and load the relevant
-toolset only when a task needs it. Two bundled Codex skills add
+manufacturing export pipeline. The default `legacy` profile begins with 18 tools and
+loads the relevant toolset only when needed. The opt-in `workflow` profile exposes
+only 7 guarded workflows plus 2 observability tools. Two bundled Codex skills add
 datasheet-driven schematic, placement, routing, review, and fabrication workflows.
 
 > **Status: beta.** The core toolchain is tested and working, but this is a young
@@ -55,11 +56,32 @@ through its own S-expression engine with atomic writes (write, fsync, rename), U
 preservation, and round-trip tests — no third-party schematic library with known
 gaps, no text-manipulation workarounds.
 
-**Context economy is a feature.** Exposing ~180 tools to an LLM costs roughly 23K
+**Context economy is a feature.** Exposing ~200 tools to an LLM costs roughly 23K
 tokens of context on every listing. Konnect's router loads a starter kit (~2K
 tokens) and lets the model pull in toolsets on demand — plus built-in observability
 (`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
 own tool failures.
+
+### Workflow-first editing
+
+Set `exposure_profile` to `workflow` to hide raw MCP capabilities and expose a small,
+typed surface: inspect, plan, inspect a change set, apply, verify, and discard. Plans
+carry a file/live-document fingerprint and target allow-list; stale plans are rejected
+before writing. PCB footprint moves and absolute rotations use one KiCad undo commit,
+projected exact courtyard checks, and save only after verification.
+
+Profiles are process-wide: `legacy` preserves the historical surface, `expert` adds
+workflows while retaining on-demand raw toolsets, and `workflow` prevents raw dispatch
+(including `load_toolset`). Configure it in `settings.json`:
+
+```json
+{ "exposure_profile": "workflow" }
+```
+
+The MVP intentionally limits schematic writes to component properties and grid-snapped
+component moves, and PCB writes to footprint position/rotation. Change sets live in the
+server process for 30 minutes; a restart expires them. Use `workflow` when guard enforcement
+is required—`expert` deliberately allows raw tools to bypass workflow policy.
 
 The result is smaller, faster to install, aligned with where KiCAD is going, and
 built for production use rather than experimentation. The original project remains

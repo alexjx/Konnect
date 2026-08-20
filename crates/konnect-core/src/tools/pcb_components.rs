@@ -2615,6 +2615,44 @@ async fn handle_get_board_2d_view(
 #[cfg(test)]
 mod reference_layout_tests {
     use super::*;
+    use konnect_ipc::types::{IpcBounds, IpcCourtyardPrimitive, IpcFootprintCourtyard, IpcVector2};
+
+    fn point(x: f64, y: f64) -> IpcVector2 {
+        IpcVector2 { x, y }
+    }
+
+    fn courtyard(reference: &str, points: &[(f64, f64)], closed: bool) -> IpcFootprintCourtyard {
+        let points: Vec<_> = points.iter().map(|(x, y)| point(*x, *y)).collect();
+        let min_x = points
+            .iter()
+            .map(|point| point.x)
+            .fold(f64::INFINITY, f64::min);
+        let min_y = points
+            .iter()
+            .map(|point| point.y)
+            .fold(f64::INFINITY, f64::min);
+        let max_x = points
+            .iter()
+            .map(|point| point.x)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let max_y = points
+            .iter()
+            .map(|point| point.y)
+            .fold(f64::NEG_INFINITY, f64::max);
+        IpcFootprintCourtyard {
+            reference: reference.to_owned(),
+            layer: "F.CrtYd".to_owned(),
+            bounds: Some(IpcBounds {
+                min: point(min_x, min_y),
+                max: point(max_x, max_y),
+            }),
+            primitives: vec![IpcCourtyardPrimitive {
+                kind: if closed { "polygon" } else { "polyline" }.to_owned(),
+                layer: "F.CrtYd".to_owned(),
+                points,
+            }],
+        }
+    }
 
     #[test]
     fn text_bounds_follow_rotation() {
@@ -2640,7 +2678,6 @@ mod reference_layout_tests {
 
     #[test]
     fn courtyard_overlap_requires_positive_area() {
-        use konnect_ipc::types::{IpcBounds, IpcVector2};
         let a = IpcBounds {
             min: IpcVector2 { x: 0.0, y: 0.0 },
             max: IpcVector2 { x: 2.0, y: 2.0 },
@@ -2656,6 +2693,59 @@ mod reference_layout_tests {
         assert!(bounds_overlap(&a, &overlap, 0.0));
         assert!(!bounds_overlap(&a, &touching, 0.0));
         assert!(bounds_overlap(&a, &touching, 0.01));
+    }
+
+    #[test]
+    fn exact_courtyard_rejects_aabb_false_positive() {
+        let lower_left = courtyard("U1", &[(0.0, 0.0), (4.0, 0.0), (0.0, 4.0)], true);
+        let upper_right = courtyard("U2", &[(4.0, 4.0), (4.0, 1.0), (1.0, 4.0)], true);
+        assert!(bounds_overlap(
+            lower_left.bounds.as_ref().unwrap(),
+            upper_right.bounds.as_ref().unwrap(),
+            0.0
+        ));
+        assert_eq!(
+            exact_courtyard_conflict(&lower_left, &upper_right, 0.0),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn exact_courtyard_detects_crossing_and_clearance() {
+        let horizontal = courtyard("U1", &[(0.0, 0.0), (2.0, 0.0)], false);
+        let crossing = courtyard("U2", &[(1.0, -1.0), (1.0, 1.0)], false);
+        let nearby = courtyard("U3", &[(0.0, 0.2), (2.0, 0.2)], false);
+        assert_eq!(
+            exact_courtyard_conflict(&horizontal, &crossing, 0.0),
+            Some(true)
+        );
+        assert_eq!(exact_courtyard_conflict(&horizontal, &nearby, 0.1), None);
+        assert_eq!(
+            exact_courtyard_conflict(&horizontal, &nearby, 0.2),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn exact_courtyard_detects_containment() {
+        let outer = courtyard(
+            "U1",
+            &[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)],
+            true,
+        );
+        let inner = courtyard(
+            "U2",
+            &[(1.0, 1.0), (2.0, 1.0), (2.0, 2.0), (1.0, 2.0)],
+            true,
+        );
+        assert_eq!(exact_courtyard_conflict(&outer, &inner, 0.0), Some(true));
+    }
+
+    #[test]
+    fn exact_courtyard_marks_open_non_intersecting_geometry_inconclusive() {
+        let first = courtyard("U1", &[(0.0, 0.0), (1.0, 0.0)], false);
+        let second = courtyard("U2", &[(0.0, 1.0), (1.0, 1.0)], false);
+        assert_eq!(exact_courtyard_conflict(&first, &second, 0.0), None);
     }
 
     #[test]
@@ -2760,7 +2850,7 @@ async fn handle_add_footprint_courtyard_circle(
     ))
 }
 
-fn bounds_overlap(
+pub(crate) fn bounds_overlap(
     a: &konnect_ipc::types::IpcBounds,
     b: &konnect_ipc::types::IpcBounds,
     clearance: f64,
@@ -2769,6 +2859,214 @@ fn bounds_overlap(
         && a.max.x + clearance > b.min.x
         && a.min.y < b.max.y + clearance
         && a.max.y + clearance > b.min.y
+}
+
+fn courtyard_segments(
+    courtyard: &konnect_ipc::types::IpcFootprintCourtyard,
+) -> Vec<(
+    konnect_ipc::types::IpcVector2,
+    konnect_ipc::types::IpcVector2,
+)> {
+    let mut segments = Vec::new();
+    for primitive in &courtyard.primitives {
+        for pair in primitive.points.windows(2) {
+            segments.push((pair[0].clone(), pair[1].clone()));
+        }
+        if matches!(primitive.kind.as_str(), "rectangle" | "circle" | "polygon")
+            && primitive.points.len() > 2
+        {
+            segments.push((
+                primitive.points.last().unwrap().clone(),
+                primitive.points[0].clone(),
+            ));
+        }
+    }
+    segments
+}
+
+fn point_segment_distance(
+    point: &konnect_ipc::types::IpcVector2,
+    start: &konnect_ipc::types::IpcVector2,
+    end: &konnect_ipc::types::IpcVector2,
+) -> f64 {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let length_squared = dx * dx + dy * dy;
+    if length_squared <= f64::EPSILON {
+        return ((point.x - start.x).powi(2) + (point.y - start.y).powi(2)).sqrt();
+    }
+    let projection =
+        (((point.x - start.x) * dx + (point.y - start.y) * dy) / length_squared).clamp(0.0, 1.0);
+    let closest_x = start.x + projection * dx;
+    let closest_y = start.y + projection * dy;
+    ((point.x - closest_x).powi(2) + (point.y - closest_y).powi(2)).sqrt()
+}
+
+fn orientation(
+    a: &konnect_ipc::types::IpcVector2,
+    b: &konnect_ipc::types::IpcVector2,
+    c: &konnect_ipc::types::IpcVector2,
+) -> f64 {
+    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+}
+
+fn point_on_courtyard_segment(
+    point: &konnect_ipc::types::IpcVector2,
+    start: &konnect_ipc::types::IpcVector2,
+    end: &konnect_ipc::types::IpcVector2,
+) -> bool {
+    const EPSILON: f64 = 1e-9;
+    orientation(start, end, point).abs() <= EPSILON
+        && point.x >= start.x.min(end.x) - EPSILON
+        && point.x <= start.x.max(end.x) + EPSILON
+        && point.y >= start.y.min(end.y) - EPSILON
+        && point.y <= start.y.max(end.y) + EPSILON
+}
+
+fn segments_intersect(
+    a1: &konnect_ipc::types::IpcVector2,
+    a2: &konnect_ipc::types::IpcVector2,
+    b1: &konnect_ipc::types::IpcVector2,
+    b2: &konnect_ipc::types::IpcVector2,
+) -> bool {
+    const EPSILON: f64 = 1e-9;
+    let o1 = orientation(a1, a2, b1);
+    let o2 = orientation(a1, a2, b2);
+    let o3 = orientation(b1, b2, a1);
+    let o4 = orientation(b1, b2, a2);
+    if ((o1 > EPSILON && o2 < -EPSILON) || (o1 < -EPSILON && o2 > EPSILON))
+        && ((o3 > EPSILON && o4 < -EPSILON) || (o3 < -EPSILON && o4 > EPSILON))
+    {
+        return true;
+    }
+    (o1.abs() <= EPSILON && point_on_courtyard_segment(b1, a1, a2))
+        || (o2.abs() <= EPSILON && point_on_courtyard_segment(b2, a1, a2))
+        || (o3.abs() <= EPSILON && point_on_courtyard_segment(a1, b1, b2))
+        || (o4.abs() <= EPSILON && point_on_courtyard_segment(a2, b1, b2))
+}
+
+fn segment_distance(
+    a1: &konnect_ipc::types::IpcVector2,
+    a2: &konnect_ipc::types::IpcVector2,
+    b1: &konnect_ipc::types::IpcVector2,
+    b2: &konnect_ipc::types::IpcVector2,
+) -> f64 {
+    if segments_intersect(a1, a2, b1, b2) {
+        return 0.0;
+    }
+    point_segment_distance(a1, b1, b2)
+        .min(point_segment_distance(a2, b1, b2))
+        .min(point_segment_distance(b1, a1, a2))
+        .min(point_segment_distance(b2, a1, a2))
+}
+
+fn same_courtyard_point(
+    a: &konnect_ipc::types::IpcVector2,
+    b: &konnect_ipc::types::IpcVector2,
+) -> bool {
+    (a.x - b.x).abs() <= 1e-6 && (a.y - b.y).abs() <= 1e-6
+}
+
+fn stitched_courtyard_loops(
+    segments: &[(
+        konnect_ipc::types::IpcVector2,
+        konnect_ipc::types::IpcVector2,
+    )],
+) -> Vec<Vec<konnect_ipc::types::IpcVector2>> {
+    let mut used = vec![false; segments.len()];
+    let mut loops = Vec::new();
+    for start_index in 0..segments.len() {
+        if used[start_index] {
+            continue;
+        }
+        used[start_index] = true;
+        let mut points = vec![
+            segments[start_index].0.clone(),
+            segments[start_index].1.clone(),
+        ];
+        loop {
+            let current = points.last().unwrap();
+            if points.len() >= 4 && same_courtyard_point(current, &points[0]) {
+                points.pop();
+                loops.push(points);
+                break;
+            }
+            let next = segments.iter().enumerate().find_map(|(index, (a, b))| {
+                if used[index] {
+                    None
+                } else if same_courtyard_point(current, a) {
+                    Some((index, b.clone()))
+                } else if same_courtyard_point(current, b) {
+                    Some((index, a.clone()))
+                } else {
+                    None
+                }
+            });
+            let Some((index, point)) = next else {
+                break;
+            };
+            used[index] = true;
+            points.push(point);
+        }
+    }
+    loops
+}
+
+fn point_in_courtyard_loop(
+    point: &konnect_ipc::types::IpcVector2,
+    polygon: &[konnect_ipc::types::IpcVector2],
+) -> bool {
+    let mut inside = false;
+    for index in 0..polygon.len() {
+        let a = &polygon[index];
+        let b = &polygon[(index + 1) % polygon.len()];
+        if point_on_courtyard_segment(point, a, b) {
+            return true;
+        }
+        if (a.y > point.y) != (b.y > point.y) {
+            let crossing_x = (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x;
+            if point.x < crossing_x {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+pub(crate) fn exact_courtyard_conflict(
+    a: &konnect_ipc::types::IpcFootprintCourtyard,
+    b: &konnect_ipc::types::IpcFootprintCourtyard,
+    clearance: f64,
+) -> Option<bool> {
+    let a_segments = courtyard_segments(a);
+    let b_segments = courtyard_segments(b);
+    if a_segments.is_empty() || b_segments.is_empty() {
+        return None;
+    }
+    if a_segments.iter().any(|(a1, a2)| {
+        b_segments
+            .iter()
+            .any(|(b1, b2)| segment_distance(a1, a2, b1, b2) <= clearance)
+    }) {
+        return Some(true);
+    }
+    let a_loops = stitched_courtyard_loops(&a_segments);
+    let b_loops = stitched_courtyard_loops(&b_segments);
+    if a_loops.iter().any(|a_loop| {
+        b_loops
+            .iter()
+            .any(|b_loop| point_in_courtyard_loop(&a_loop[0], b_loop))
+    }) || b_loops.iter().any(|b_loop| {
+        a_loops
+            .iter()
+            .any(|a_loop| point_in_courtyard_loop(&b_loop[0], a_loop))
+    }) {
+        return Some(true);
+    }
+    if a_loops.is_empty() || b_loops.is_empty() {
+        return None;
+    }
+    Some(false)
 }
 
 async fn handle_check_courtyard_overlaps(
@@ -2789,6 +3087,7 @@ async fn handle_check_courtyard_overlaps(
         .filter(|c| requested.is_empty() || requested.contains(&c.reference))
         .collect();
     let mut overlaps = Vec::new();
+    let mut inconclusive_pairs = Vec::new();
     for i in 0..selected.len() {
         for b in &selected[i + 1..] {
             let a = &selected[i];
@@ -2797,12 +3096,16 @@ async fn handle_check_courtyard_overlaps(
             }
             if let (Some(ab), Some(bb)) = (&a.bounds, &b.bounds) {
                 if bounds_overlap(ab, bb, clearance) {
-                    overlaps.push(json!({"ref1":a.reference,"ref2":b.reference,"layer":a.layer,"bounds1":ab,"bounds2":bb}))
+                    match exact_courtyard_conflict(a, b, clearance) {
+                        Some(true) => overlaps.push(json!({"ref1":a.reference,"ref2":b.reference,"layer":a.layer,"bounds1":ab,"bounds2":bb})),
+                        Some(false) => {}
+                        None => inconclusive_pairs.push(json!({"ref1":a.reference,"ref2":b.reference,"layer":a.layer,"reason":"courtyard has no usable polyline segments"})),
+                    }
                 }
             }
         }
     }
     Ok(CallToolResult::json(
-        &json!({"source":"active_kicad_ipc","method":"courtyard_aabb","clearance_mm":clearance,"checked":selected.len(),"overlap_count":overlaps.len(),"overlaps":overlaps}),
+        &json!({"source":"active_kicad_ipc","method":"courtyard_exact_polyline_with_aabb_broad_phase","clearance_mm":clearance,"checked":selected.len(),"overlap_count":overlaps.len(),"overlaps":overlaps,"inconclusive_count":inconclusive_pairs.len(),"inconclusive_pairs":inconclusive_pairs}),
     ))
 }

@@ -43,6 +43,14 @@ pub enum ToolErrorKind {
     /// The tool exists in the registry but its toolset isn't loaded.
     /// Client recovers in one hop: `load_toolset(toolset)` then retry.
     ToolsetNotLoaded { toolset: String, tool: String },
+    /// The tool exists, but the process exposure profile intentionally hides it.
+    CapabilityNotExposed { tool: String, profile: String },
+    /// A workflow plan failed typed validation before any change-set was created.
+    InvalidPlan { reason: String },
+    /// The process-local workflow state no longer contains this change set.
+    ChangeSetExpired { change_set_id: String },
+    /// The requested lifecycle transition is not valid from the current state.
+    InvalidWorkflowState { state: String },
     /// No tool with this name exists in any registered toolset.
     UnknownTool { tool: String },
     /// A required argument is missing or malformed.
@@ -61,6 +69,10 @@ impl ToolErrorKind {
     pub fn short_code(&self) -> &'static str {
         match self {
             Self::ToolsetNotLoaded { .. } => "toolset_not_loaded",
+            Self::CapabilityNotExposed { .. } => "capability_not_exposed",
+            Self::InvalidPlan { .. } => "invalid_plan",
+            Self::ChangeSetExpired { .. } => "change_set_expired",
+            Self::InvalidWorkflowState { .. } => "invalid_workflow_state",
             Self::UnknownTool { .. } => "unknown_tool",
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::FileNotFound { .. } => "file_not_found",
@@ -155,6 +167,15 @@ mod tests {
                 tool: "y".into(),
             },
             ToolErrorKind::UnknownTool { tool: "x".into() },
+            ToolErrorKind::CapabilityNotExposed {
+                tool: "x".into(),
+                profile: "workflow".into(),
+            },
+            ToolErrorKind::InvalidPlan { reason: "r".into() },
+            ToolErrorKind::ChangeSetExpired {
+                change_set_id: "x".into(),
+            },
+            ToolErrorKind::InvalidWorkflowState { state: "x".into() },
             ToolErrorKind::InvalidArgument {
                 field: "f".into(),
                 reason: "r".into(),

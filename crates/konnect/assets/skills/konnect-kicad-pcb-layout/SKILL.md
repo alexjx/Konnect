@@ -11,9 +11,9 @@ by functional block, then compact without violating those requirements.
 
 ## Konnect discovery and task routing
 
-- Start with `list_toolboxes` and `get_active_toolsets`; load only current toolsets needed for the task.
-- Use `project` and `config` for project state and constraints; `pcb_board` for outlines, layers, zones and board items; `pcb_components` for footprints; `pcb_routing` for tracks, vias, netclasses and differential pairs; `pcb_export` for DRC and fabrication outputs; and `library`, `integration`, `verification`, `design_review`, or `manufacturing` as applicable.
-- Never guess a tool or toolset name. Rediscover the registry after an unavailable-tool error.
+- Prefer Konnect's workflow interface when available: inspect with `inspect_design`, create a typed plan with `plan_pcb_edit`, review the returned change set, then use `apply_change_set` and `verify_change_set`. Never bypass a stale-plan, exact-document, allow-list, or verification failure.
+- In `expert` or `legacy` exposure mode, start with `list_toolboxes` and `get_active_toolsets`; load only current toolsets needed for the task. Use raw tools only for a capability the workflow interface does not yet support, while preserving the same preflight and verification gates.
+- Never guess a workflow, tool, or toolset name. Rediscover the available interface after an unavailable-capability error.
 - For routing, zones, final DRC, or fabrication output, also read and follow [`references/pcb-completion.md`](references/pcb-completion.md).
 
 ## Mandatory design-document gate
@@ -39,7 +39,7 @@ The gate must establish all of the following:
 
 ## Konnect and IPC preflight
 
-1. Use Konnect's discovery tools to load only the PCB toolsets needed.
+1. Use the workflow inspection interface, or in expert/legacy mode load only the PCB toolsets needed.
 2. Require the formal project PCB Editor to be visibly open. A project manager
    window or an invisible/background document is insufficient.
 3. Verify that the active IPC board document is the exact requested

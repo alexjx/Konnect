@@ -43,12 +43,12 @@ Konnect/
 │   │   └── src/
 │   │       ├── mcp/
 │   │       │   ├── protocol.rs      # MCP JSON-RPC 2.0 types
-│   │       │   ├── handler.rs       # Dispatch: initialize, tools/list (all tools static), tools/call
+│   │       │   ├── handler.rs       # Dispatch + legacy/expert/workflow exposure profiles
 │   │       │   └── server.rs        # Session state machine
 │   │       ├── router/
 │   │       │   ├── mod.rs           # ToolRouter: load/unload toolsets
 │   │       │   ├── registry.rs      # Static toolset metadata + tools_for() dispatcher
-│   │       │   └── meta_tools.rs    # 4 always-visible meta-tools
+│   │       │   └── meta_tools.rs    # 4 routing + 2 observability meta-tools
 │   │       └── tools/
 │   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir(), resolve_lib_symbol()
 │   │           ├── cli.rs            # kicad-cli v10 subprocess wrapper (verified against actual binary)
@@ -70,7 +70,8 @@ Konnect/
 │   │           ├── config.rs         # 7 tools (user/project config, design rules)
 │   │           ├── design_review.rs  # 6 tools (decoupling/connection/power/DFM audits)
 │   │           ├── templates.rs      # 4 tools (6 built-in reference circuit templates)
-│   │           └── manufacturing.rs  # 3 tools (export package, validate, cost estimate)
+│   │           ├── manufacturing.rs  # Manufacturing export and validation
+│   │           └── workflow.rs       # 7 guarded inspect/plan/apply/verify workflows
 │   │
 │   ├── konnect-sexp/                  # S-expression engine (no KiCAD dependency)
 │   │   └── src/
@@ -172,7 +173,7 @@ if !path.exists() {
 
 Adding a new kind: edit `mcp/error.rs`, add the variant, add the match arm in `short_code()`, use it from the handler. The `short_code_matches_serialized_kind_field` test will fail loudly if they drift.
 
-The dispatch-level errors (not-loaded/unknown/handler-panic) are fully structured. So are **all missing-argument errors** across all 171 tools — `tools/mod.rs::require_str` / `require_f64` emit `ToolErrorKind::InvalidArgument { field, reason }` automatically. Most in-handler errors still use `CallToolResult::error("free text")` or bubble `anyhow::Error`; migrating them is incremental. `project.rs::handle_get_project_info` demonstrates the structured `FileNotFound` pattern.
+The dispatch-level errors (not-loaded/not-exposed/unknown/handler-panic) are structured. Missing-argument errors use `ToolErrorKind::InvalidArgument { field, reason }`. Workflow runs also persist stable error codes such as `invalid_plan`, `stale_revision`, `partial_apply`, and `verification_failed`.
 
 ## Observability
 
@@ -191,11 +192,17 @@ The observer is constructed once by `McpHandler::new` and stashed on both the ha
 
 Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/observability.rs).
 
-## Tool Routing (Starter Kit + On-Demand Loading)
+## Exposure Profiles and Tool Routing
 
-The server does NOT expose all 171 tools in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The process selects one immutable profile at startup through `exposure_profile`:
 
-- **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 4 meta-tools, baseline `tools/list` is ~17 tools ≈ 2K tokens.
+- **`legacy` (default)**: historical starter-kit and on-demand toolset behavior.
+- **`expert`**: legacy behavior plus the 7 workflow tools.
+- **`workflow`**: only 7 workflows plus `get_recent_calls` and `server_stats`; raw dispatch and routing meta-tools return `capability_not_exposed`.
+
+In legacy/expert mode:
+
+- **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 6 meta-tools, baseline `tools/list` is 18 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
 - **`tools/list_changed` notification**: sent on every load/unload so MCP clients refresh their local tool cache.
 - **Error recovery**: if the LLM calls an unloaded tool, `handler.rs` returns an actionable error naming the toolset that owns it (so the LLM can load it and retry in one hop — no extra `list_toolboxes` round-trip).
@@ -248,9 +255,9 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **18 toolsets, 174 exposed tools** + 6 meta-tools (4 routing + 2 observability; see `tool-directory.md`)
+- **18 toolsets, 193 raw tools** + 7 workflow tools + 6 meta-tools (see `tool-directory.md`)
 - Baseline `tools/list`: 18 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): ~180 tools; 40 retained implementations are hidden by the registry filter
+- Workflow `tools/list`: 9 tools; full expert catalog with all raw sets loaded: 206 tools
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unsupported tools exposed** (9 inactive implementations remain hidden)
 - **3 CLI commands removed in KiCAD v10** (specctra DSN/SES, pcb sync — return clear errors)

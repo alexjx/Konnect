@@ -179,6 +179,7 @@ struct IpcSession {
     client_name: String,
     token: Mutex<String>,
     request_gate: Mutex<()>,
+    footprint_transform_gate: Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -215,6 +216,164 @@ fn update_footprint_pad_nets(
     Ok(changed)
 }
 
+fn footprint_reference(footprint: &kiapi::board::types::FootprintInstance) -> &str {
+    footprint
+        .reference_field
+        .as_ref()
+        .and_then(|field| field.text.as_ref())
+        .and_then(|text| text.text.as_ref())
+        .map(|text| text.text.as_str())
+        .unwrap_or("")
+}
+
+fn validate_board_coordinate(value: f64, field: &str, reference: &str) -> Result<()> {
+    const MAX_MM: f64 = i64::MAX as f64 / 1_000_000.0;
+    if !value.is_finite() || value.abs() > MAX_MM {
+        anyhow::bail!(
+            "Footprint '{}' has invalid {} coordinate: {}",
+            reference,
+            field,
+            value
+        );
+    }
+    Ok(())
+}
+
+fn prepare_footprint_transforms(
+    items: &[prost_types::Any],
+    transforms: &[IpcFootprintTransform],
+) -> Result<(
+    Vec<kiapi::board::types::FootprintInstance>,
+    Vec<IpcFootprintTransformState>,
+)> {
+    let mut requested = std::collections::HashSet::with_capacity(transforms.len());
+    for transform in transforms {
+        if transform.reference.is_empty() {
+            anyhow::bail!("Footprint transform reference must not be empty");
+        }
+        if !requested.insert(transform.reference.as_str()) {
+            anyhow::bail!(
+                "Footprint '{}' appears more than once in the transform batch",
+                transform.reference
+            );
+        }
+        if transform.position.is_none() && transform.rotation.is_none() {
+            anyhow::bail!(
+                "Footprint '{}' transform must set position, rotation, or both",
+                transform.reference
+            );
+        }
+        if let Some(position) = &transform.position {
+            validate_board_coordinate(position.x, "x", &transform.reference)?;
+            validate_board_coordinate(position.y, "y", &transform.reference)?;
+        }
+        if transform
+            .rotation
+            .is_some_and(|rotation| !rotation.is_finite() || !rotation.to_radians().is_finite())
+        {
+            anyhow::bail!("Footprint '{}' has invalid rotation", transform.reference);
+        }
+    }
+
+    let mut matching: std::collections::HashMap<
+        String,
+        Vec<kiapi::board::types::FootprintInstance>,
+    > = std::collections::HashMap::with_capacity(transforms.len());
+    for item in items {
+        let Ok(footprint) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+        else {
+            continue;
+        };
+        let reference = footprint_reference(&footprint);
+        if requested.contains(reference) {
+            matching
+                .entry(reference.to_string())
+                .or_default()
+                .push(footprint);
+        }
+    }
+
+    let mut updates = Vec::with_capacity(transforms.len());
+    let mut states = Vec::with_capacity(transforms.len());
+    for transform in transforms {
+        let matches = matching.remove(&transform.reference).unwrap_or_default();
+        let mut update = match matches.len() {
+            0 => anyhow::bail!("Footprint '{}' not found", transform.reference),
+            1 => matches.into_iter().next().expect("length checked"),
+            count => anyhow::bail!(
+                "Footprint reference '{}' is not unique on the board ({} matches)",
+                transform.reference,
+                count
+            ),
+        };
+        let old_position = update.position.ok_or_else(|| {
+            anyhow::anyhow!("Footprint '{}' has no position", transform.reference)
+        })?;
+        let old_angle = update
+            .orientation
+            .as_ref()
+            .map(|orientation| orientation.value_degrees)
+            .unwrap_or(0.0);
+        if !old_angle.is_finite() {
+            anyhow::bail!(
+                "Footprint '{}' has an invalid current rotation",
+                transform.reference
+            );
+        }
+        let target_angle = transform.rotation.unwrap_or(old_angle);
+        if transform.rotation.is_some() {
+            rotate_footprint_definition(
+                &mut update,
+                old_position.x_nm,
+                old_position.y_nm,
+                target_angle - old_angle,
+            )?;
+            update.orientation = Some(kiapi::common::types::Angle {
+                value_degrees: target_angle,
+            });
+        }
+        let target_position = transform.position.clone().unwrap_or(IpcVector2 {
+            x: nm_to_mm(old_position.x_nm),
+            y: nm_to_mm(old_position.y_nm),
+        });
+        if transform.position.is_some() {
+            let dx_nm = crate::builders::mm_to_nm(target_position.x)
+                .checked_sub(old_position.x_nm)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Footprint '{}' x translation exceeds KiCad coordinate range",
+                        transform.reference
+                    )
+                })?;
+            let dy_nm = crate::builders::mm_to_nm(target_position.y)
+                .checked_sub(old_position.y_nm)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Footprint '{}' y translation exceeds KiCad coordinate range",
+                        transform.reference
+                    )
+                })?;
+            translate_footprint_definition(&mut update, dx_nm, dy_nm)?;
+            update.position = Some(crate::builders::vec2(target_position.x, target_position.y));
+        }
+
+        let updated_position = update
+            .position
+            .as_ref()
+            .expect("validated footprint position");
+        states.push(IpcFootprintTransformState {
+            reference: transform.reference.clone(),
+            position: IpcVector2 {
+                x: nm_to_mm(updated_position.x_nm),
+                y: nm_to_mm(updated_position.y_nm),
+            },
+            rotation: target_angle,
+        });
+        updates.push(update);
+    }
+    Ok((updates, states))
+}
+
 impl KiCadIpcClient {
     /// Create a client connecting to the given IPC socket path.
     /// If empty, tries KICAD_API_SOCKET environment variable.
@@ -232,6 +391,7 @@ impl KiCadIpcClient {
                 client_name: format!("konnect-{}-{}", std::process::id(), sequence),
                 token: Mutex::new(std::env::var("KICAD_API_TOKEN").unwrap_or_default()),
                 request_gate: Mutex::new(()),
+                footprint_transform_gate: Mutex::new(()),
             }),
             document: None,
         }
@@ -1629,174 +1789,79 @@ impl KiCadIpcClient {
         result
     }
 
+    /// Apply multiple absolute footprint transforms as one KiCad undoable edit.
+    ///
+    /// Every request is prepared and validated before `BeginCommit`. Once the
+    /// commit starts, all updated footprint instances are sent in one
+    /// `UpdateItems` request and pushed together. A failed update or push is
+    /// followed by a best-effort drop of the pending commit.
+    pub fn transform_footprints_atomically(
+        &self,
+        transforms: &[IpcFootprintTransform],
+    ) -> Result<Vec<IpcFootprintTransformState>> {
+        if transforms.is_empty() {
+            return Ok(Vec::new());
+        }
+        // BeginCommit is session-scoped. Serialize the read/prepare/commit
+        // sequence across client clones so a later batch cannot be prepared
+        // from state that an earlier batch is about to replace.
+        let _transaction_guard =
+            self.session.footprint_transform_gate.lock().map_err(|_| {
+                anyhow::anyhow!("footprint transform transaction gate was poisoned")
+            })?;
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let (updates, states) = prepare_footprint_transforms(&items, transforms)?;
+
+        if updates.is_empty() {
+            return Ok(states);
+        }
+
+        let updates = updates
+            .iter()
+            .map(|update| crate::builders::pack_any(update, "kiapi.board.types.FootprintInstance"))
+            .collect();
+        let commit = self.begin_commit()?;
+        let result = (|| {
+            self.update_items(updates)?;
+            self.push_commit(
+                &commit,
+                &format!("Transform {} footprint(s)", transforms.len()),
+            )
+        })();
+        if result.is_err() {
+            let _ = self.drop_commit(&commit);
+        }
+        result.map(|()| states)
+    }
+
     /// Move a footprint to a new position.
     pub fn move_footprint(&self, reference: &str, x: f64, y: f64) -> Result<()> {
-        // Find the footprint, update position, send UpdateItems
-        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
-        for item in &items {
-            if let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) {
-                let ref_text = fp
-                    .reference_field
-                    .as_ref()
-                    .and_then(|f| f.text.as_ref())
-                    .and_then(|bt| bt.text.as_ref())
-                    .map(|t| t.text.as_str())
-                    .unwrap_or("");
-                if ref_text == reference {
-                    // Follow the KiCad IPC transaction model used by kicad-python:
-                    // mutate the complete item returned by GetItems, update it inside
-                    // an explicit commit, then push the commit for editor Undo.
-                    let mut update = fp.clone();
-                    // KiCad 10 returns footprint definition geometry in absolute
-                    // board coordinates through GetItems (despite the proto comment
-                    // describing Pad.position as footprint-relative).  Move the
-                    // complete returned footprint as one rigid body.
-                    let old_position = update.position.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("Footprint '{}' has no position", reference)
-                    })?;
-                    let dx_nm = crate::builders::mm_to_nm(x) - old_position.x_nm;
-                    let dy_nm = crate::builders::mm_to_nm(y) - old_position.y_nm;
-                    translate_footprint_definition(&mut update, dx_nm, dy_nm)?;
-                    update.position = Some(crate::builders::vec2(x, y));
-                    let any =
-                        crate::builders::pack_any(&update, "kiapi.board.types.FootprintInstance");
-                    let commit = self.begin_commit()?;
-                    match self.update_items(vec![any]) {
-                        Ok(()) => {
-                            if let Err(error) =
-                                self.push_commit(&commit, &format!("Move footprint {reference}"))
-                            {
-                                let _ = self.drop_commit(&commit);
-                                return Err(error);
-                            }
-                            return Ok(());
-                        }
-                        Err(error) => {
-                            let _ = self.drop_commit(&commit);
-                            return Err(error);
-                        }
-                    }
-                }
-            }
-        }
-        anyhow::bail!("Footprint '{}' not found", reference)
+        self.transform_footprints_atomically(&[IpcFootprintTransform {
+            reference: reference.to_string(),
+            position: Some(IpcVector2 { x, y }),
+            rotation: None,
+        }])?;
+        Ok(())
     }
 
     /// Rotate a footprint to a new angle.
     pub fn rotate_footprint(&self, reference: &str, angle: f64) -> Result<()> {
-        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
-        for item in &items {
-            if let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) {
-                let ref_text = fp
-                    .reference_field
-                    .as_ref()
-                    .and_then(|f| f.text.as_ref())
-                    .and_then(|bt| bt.text.as_ref())
-                    .map(|t| t.text.as_str())
-                    .unwrap_or("");
-                if ref_text == reference {
-                    let mut update = fp.clone();
-                    let center = update
-                        .position
-                        .as_ref()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Footprint '{}' has no position", reference)
-                        })?
-                        .clone();
-                    let old_angle = update
-                        .orientation
-                        .as_ref()
-                        .map(|a| a.value_degrees)
-                        .unwrap_or(0.0);
-                    rotate_footprint_definition(
-                        &mut update,
-                        center.x_nm,
-                        center.y_nm,
-                        angle - old_angle,
-                    )?;
-                    update.orientation = Some(kiapi::common::types::Angle {
-                        value_degrees: angle,
-                    });
-                    let any =
-                        crate::builders::pack_any(&update, "kiapi.board.types.FootprintInstance");
-                    let commit = self.begin_commit()?;
-                    match self.update_items(vec![any]) {
-                        Ok(()) => {
-                            if let Err(error) =
-                                self.push_commit(&commit, &format!("Rotate footprint {reference}"))
-                            {
-                                let _ = self.drop_commit(&commit);
-                                return Err(error);
-                            }
-                            return Ok(());
-                        }
-                        Err(error) => {
-                            let _ = self.drop_commit(&commit);
-                            return Err(error);
-                        }
-                    }
-                }
-            }
-        }
-        anyhow::bail!("Footprint '{}' not found", reference)
+        self.transform_footprints_atomically(&[IpcFootprintTransform {
+            reference: reference.to_string(),
+            position: None,
+            rotation: Some(angle),
+        }])?;
+        Ok(())
     }
 
     /// Move and rotate a footprint in one KiCad IPC transaction.
     pub fn transform_footprint(&self, reference: &str, x: f64, y: f64, angle: f64) -> Result<()> {
-        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
-        for item in &items {
-            let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
-            else {
-                continue;
-            };
-            let ref_text = fp
-                .reference_field
-                .as_ref()
-                .and_then(|field| field.text.as_ref())
-                .and_then(|text| text.text.as_ref())
-                .map(|text| text.text.as_str())
-                .unwrap_or("");
-            if ref_text != reference {
-                continue;
-            }
-
-            let mut update = fp.clone();
-            let old_position = update
-                .position
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Footprint '{}' has no position", reference))?
-                .clone();
-            let old_angle = update
-                .orientation
-                .as_ref()
-                .map(|orientation| orientation.value_degrees)
-                .unwrap_or(0.0);
-            rotate_footprint_definition(
-                &mut update,
-                old_position.x_nm,
-                old_position.y_nm,
-                angle - old_angle,
-            )?;
-            let dx_nm = crate::builders::mm_to_nm(x) - old_position.x_nm;
-            let dy_nm = crate::builders::mm_to_nm(y) - old_position.y_nm;
-            translate_footprint_definition(&mut update, dx_nm, dy_nm)?;
-            update.position = Some(crate::builders::vec2(x, y));
-            update.orientation = Some(kiapi::common::types::Angle {
-                value_degrees: angle,
-            });
-
-            let any = crate::builders::pack_any(&update, "kiapi.board.types.FootprintInstance");
-            let commit = self.begin_commit()?;
-            let result = (|| {
-                self.update_items(vec![any])?;
-                self.push_commit(&commit, &format!("Transform footprint {reference}"))
-            })();
-            if result.is_err() {
-                let _ = self.drop_commit(&commit);
-            }
-            return result;
-        }
-        anyhow::bail!("Footprint '{}' not found", reference)
+        self.transform_footprints_atomically(&[IpcFootprintTransform {
+            reference: reference.to_string(),
+            position: Some(IpcVector2 { x, y }),
+            rotation: Some(angle),
+        }])?;
+        Ok(())
     }
 
     /// Set every pad in a footprint to one angle relative to the footprint.
@@ -4368,6 +4433,105 @@ mod footprint_pad_net_tests {
 mod footprint_transform_tests {
     use super::*;
     use prost::Message;
+
+    fn footprint_item(reference: &str, x: f64, y: f64, angle: f64) -> prost_types::Any {
+        let mut footprint = crate::builders::build_mounting_hole(reference, x, y, 3.2);
+        footprint.orientation = Some(kiapi::common::types::Angle {
+            value_degrees: angle,
+        });
+        crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+    }
+
+    #[test]
+    fn prepares_multiple_absolute_transforms_in_request_order() {
+        let items = vec![
+            footprint_item("U1", 10.0, 20.0, 0.0),
+            footprint_item("C1", 30.0, 40.0, 45.0),
+        ];
+        let transforms = vec![
+            IpcFootprintTransform {
+                reference: "C1".to_string(),
+                position: None,
+                rotation: Some(90.0),
+            },
+            IpcFootprintTransform {
+                reference: "U1".to_string(),
+                position: Some(IpcVector2 { x: 11.5, y: 22.25 }),
+                rotation: Some(180.0),
+            },
+        ];
+
+        let (updates, states) = prepare_footprint_transforms(&items, &transforms).unwrap();
+
+        assert_eq!(updates.len(), 2);
+        assert_eq!(footprint_reference(&updates[0]), "C1");
+        assert_eq!(footprint_reference(&updates[1]), "U1");
+        assert_eq!(states[0].reference, "C1");
+        assert_eq!(states[0].position, IpcVector2 { x: 30.0, y: 40.0 });
+        assert_eq!(states[0].rotation, 90.0);
+        assert_eq!(states[1].position, IpcVector2 { x: 11.5, y: 22.25 });
+        assert_eq!(states[1].rotation, 180.0);
+    }
+
+    #[test]
+    fn rejects_duplicate_request_references_before_preparing_updates() {
+        let items = vec![footprint_item("U1", 10.0, 20.0, 0.0)];
+        let transforms = vec![
+            IpcFootprintTransform {
+                reference: "U1".to_string(),
+                position: Some(IpcVector2 { x: 11.0, y: 20.0 }),
+                rotation: None,
+            },
+            IpcFootprintTransform {
+                reference: "U1".to_string(),
+                position: None,
+                rotation: Some(90.0),
+            },
+        ];
+
+        let error = prepare_footprint_transforms(&items, &transforms).unwrap_err();
+        assert!(error.to_string().contains("more than once"));
+    }
+
+    #[test]
+    fn rejects_missing_and_non_unique_board_references() {
+        let duplicate_items = vec![
+            footprint_item("U1", 10.0, 20.0, 0.0),
+            footprint_item("U1", 30.0, 40.0, 0.0),
+        ];
+        let transform = [IpcFootprintTransform {
+            reference: "U1".to_string(),
+            position: None,
+            rotation: Some(90.0),
+        }];
+        let duplicate_error =
+            prepare_footprint_transforms(&duplicate_items, &transform).unwrap_err();
+        assert!(duplicate_error.to_string().contains("not unique"));
+
+        let missing_error = prepare_footprint_transforms(&[], &transform).unwrap_err();
+        assert!(missing_error.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn rejects_invalid_or_empty_transforms() {
+        let items = vec![footprint_item("U1", 10.0, 20.0, 0.0)];
+        let invalid_coordinate = [IpcFootprintTransform {
+            reference: "U1".to_string(),
+            position: Some(IpcVector2 {
+                x: f64::NAN,
+                y: 20.0,
+            }),
+            rotation: None,
+        }];
+        assert!(prepare_footprint_transforms(&items, &invalid_coordinate).is_err());
+
+        let no_change = [IpcFootprintTransform {
+            reference: "U1".to_string(),
+            position: None,
+            rotation: None,
+        }];
+        assert!(prepare_footprint_transforms(&items, &no_change).is_err());
+    }
 
     #[test]
     fn absolute_definition_pad_tracks_translation() {

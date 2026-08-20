@@ -6,7 +6,7 @@
 //! previously only ran against a live KiCAD session.
 
 use konnect_ipc::gen::kiapi;
-use konnect_ipc::KiCadIpcClient;
+use konnect_ipc::{IpcFootprintTransform, IpcVector2, KiCadIpcClient};
 use nng::options::Options;
 use prost::Message;
 use std::time::Duration;
@@ -137,6 +137,140 @@ fn board_binding_matches_the_full_canonical_path() {
     let other = dir.path().join("other.kicad_pcb");
     std::fs::write(&other, "(kicad_pcb)").unwrap();
     assert!(client.bind_board(&other).is_err());
+}
+
+#[test]
+fn footprint_transform_batch_uses_one_commit_and_one_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("board.kicad_pcb");
+    std::fs::write(&board, "(kicad_pcb)").unwrap();
+    let project_path = dir.path().to_string_lossy().to_string();
+    let document = kiapi::common::types::DocumentSpecifier {
+        r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+        identifier: Some(
+            kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                "board.kicad_pcb".to_string(),
+            ),
+        ),
+        project: Some(kiapi::common::types::ProjectSpecifier {
+            name: "board".to_string(),
+            path: project_path,
+        }),
+    };
+    let footprints = vec![
+        konnect_ipc::builders::pack_any(
+            &konnect_ipc::builders::build_mounting_hole("U1", 10.0, 20.0, 3.2),
+            "kiapi.board.types.FootprintInstance",
+        ),
+        konnect_ipc::builders::pack_any(
+            &konnect_ipc::builders::build_mounting_hole("C1", 30.0, 40.0, 3.2),
+            "kiapi.board.types.FootprintInstance",
+        ),
+    ];
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let server_observed = observed.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request message");
+        let command = message.type_url.rsplit('/').next().unwrap().to_string();
+        match command.as_str() {
+            "kiapi.common.commands.GetOpenDocuments" => {
+                let body = kiapi::common::commands::GetOpenDocumentsResponse {
+                    documents: vec![document.clone()],
+                };
+                Some(ok_response_with(konnect_ipc::builders::pack_any(
+                    &body,
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                )))
+            }
+            "kiapi.common.commands.GetItems" => {
+                let body = kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items: footprints.clone(),
+                };
+                Some(ok_response_with(konnect_ipc::builders::pack_any(
+                    &body,
+                    "kiapi.common.commands.GetItemsResponse",
+                )))
+            }
+            "kiapi.common.commands.BeginCommit" => {
+                server_observed.lock().unwrap().push(command);
+                let body = kiapi::common::commands::BeginCommitResponse {
+                    id: Some(kiapi::common::types::Kiid {
+                        value: "commit-1".to_string(),
+                    }),
+                };
+                Some(ok_response_with(konnect_ipc::builders::pack_any(
+                    &body,
+                    "kiapi.common.commands.BeginCommitResponse",
+                )))
+            }
+            "kiapi.common.commands.UpdateItems" => {
+                let update = kiapi::common::commands::UpdateItems::decode(message.value.as_slice())
+                    .expect("decode UpdateItems");
+                server_observed
+                    .lock()
+                    .unwrap()
+                    .push(format!("{command}:{}", update.items.len()));
+                let body = kiapi::common::commands::UpdateItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    updated_items: update
+                        .items
+                        .into_iter()
+                        .map(|item| kiapi::common::commands::ItemUpdateResult {
+                            status: Some(kiapi::common::commands::ItemStatus {
+                                code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                error_message: String::new(),
+                            }),
+                            item: Some(item),
+                        })
+                        .collect(),
+                };
+                Some(ok_response_with(konnect_ipc::builders::pack_any(
+                    &body,
+                    "kiapi.common.commands.UpdateItemsResponse",
+                )))
+            }
+            "kiapi.common.commands.EndCommit" => {
+                let end = kiapi::common::commands::EndCommit::decode(message.value.as_slice())
+                    .expect("decode EndCommit");
+                assert_eq!(
+                    end.action,
+                    kiapi::common::commands::CommitAction::CmaCommit as i32
+                );
+                server_observed.lock().unwrap().push(command);
+                Some(ok_response())
+            }
+            other => panic!("unexpected command {other}"),
+        }
+    });
+
+    let client = KiCadIpcClient::new(&mock.url).bind_board(&board).unwrap();
+    let states = client
+        .transform_footprints_atomically(&[
+            IpcFootprintTransform {
+                reference: "U1".to_string(),
+                position: Some(IpcVector2 { x: 12.0, y: 22.0 }),
+                rotation: None,
+            },
+            IpcFootprintTransform {
+                reference: "C1".to_string(),
+                position: None,
+                rotation: Some(90.0),
+            },
+        ])
+        .unwrap();
+
+    assert_eq!(states.len(), 2);
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![
+            "kiapi.common.commands.BeginCommit",
+            "kiapi.common.commands.UpdateItems:2",
+            "kiapi.common.commands.EndCommit",
+        ]
+    );
 }
 
 #[test]
