@@ -2,262 +2,254 @@
 
 <div align="center">
 
-<img src="resources/images/KiCAD-MCP-Server-rust.svg" alt="KiCAD-MCP-Server Logo" height="240" />
+<img src="resources/images/KiCAD-MCP-Server-rust.svg" alt="Konnect logo" height="220" />
 
+# Konnect
 
-# Konnect *BETA Release
+**A Codex-tailored MCP server for AI-assisted KiCad 10 workflows.**
 
-**AI-assisted PCB design for KiCAD 10.** Konnect is a native KiCAD plugin — a single
-Rust binary — that lets Claude and other AI assistants design schematics and PCBs
-through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
+</div>
 
-**193 verified raw tools across 18 on-demand toolsets, plus 7 workflow tools.** Schematic capture, PCB layout and
-route planning, ERC/DRC, design-review audits, reference circuits, and a full
-manufacturing export pipeline. The default `legacy` profile begins with 18 tools and
-loads the relevant toolset only when needed. The opt-in `workflow` profile exposes
-only 7 guarded workflows plus 2 observability tools. Two bundled Codex skills add
-datasheet-driven schematic, placement, routing, review, and fabrication workflows.
+> **Status: beta.** Review generated changes in KiCad and keep verified project
+> backups. The guarded workflow reduces risk, but it does not replace electrical,
+> mechanical, or manufacturing review.
 
-> **Status: beta.** The core toolchain is tested and working, but this is a young
-> release and it wants real-world mileage and review. Issues and PRs are welcome —
-> see [CONTRIBUTING.md](CONTRIBUTING.md).
+Konnect connects Codex and other Model Context Protocol clients to KiCad for
+schematic work, live PCB editing, verification, and production-file generation.
+It is implemented in Rust and uses KiCad 10's IPC API for live board operations.
 
-## Why Konnect exists
+## About this fork
 
-Konnect is the successor to [KiCAD-MCP-Server](https://github.com/mixelpixx/KiCAD-MCP-Server),
-a Python/TypeScript project that proved AI-driven PCB design works — and, in the
-process, showed exactly where that architecture runs out of road. Konnect was built
-to fix those specific problems:
+This is a personal fork of [mixelpixx/Konnect](https://github.com/mixelpixx/Konnect),
+which grew from the earlier
+[KiCAD-MCP-Server](https://github.com/mixelpixx/KiCAD-MCP-Server) project. The
+upstream architecture and contributors made this work possible.
 
-**The call path was too long.** In the original server, a single tool call travels
-through TypeScript, schema validation, a spawned Python subprocess, JSON over
-stdin/stdout, a command router, and finally SWIG-generated C++ proxy objects before
-anything touches your board. That's four language and serialization boundaries, each
-with its own failure modes — subprocess lifecycle management, stdout parsing that
-filters out warnings KiCAD leaks into the stream, chunked-JSON reassembly. In
-Konnect, a tool call is a function call. One process, one language, no plumbing.
+This fork has been tailored with Codex to suit my own hardware-design needs. Its
+main priorities are:
 
-**The dependency surface was enormous.** Running the original means carrying Node.js
-and its npm tree, Python and its pip packages, wxPython, kicad-skip, and KiCAD's
-SWIG bindings — two package ecosystems plus a binding layer, every one of them a
-moving target that can break an install. Konnect is a single static binary, about
-5 MB. There is nothing to install alongside it and nothing to version-match.
+- guarded, inspect-plan-apply-verify editing workflows;
+- concise Codex skills that encode only necessary operating guidance;
+- evidence-backed schematic, package, and PCB layout review;
+- reliable live KiCad IPC operations with explicit board identity; and
+- practical workflows for two-layer boards and power-electronics designs.
 
-**SWIG is a dead end.** The original's PCB backend depends on KiCAD's SWIG Python
-bindings, which KiCAD is deprecating in favor of its IPC API. SWIG also carried
-real operational scars: a zone-fill call that can segfault the backend, proxy-object
-comparison bugs, and a fallback path that can silently swap backends mid-session.
-Konnect talks to KiCAD 10 through the official IPC API (protobuf over NNG) — the
-interface KiCAD is investing in — with real-time board edits that integrate with
-KiCAD's own undo/redo.
+Fork-specific behavior and priorities may diverge from upstream. Upstream credit
+does not imply endorsement of these changes.
 
-**Schematic edits should not corrupt files.** Konnect edits `.kicad_sch` files
-through its own S-expression engine with atomic writes (write, fsync, rename), UUID
-preservation, and round-trip tests — no third-party schematic library with known
-gaps, no text-manipulation workarounds.
+## Capabilities
 
-**Context economy is a feature.** Exposing ~200 tools to an LLM costs roughly 23K
-tokens of context on every listing. Konnect's router loads a starter kit (~2K
-tokens) and lets the model pull in toolsets on demand — plus built-in observability
-(`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
-own tool failures.
+- Inspect KiCad projects, schematics, boards, components, nets, and configuration.
+- Create and edit schematics, symbols, wiring, labels, fields, and hierarchy.
+- Place, move, rotate, route, and inspect PCB objects through live KiCad IPC.
+- Work with board outlines, zones, vias, net classes, references, and fabrication
+  constraints.
+- Run ERC, DRC, connectivity checks, design reviews, and targeted verification.
+- Export Gerbers, drill files, position files, BOM data, PDFs, and supported 3D or
+  interchange formats.
+- Record tool-call diagnostics through recent-call reports, server statistics,
+  and JSONL logs.
 
-### Workflow-first editing
+The current MCP catalog is documented in [tool-directory.md](tool-directory.md).
 
-Set `exposure_profile` to `workflow` to hide raw MCP capabilities and expose a small,
-typed surface: inspect, plan, inspect a change set, apply, verify, and discard. Plans
-carry a file/live-document fingerprint and target allow-list; stale plans are rejected
-before writing. PCB footprint moves and absolute rotations use one KiCad undo commit,
-projected exact courtyard checks, and save only after verification.
+## Workflow profiles
 
-Profiles are process-wide: `legacy` preserves the historical surface, `expert` adds
-workflows while retaining on-demand raw toolsets, and `workflow` prevents raw dispatch
-(including `load_toolset`). Configure it in `settings.json`:
+Konnect exposes one process-wide capability profile:
 
-```json
-{ "exposure_profile": "workflow" }
-```
+| Profile | Intended use | Surface |
+| --- | --- | --- |
+| `workflow` | Guarded changes | Typed inspect, plan, apply, verify, recovery, and observability tools only |
+| `expert` | Migration or unsupported operations | Guarded workflows plus on-demand raw toolsets |
+| `legacy` | Compatibility | Historical starter tools and on-demand raw toolsets; guarded workflows are hidden |
 
-The MVP intentionally limits schematic writes to component properties and grid-snapped
-component moves, and PCB writes to footprint position/rotation. Change sets live in the
-server process for 30 minutes; a restart expires them. Use `workflow` when guard enforcement
-is required—`expert` deliberately allows raw tools to bypass workflow policy.
+`legacy` remains the default for compatibility. This fork recommends `workflow`
+when the requested edit is supported. A workflow change set binds the exact file
+or live board, records an allow-list and fingerprint, rejects stale plans, and
+requires verification after applying.
 
-The result is smaller, faster to install, aligned with where KiCAD is going, and
-built for production use rather than experimentation. The original project remains
-open, maintained, and useful — see [the comparison below](#relationship-to-kicad-mcp-server).
+The guarded workflow is intentionally narrower than the raw tool surface. It
+currently covers selected existing-component schematic edits and moves, plus
+absolute PCB footprint transforms. Use `expert` only when the requested operation
+is unsupported and the broader capability is justified. Change sets are stored in
+the server process and normally expire after 30 minutes; restarting the server
+invalidates them.
 
-## What it does
-
-Instead of describing changes and applying them by hand, the AI works your project
-directly:
-
-- **Place and wire schematic components** — add resistors, ICs, connectors; wire them
-  together by pin name
-- **Lay out the PCB** — place, move, rotate, and route footprints in real time via
-  KiCAD's IPC API, with full undo/redo integration
-- **Run design checks** — ERC, DRC, connectivity validation, decoupling audits,
-  power-rail review, BOM health checks
-- **Export production files** — Gerbers, drill, BOM, pick-and-place, 3D models, PDF
-- **Search JLCPCB parts** — find in-stock components in a local 2.5M-part catalog and
-  suggest alternatives
-- **Start from reference circuits** — USB-C, LDO, buck converter, STM32, I2C, LED
-  templates with verified component values
-- **Watch it happen** — a live schematic viewer auto-refreshes as the AI edits
-
-### PCB reference silkscreen tools
-
-Load the `pcb_components` toolset to inspect and edit footprint references through
-KiCad IPC. `batch_set_reference_style` enforces a minimum 1.0 x 1.0 mm font with
-0.15 mm stroke. `check_reference_collisions` reports same-side pad, via, board-bound,
-and reference overlaps. `auto_place_references` searches compact positions around
-each footprint's pad bounds. It defaults to `dry_run: true` and
-`only_colliding: true`, so legal hand-placed references remain unchanged. If
-enabled, only ordinary R/C references may be hidden when no legal candidate exists.
-
-Run auto-placement in small reference or prefix groups and review the dry-run
-report before setting `dry_run: false`. These tools never move footprints, pads,
-vias, tracks, zones, or functional pad labels.
-
-The full tool catalog is documented in [tool-directory.md](tool-directory.md).
-
-## How it works
-
-| Layer | Mechanism |
-|-------|-----------|
-| Schematic editing | Direct `.kicad_sch` S-expression editing with atomic writes (no KiCAD required) |
-| PCB editing | KiCAD 10 IPC API (NNG + protobuf) — real-time, undo-aware, requires KiCAD running |
-| Exports & checks | `kicad-cli` subprocess (Gerber, PDF, ERC, DRC, …) |
-| Transport | MCP JSON-RPC over stdio (default), or Streamable HTTP (`transport = "http"` / `"both"`) |
-
-## Installation
-
-### From the KiCAD Plugin Manager (recommended)
-
-1. Download `konnect-pcm-v<version>.zip` from [Releases](https://github.com/mixelpixx/Konnect/releases)
-   (the `konnect-pcm-*` asset is the KiCAD plugin package; the other archives are
-   standalone server binaries)
-2. Open KiCAD 10 → **Plugin and Content Manager**
-3. Click **Install from File** and select the zip
-4. Restart KiCAD
-
-Verify: open the **PCB Editor** → **Tools → External Plugins** → you should see
-**Konnect**.
-
-### Build from source
-
-```bash
-# protoc is required (protobuf code generation)
-# Windows: choco install protoc / macOS: brew install protobuf / Linux: apt install protobuf-compiler
-cargo build --release -p konnect
-```
-
-## Setup with Codex
-
-Run the server once from a terminal or install the skills explicitly:
-
-```powershell
-konnect.exe init
-```
-
-Konnect installs `konnect-kicad-schematic` and `konnect-kicad-pcb-layout` under
-`$CODEX_HOME/skills`. If `CODEX_HOME` is unset, it uses `~/.codex/skills`.
-Register the same executable as the `konnect` MCP server in Codex, then restart
-Codex so it discovers the skills.
-
-## Setup with Claude Desktop
-
-After a PCM install, the server binary lives in your KiCAD documents folder:
-
-```
-C:\Users\<YOU>\Documents\KiCad\10.0\3rdparty\plugins\com_github_mixelpixx_konnect\bin\konnect.exe
-```
-
-Edit `%APPDATA%\Claude\claude_desktop_config.json`:
+Minimal `settings.json`:
 
 ```json
 {
-  "mcpServers": {
-    "konnect": {
-      "command": "C:\\Users\\<YOU>\\Documents\\KiCad\\10.0\\3rdparty\\plugins\\com_github_mixelpixx_konnect\\bin\\konnect.exe"
-    }
-  }
+  "exposure_profile": "workflow",
+  "transport": "stdio",
+  "log_level": "info"
 }
 ```
 
-Restart Claude Desktop and the Konnect tools appear. For Claude Code, drop the same
-snippet into a `.mcp.json` in your project root (see [examples/](examples/)).
+Configuration can also specify `kicad_cli`, `kicad_binary`, `project_dir`,
+`ipc_address`, `http_address`, and `jlcpcb_db_path`. Konnect accepts JSON or TOML.
+Use `--config <path>` to select an explicit file; otherwise it checks
+`konnect.toml`, `settings.json`, and the platform configuration directory.
 
-## Schematic viewer
+## Bundled Codex skills
 
-A standalone viewer that auto-refreshes as the schematic file changes:
+Running `konnect init` installs these skills under `$CODEX_HOME/skills`, falling
+back to `~/.codex/skills`:
 
-```bash
-schematic-viewer.exe path\to\your\root_schematic.kicad_sch
-```
+- `konnect-kicad-schematic` — guarded schematic editing and verification;
+- `konnect-kicad-pcb-layout` — live PCB modification and verification; and
+- `kicad-layout-review` — read-only general, buck-converter, datasheet, and
+  two-layer ground-return review.
 
-Point it at the root sheet of a hierarchical design and every sub-sheet is rendered
-too, with a depth-indented sheet selector in the toolbar. Edits saved from KiCAD (or
-made by the AI through the schematic tools) re-render only the sheets that changed
-and refresh the view live — rendering runs against temp-folder snapshots, so the
-viewer never blocks KiCAD from saving. Pan with click-drag, zoom with the wheel,
-`0` to fit, `R` to refresh, drag-and-drop to open a different file. Also launchable
-by the AI via the `open_schematic_viewer` tool.
+The skills separate review from mutation. A layout audit does not authorize board
+changes, and a successful tool call alone is not treated as verification.
 
-Needs the WebView2 runtime (pre-installed on Windows 10/11) and a KiCAD install for
-`kicad-cli` (auto-discovered, or pass `--kicad-cli <path>`). Built separately from
-the main workspace — see [DEV.md](DEV.md) for build steps.
+The repository also contains `kicad-package-audit`. It is maintained separately
+and is not installed by `konnect init`.
+
+## How it works
+
+| Area | Implementation |
+| --- | --- |
+| Schematic editing | Native `.kicad_sch` S-expression model with atomic file replacement |
+| PCB editing | KiCad 10 IPC API over NNG/protobuf; live, board-bound, and undo-aware |
+| Checks and exports | `kicad-cli` subprocesses for ERC, DRC, PDF, fabrication, and interchange outputs |
+| MCP transport | JSON-RPC over stdio by default; Streamable HTTP or both are configurable |
+| Tool exposure | Small starter surface, guarded workflow profile, or on-demand raw toolsets |
+
+Schematic file operations do not require KiCad to be open. Live PCB operations
+require the exact target board to be open in KiCad with IPC available.
 
 ## Requirements
 
-- KiCAD 10 (Windows today; Linux and macOS builds are on the [roadmap](ROADMAP.md) —
-  the code already compiles and passes tests on all three platforms in CI)
-- `kicad-cli` (ships with KiCAD — used for exports, ERC, DRC)
-- For PCB tools: KiCAD running with the target board open (IPC API)
+Runtime requirements:
 
-## License: free for the little guys
+- KiCad 10;
+- `kicad-cli` for CLI-backed checks and exports; and
+- KiCad IPC enabled with the target board open for live PCB operations.
 
-Konnect is licensed under the **[GNU AGPL-3.0](LICENSE)**.
+Source builds additionally require a Rust toolchain and `protoc` for protobuf
+code generation.
 
-If you're a hobbyist, student, freelancer, or open-source project: **use it freely,
-no strings attached.** Design boards, ship them, sell them.
+Workspace CI covers Windows, Linux, and macOS, and the release workflow defines
+standalone builds for those platforms. KiCad IPC, packaging, and viewer behavior
+can still vary by platform, so verify the integration you intend to deploy.
 
-If you're a business: the AGPL requires that anything you build on or around Konnect —
-including software provided over a network — be open-sourced under the same license.
-If that doesn't work for you, **commercial licenses are available**: see
-[COMMERCIAL.md](COMMERCIAL.md).
+## Build and install
 
-## Relationship to KiCAD-MCP-Server
+Clone this fork and build the release binary:
 
-The original [Python/TypeScript project](https://github.com/mixelpixx/KiCAD-MCP-Server)
-remains fully open (MIT) and maintained. Konnect is where new development happens —
-the architecture it proved, rebuilt for production:
+```bash
+git clone https://github.com/alexjx/Konnect.git
+cd Konnect
+cargo build --release -p konnect
+```
 
-| | KiCAD-MCP-Server | Konnect |
-|---|---|---|
-| Runtime | Node.js + Python + SWIG bindings | Single static binary (~5 MB) |
-| Tool call path | TS → subprocess → Python → SWIG C++ | Direct function call |
-| PCB backend | SWIG (deprecated by KiCAD) + experimental IPC | KiCAD 10 IPC API |
-| Schematic backend | kicad-skip + custom loaders | Native S-expression engine, atomic writes |
-| Context cost | Router pattern | Load/unload toolsets + observability |
-| Codex skills | — | 2 workflow skills bundled |
-| License | MIT | AGPL-3.0 + commercial |
+If your GitHub SSH key is configured, `git@github.com:alexjx/Konnect.git` is an
+equivalent clone URL.
 
-## Troubleshooting
+The executable is written to `target/release/konnect` or
+`target/release/konnect.exe` on Windows. Run the test suite before deploying a
+modified build:
 
-**Plugin doesn't appear in KiCAD** — install via the Plugin and Content Manager (not
-manual copy), then restart KiCAD.
+```bash
+cargo test --workspace
+```
 
-**PCB tools return "IPC connect failed"** — open KiCAD with your board file first;
-PCB tools talk to the running PCB editor.
+Install or refresh the bundled Codex skills:
 
-**"kicad-cli not found"** — common install paths are auto-detected; set the path
-explicitly in the plugin settings dialog or your `konnect-settings.json` if yours
-is elsewhere.
+```powershell
+# Windows
+target\release\konnect.exe init
+target\release\konnect.exe status
+```
 
-## Support
+```bash
+# Linux or macOS
+./target/release/konnect init
+./target/release/konnect status
+```
 
-- Issues & feature requests: [GitHub Issues](https://github.com/mixelpixx/Konnect/issues)
-- Roadmap: [ROADMAP.md](ROADMAP.md)
-- Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
-- New to KiCad development: [Beginner Contributor Guide](docs/BEGINNER_CONTRIBUTOR_GUIDE.md)
+### Register with Codex
+
+Add the server to the Codex configuration. Using the name `kicad` matches the
+bundled skill dependency metadata:
+
+```toml
+[mcp_servers.kicad]
+enabled = true
+command = 'D:\path\to\Konnect\target\release\konnect.exe'
+args = ['--config', 'D:\path\to\konnect-settings.json']
+cwd = 'D:\path\to\Konnect'
+startup_timeout_sec = 120
+```
+
+Restart Codex after changing MCP configuration or installing skills. Other MCP
+clients can launch the same executable over stdio with an equivalent command and
+argument configuration.
+
+### KiCad plugin package
+
+The `konnect` crate also builds a plugin library. KiCad Plugin and Content Manager
+packages are produced by the scripts under [packaging](packaging). Use a package
+published by this fork when available, or build one from the checked-out revision;
+do not assume an upstream package contains this fork's changes. The current PCM
+metadata still uses the inherited `com.github.mixelpixx.konnect` identifier, so
+review that metadata before publishing a fork-specific package.
+
+## Schematic viewer
+
+The optional viewer is built separately from the main workspace:
+
+```bash
+cd crates/schematic-viewer
+cargo build --release
+```
+
+Then run the built executable:
+
+```powershell
+# Windows, from crates/schematic-viewer
+target\release\schematic-viewer.exe path\to\root_schematic.kicad_sch
+```
+
+```bash
+# Linux or macOS, from crates/schematic-viewer
+./target/release/schematic-viewer path/to/root_schematic.kicad_sch
+```
+
+It watches hierarchical schematic files, renders from temporary snapshots, and
+refreshes changed sheets without taking ownership of the source files. See
+[DEV.md](DEV.md) for build details.
+
+## Safety and limitations
+
+- Confirm the exact project, schematic, or live board before every write.
+- Treat project requirements and exact manufacturer documentation as design
+  authority; do not invent electrical, mechanical, or fabrication limits.
+- DRC and courtyard checks cover only their stated rules. They do not prove
+  signal integrity, thermal performance, manufacturability, or release readiness.
+- Inspect the observed state after errors or ambiguous outcomes instead of
+  retrying a mutation blindly.
+- Fabrication-file generation does not authorize ordering or transmitting a
+  board package.
+
+## Documentation
+
+- [Tool directory](tool-directory.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Developer guide](DEV.md)
+- [Beginner contributor guide](docs/BEGINNER_CONTRIBUTOR_GUIDE.md)
+- [Roadmap](ROADMAP.md)
+- [Contributing](CONTRIBUTING.md)
+
+## License and upstream
+
+This repository is licensed under the [GNU AGPL-3.0-only](LICENSE). Review the
+license itself for the applicable terms; this README is not legal advice.
+
+Upstream projects:
+
+- [mixelpixx/Konnect](https://github.com/mixelpixx/Konnect)
+- [mixelpixx/KiCAD-MCP-Server](https://github.com/mixelpixx/KiCAD-MCP-Server)
+
+Issues for this fork belong in
+[alexjx/Konnect](https://github.com/alexjx/Konnect/issues).
