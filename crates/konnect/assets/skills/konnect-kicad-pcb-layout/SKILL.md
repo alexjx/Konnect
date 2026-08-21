@@ -57,6 +57,8 @@ directly or use an unbound/background document.
   mechanical, and fabricator requirements that materially affect the requested
   change. Follow [the design-authority gate](references/design-document-contract.md)
   when required evidence is missing or conflicting.
+- For placement or floorplanning, apply the maintained
+  [layout rules](references/layout-rules.md) after project-specific requirements.
 - Guarded courtyard validation proves only that the transforms introduce no new
   courtyard overlaps. It does not prove assembly margin, board-edge clearance,
   keepouts, enclosure/access, copper clearance, thermal behavior, or electrical

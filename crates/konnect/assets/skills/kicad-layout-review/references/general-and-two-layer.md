@@ -36,6 +36,20 @@
 - Prefer one layer as a substantially continuous ground reference. Treat
   traces, clearances, antipads, keepouts, cutouts, and unfilled regions that
   divide it as slots, even when all surrounding copper has the same net name.
+- Determine usable continuity from the final filled copper, not from zone
+  definitions, net names, or total copper area. Identify the dominant connected
+  GND region on each layer and the substantial lobes, islands, or peninsulas it
+  contains. Where tooling permits, record connected-region count and area; an
+  annotated filled-copper view is sufficient when exact area is unavailable.
+- Explicitly inspect every bridge that joins two substantial GND regions. Note
+  its layer, approximate minimum width and length, the alternate-layer copper
+  available in the same area, and nearby GND vias or through-hole connections.
+  Do not describe fragmented fill on the other layer as a parallel plane.
+- Partition the board conceptually along each material split or narrow bridge.
+  Identify important signal sources and receivers, power sources and loads,
+  connectors, and decoupling returns on opposite sides. Trace any route that
+  crosses the partition and show where its return current can cross. Protocol
+  rate alone is not sufficient: use driver edge rate and return geometry.
 - Trace each important return from receiver or load back to its source. A fast
   signal return must remain adjacent to the outbound route and must not be
   forced around a split or slot. At a signal layer transition, require a nearby
@@ -45,6 +59,13 @@
   inductance, or return-continuity criterion. A narrow-looking shape is not a
   defect when the relevant current has a demonstrated low-impedance parallel
   path or remains within documented limits.
+- Always disclose a dominant-plane neck that joins substantial board regions
+  when the other layer lacks a substantially continuous reference, even when a
+  failure threshold is not proven. Report it as a return-topology observation;
+  classify it as a confirmed `MEDIUM` weakness when important routes depend on
+  the neck without a short parallel return, or as `NEEDS EVIDENCE` when edge
+  rate, current, geometry, or the actual dependent routes remain unknown. Do
+  not silently pass it and do not inflate it to a defect solely from appearance.
 - Measure the minimum filled width and neck length. Include thermal spokes,
   pads, and every series via transition in the bottleneck assessment. Use known
   copper thickness, plating, continuous/RMS and transient current, temperature
@@ -62,3 +83,14 @@ view with source, load or receiver, outbound path, actual return path, measured
 neck, series vias, and any parallel path. Support power-path findings with a
 resistance/voltage-drop and heating check; support fast-return findings with
 return discontinuity and loop-area evidence.
+
+Every two-layer report must therefore answer, in user-visible form:
+
+1. Which layer is the primary usable ground reference?
+2. Is it substantially continuous, or divided into major regions by slots or
+   narrow bridges?
+3. Does the other layer provide a genuinely continuous parallel return, or
+   only fragmented pours?
+4. Which important signals or power/decoupling returns cross or depend on each
+   division?
+5. What is the severity, confidence, smallest remedy, and missing evidence?

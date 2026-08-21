@@ -19,6 +19,11 @@ skill in a separate mutation workflow.
    the final filled copper on all relevant layers. Zone outlines and DRC alone
    do not show the actual current or return path. If fills are stale, report
    that limitation instead of mutating the board.
+   For every two-layer review, explicitly identify the usable primary ground
+   reference and summarize filled-GND continuity on both layers: connected
+   regions, fragmentation, slots, narrow links between substantial regions,
+   and the vias or through-hole pads providing parallel connections. The mere
+   presence of a GND zone on a layer is not evidence of a continuous plane.
 3. Relate layout to the schematic and design requirements: identify power and
    return paths, switching nodes, sensitive signals, current levels, edge
    rates, thermal loads, controlled-impedance nets, and mechanical constraints.
@@ -76,3 +81,12 @@ do not count it as a defect. End with review scope, limitations, DRC status,
 remaining blockers, and whether the reviewed evidence supports release. Do not
 claim release readiness while required evidence is missing or blocker/high
 findings remain.
+
+For a two-layer board, always include a user-visible ground-reference and
+return-path assessment even when no defect is proven. Disclose any dominant
+plane divided into large regions joined by a narrow bridge when the other
+layer is not a substantially continuous parallel reference. State which
+important routes cross or depend on that topology, whether a credible parallel
+return exists, and what evidence controls severity. Do not omit the condition
+merely because the board carries “only signals,” uses a low protocol rate, or
+still passes connectivity and DRC.

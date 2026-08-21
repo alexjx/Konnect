@@ -74,6 +74,12 @@ pub const SKILLS: &[SkillManifest] = &[
                     "../assets/skills/konnect-kicad-pcb-layout/references/pcb-completion.md"
                 ),
             ),
+            (
+                "references/layout-rules.md",
+                include_str!(
+                    "../assets/skills/konnect-kicad-pcb-layout/references/layout-rules.md"
+                ),
+            ),
         ],
     },
 ];
@@ -104,5 +110,24 @@ mod tests {
             .expect("embedded SKILL.md");
         assert!(skill_md.contains("name: kicad-layout-review"));
         assert!(!skill_md.contains("[TODO"));
+    }
+
+    #[test]
+    fn pcb_layout_skill_packages_its_layout_rules() {
+        let skill = SKILLS
+            .iter()
+            .find(|skill| skill.name == "konnect-kicad-pcb-layout")
+            .expect("konnect-kicad-pcb-layout manifest entry");
+        let skill_md = skill
+            .files
+            .iter()
+            .find_map(|(path, content)| (*path == "SKILL.md").then_some(*content))
+            .expect("embedded SKILL.md");
+
+        assert!(skill
+            .files
+            .iter()
+            .any(|(path, _)| *path == "references/layout-rules.md"));
+        assert!(skill_md.contains("references/layout-rules.md"));
     }
 }
