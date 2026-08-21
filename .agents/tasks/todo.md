@@ -1,21 +1,28 @@
-# Workflow-first MVP 实现 — 2026-08-20
+# Rebuild, restart, and install skills — 2026-08-21
 
-- [x] 审核当前所有未提交改动并运行基线验证
-- [x] 提交全部当前改动并创建 annotated baseline tag
-- [x] P0：实现 exposure profile、workflow 状态/错误/typed operations
-- [x] P1：实现聚合只读 `inspect_design`
-- [x] P2：实现单文件 schematic plan/apply/verify MVP
-- [x] P3：实现 PCB move/rotate plan/apply/verify MVP
-- [x] 更新工具目录、README/DEV、bundled Skills 与配置示例
-- [x] 增加 unit、protocol、fixture/mock 与相关回归测试
-- [x] 运行完整验证、审查 diff，并提交 MVP
+- [x] Identify the configured Konnect MCP executable and running process
+- [x] Build and verify the release binary
+- [x] Replace the configured executable without disturbing unrelated processes
+- [x] Install all bundled skills through the rebuilt binary
+- [x] Restart Konnect and verify its process, version, MCP handshake, and skills
+- [x] Commit the verified source and skill updates
 
 ## Review
 
-- 基线提交：`36e2532 feat: extend verified live editing capabilities`
-- 基线标签：`pre-workflow-mvp-20260820`
-- 暴露模式：legacy 18 个默认工具；expert 增加 7 个流程；workflow 仅 7 个流程 + 2 个观测工具。
-- 原理图：typed plan、目标零写入、SHA-256 stale 拒绝、单次原子写、并发幂等、同快照解析/校验。
-- PCB：精确文档绑定、live hash、courtyard 投影与 baseline-delta 检查、多 footprint 单 KiCad commit、verify 后才 save。
-- 最终验证：`cargo fmt --all -- --check`、`cargo test --workspace`、`cargo clippy --workspace --all-targets`、`git diff --check` 全部退出码 0。
-- 真实 KiCad E2E 仍由 weekly/release workflow 执行；本地无真实编辑器会话，因此本轮以 IPC mock 证明事务形状。
+- Built release `konnect 0.1.3-xinj.40` and deployed it to the exact configured
+  path `D:\wkspace\Konnect\konnect.exe`.
+- Stopped only `konnect.exe` processes whose resolved executable path matched
+  the configured target. Preserved the previous executable at
+  `D:\wkspace\Konnect\konnect.exe.pre-rebuild-20260821-2.bak`.
+- Release and deployed SHA-256 hashes match:
+  `5B33491B40196310C055AD81EAF4AB900F0734021C863B088E4F6600F49ABE72`.
+- The rebuilt binary's installer reports all three bundled skills present:
+  `kicad-layout-review`, `konnect-kicad-schematic`, and
+  `konnect-kicad-pcb-layout`. The separately maintained
+  `kicad-package-audit` also matches its repository files.
+- Verified a fresh stdio process with an MCP initialize and `tools/list`
+  handshake; it reported server version `0.1.3-xinj.40` and exited normally
+  when the smoke client's stdin closed.
+- The pre-existing MCP connection for this task closed when its old process was
+  stopped and cannot reattach in place. A new task connection or Codex app
+  reload will spawn the rebuilt executable.

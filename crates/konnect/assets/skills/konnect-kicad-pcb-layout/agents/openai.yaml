@@ -1,7 +1,7 @@
 interface:
   display_name: "Konnect KiCad PCB Layout"
-  short_description: "Place, route, review, and prepare KiCad PCBs with Konnect"
-  default_prompt: "Use $konnect-kicad-pcb-layout to place, route, review, or prepare this KiCad PCB through live Konnect IPC."
+  short_description: "Place, route, and prepare KiCad PCBs with Konnect"
+  default_prompt: "Use $konnect-kicad-pcb-layout to inspect, plan, apply, and verify this KiCad PCB safely through live Konnect IPC."
 
 dependencies:
   tools:

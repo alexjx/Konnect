@@ -108,7 +108,10 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string" },
                     "net": { "type": "string", "description": "Net name" },
                     "x": { "type": "number" }, "y": { "type": "number" },
-                    "rotation": { "type": "number", "default": 0 },
+                    "rotation": {
+                        "type": "number",
+                        "description": "Optional explicit rotation override in degrees. When omitted, Konnect derives rotation and text justification from an unambiguous wire endpoint at the label anchor; otherwise it preserves the legacy 0-degree default."
+                    },
                     "label_type": {
                         "type": "string",
                         "enum": ["net_label", "global_label", "hierarchical_label"],
@@ -704,7 +707,7 @@ async fn handle_add_net_label(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
+    let requested_rotation = opt_f64(args, "rotation");
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
     let shape = opt_str(args, "shape").unwrap_or("input");
 
@@ -722,6 +725,9 @@ async fn handle_add_net_label(
     }
 
     let mut sch = cse::Schematic::load(&sch_path)?;
+    let (rotation, orientation_source) =
+        resolve_label_rotation(&sch.wires, x, y, requested_rotation);
+    let justification = label_justification(rotation);
 
     match label_type {
         "global_label" => {
@@ -730,6 +736,7 @@ async fn handle_add_net_label(
             let idx = sch.global_labels.len() - 1;
             if let Some(gl) = sch.global_labels.get_mut(idx) {
                 gl.at.rotation = Some(rotation);
+                gl.effects = Some(label_effects(rotation));
             }
         }
         "hierarchical_label" => {
@@ -738,19 +745,129 @@ async fn handle_add_net_label(
             let idx = sch.hierarchical_labels.len() - 1;
             if let Some(hl) = sch.hierarchical_labels.get_mut(idx) {
                 hl.at.rotation = Some(rotation);
+                hl.effects = Some(label_effects(rotation));
             }
         }
         _ => {
             let label = sch.add_label(&net, x, y);
             label.at.rotation = Some(rotation);
+            label.effects = Some(label_effects(rotation));
         }
     }
 
     sch.overwrite()?;
 
-    Ok(CallToolResult::json(
-        &json!({ "added_label": net, "type": label_type, "x": x, "y": y }),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "added_label": net,
+        "type": label_type,
+        "x": x,
+        "y": y,
+        "rotation": rotation,
+        "justification": justification,
+        "orientation_source": orientation_source
+    })))
+}
+
+const LABEL_GEOMETRY_EPSILON: f64 = 0.01;
+
+fn label_justification(rotation: f64) -> &'static str {
+    if rotation.rem_euclid(360.0) >= 180.0 {
+        "right"
+    } else {
+        "left"
+    }
+}
+
+fn label_effects(rotation: f64) -> cse::types::Effects {
+    cse::types::Effects(cse::sexp::SexpNode::List(vec![
+        cse::sexp::atom("effects"),
+        cse::sexp::tagged(
+            "font",
+            vec![cse::sexp::tagged(
+                "size",
+                vec![cse::sexp::atom("1.27"), cse::sexp::atom("1.27")],
+            )],
+        ),
+        cse::sexp::tagged(
+            "justify",
+            vec![cse::sexp::atom(label_justification(rotation))],
+        ),
+    ]))
+}
+
+fn wire_endpoint_rotation(wire: &cse::Wire, x: f64, y: f64) -> Option<f64> {
+    let at_start = (wire.start.0 - x).abs() < LABEL_GEOMETRY_EPSILON
+        && (wire.start.1 - y).abs() < LABEL_GEOMETRY_EPSILON;
+    let at_end = (wire.end.0 - x).abs() < LABEL_GEOMETRY_EPSILON
+        && (wire.end.1 - y).abs() < LABEL_GEOMETRY_EPSILON;
+    let interior = match (at_start, at_end) {
+        (true, false) => wire.end,
+        (false, true) => wire.start,
+        _ => return None,
+    };
+    let dx = x - interior.0;
+    let dy = y - interior.1;
+
+    if dx.abs() < LABEL_GEOMETRY_EPSILON && dy.abs() < LABEL_GEOMETRY_EPSILON {
+        None
+    } else if dy.abs() < LABEL_GEOMETRY_EPSILON {
+        Some(if dx > 0.0 { 0.0 } else { 180.0 })
+    } else if dx.abs() < LABEL_GEOMETRY_EPSILON {
+        Some(if dy < 0.0 { 90.0 } else { 270.0 })
+    } else {
+        None
+    }
+}
+
+fn wire_contains_point(wire: &cse::Wire, x: f64, y: f64) -> bool {
+    let segment_x = wire.end.0 - wire.start.0;
+    let segment_y = wire.end.1 - wire.start.1;
+    let point_x = x - wire.start.0;
+    let point_y = y - wire.start.1;
+    let length = segment_x.hypot(segment_y);
+    if length < LABEL_GEOMETRY_EPSILON {
+        return point_x.hypot(point_y) < LABEL_GEOMETRY_EPSILON;
+    }
+
+    let cross = point_x * segment_y - point_y * segment_x;
+    if cross.abs() > LABEL_GEOMETRY_EPSILON * length {
+        return false;
+    }
+
+    let dot = point_x * segment_x + point_y * segment_y;
+    let endpoint_tolerance = LABEL_GEOMETRY_EPSILON * length;
+    dot >= -endpoint_tolerance && dot <= length * length + endpoint_tolerance
+}
+
+fn infer_label_rotation(wires: &cse::WireCollection, x: f64, y: f64) -> Option<f64> {
+    let mut inferred: Option<f64> = None;
+    for wire in wires.iter() {
+        if !wire_contains_point(wire, x, y) {
+            continue;
+        }
+        let rotation = wire_endpoint_rotation(wire, x, y)?;
+        match inferred {
+            None => inferred = Some(rotation),
+            Some(existing) if (existing - rotation).abs() < LABEL_GEOMETRY_EPSILON => {}
+            Some(_) => return None,
+        }
+    }
+    inferred
+}
+
+fn resolve_label_rotation(
+    wires: &cse::WireCollection,
+    x: f64,
+    y: f64,
+    explicit_rotation: Option<f64>,
+) -> (f64, &'static str) {
+    if let Some(rotation) = explicit_rotation {
+        (rotation, "explicit")
+    } else if let Some(rotation) = infer_label_rotation(wires, x, y) {
+        (rotation, "wire")
+    } else {
+        (0.0, "legacy_fallback")
+    }
 }
 
 async fn handle_set_all_global_label_shapes(
@@ -928,32 +1045,10 @@ async fn handle_rotate_label(
     let mut sch = cse::Schematic::load(&sch_path)?;
     let mut rotated = false;
     let matches_position = |px: f64, py: f64| (px - x).abs() < 0.01 && (py - y).abs() < 0.01;
-    let label_effects = || {
-        // KiCad's label anchor semantics use justification together with
-        // rotation. 0/90 extend from a left-justified anchor; 180/270 extend
-        // from a right-justified anchor.
-        let justify = if rotation.rem_euclid(360.0) >= 180.0 {
-            "right"
-        } else {
-            "left"
-        };
-        cse::types::Effects(cse::sexp::SexpNode::List(vec![
-            cse::sexp::atom("effects"),
-            cse::sexp::tagged(
-                "font",
-                vec![cse::sexp::tagged(
-                    "size",
-                    vec![cse::sexp::atom("1.27"), cse::sexp::atom("1.27")],
-                )],
-            ),
-            cse::sexp::tagged("justify", vec![cse::sexp::atom(justify)]),
-        ]))
-    };
-
     for label in &mut sch.labels {
         if label.text == net && matches_position(label.at.x, label.at.y) {
             label.at.rotation = Some(rotation);
-            label.effects = Some(label_effects());
+            label.effects = Some(label_effects(rotation));
             rotated = true;
             break;
         }
@@ -967,7 +1062,7 @@ async fn handle_rotate_label(
                 // leaves the outline attached by the wrong edge after a
                 // 180-degree rotation. Match KiCad's native convention so
                 // the pointed connection end rotates with the label.
-                label.effects = Some(label_effects());
+                label.effects = Some(label_effects(rotation));
                 rotated = true;
                 break;
             }
@@ -977,7 +1072,7 @@ async fn handle_rotate_label(
         for label in &mut sch.hierarchical_labels {
             if label.text == net && matches_position(label.at.x, label.at.y) {
                 label.at.rotation = Some(rotation);
-                label.effects = Some(label_effects());
+                label.effects = Some(label_effects(rotation));
                 rotated = true;
                 break;
             }
@@ -1342,28 +1437,6 @@ async fn handle_connect_to_net(
         "down" => (pin_x, pin_y + stub_length, 270.0),
         _ => (pin_x + stub_length, pin_y, 0.0), // "right" default
     };
-    let label_effects = || {
-        // Rotation alone is insufficient in KiCad: 180/270 degree labels
-        // also need right justification or their text grows back across the
-        // wire and into the symbol connection envelope.
-        let justify = if label_rot.rem_euclid(360.0) >= 180.0 {
-            "right"
-        } else {
-            "left"
-        };
-        cse::types::Effects(cse::sexp::SexpNode::List(vec![
-            cse::sexp::atom("effects"),
-            cse::sexp::tagged(
-                "font",
-                vec![cse::sexp::tagged(
-                    "size",
-                    vec![cse::sexp::atom("1.27"), cse::sexp::atom("1.27")],
-                )],
-            ),
-            cse::sexp::tagged("justify", vec![cse::sexp::atom(justify)]),
-        ]))
-    };
-
     let mut sch = cse::Schematic::load(&sch_path)?;
 
     // T-junction detection for the wire stub
@@ -1390,13 +1463,13 @@ async fn handle_connect_to_net(
             let idx = sch.global_labels.len() - 1;
             if let Some(gl) = sch.global_labels.get_mut(idx) {
                 gl.at.rotation = Some(label_rot);
-                gl.effects = Some(label_effects());
+                gl.effects = Some(label_effects(label_rot));
             }
         }
         _ => {
             let label = sch.add_label(&net, label_x, label_y);
             label.at.rotation = Some(label_rot);
-            label.effects = Some(label_effects());
+            label.effects = Some(label_effects(label_rot));
         }
     }
 
@@ -1683,6 +1756,96 @@ async fn handle_add_schematic_connection(
     Ok(CallToolResult::json(&json!({
         "connected": { "from": [x1, y1], "to": [x2, y2] }
     })))
+}
+
+#[cfg(test)]
+mod label_direction_tests {
+    use super::*;
+
+    fn wires(segments: &[(f64, f64, f64, f64)]) -> cse::WireCollection {
+        cse::WireCollection::new(
+            segments
+                .iter()
+                .map(|&(x1, y1, x2, y2)| cse::Wire::new(x1, y1, x2, y2))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn infers_all_four_label_directions_from_wire_endpoints() {
+        let cases = [
+            ((0.0, 0.0, 10.0, 0.0), (10.0, 0.0), 0.0, "left"),
+            ((10.0, 0.0, 0.0, 0.0), (0.0, 0.0), 180.0, "right"),
+            ((0.0, 10.0, 0.0, 0.0), (0.0, 0.0), 90.0, "left"),
+            ((0.0, 0.0, 0.0, 10.0), (0.0, 10.0), 270.0, "right"),
+        ];
+
+        for (segment, anchor, expected_rotation, expected_justification) in cases {
+            let collection = wires(&[segment]);
+            let (rotation, source) = resolve_label_rotation(&collection, anchor.0, anchor.1, None);
+            assert_eq!(rotation, expected_rotation);
+            assert_eq!(label_justification(rotation), expected_justification);
+            assert_eq!(source, "wire");
+        }
+    }
+
+    #[test]
+    fn explicit_rotation_overrides_connected_wire() {
+        let collection = wires(&[(0.0, 0.0, 10.0, 0.0)]);
+        assert_eq!(
+            resolve_label_rotation(&collection, 10.0, 0.0, Some(180.0)),
+            (180.0, "explicit")
+        );
+    }
+
+    #[test]
+    fn unclear_geometry_uses_legacy_default() {
+        let no_wire = wires(&[]);
+        assert_eq!(
+            resolve_label_rotation(&no_wire, 10.0, 0.0, None),
+            (0.0, "legacy_fallback")
+        );
+
+        let mid_segment = wires(&[(0.0, 0.0, 20.0, 0.0)]);
+        assert_eq!(
+            resolve_label_rotation(&mid_segment, 10.0, 0.0, None),
+            (0.0, "legacy_fallback")
+        );
+
+        let junction = wires(&[(0.0, 0.0, 10.0, 0.0), (10.0, 10.0, 10.0, 0.0)]);
+        assert_eq!(
+            resolve_label_rotation(&junction, 10.0, 0.0, None),
+            (0.0, "legacy_fallback")
+        );
+
+        let tee_junction = wires(&[(0.0, 0.0, 20.0, 0.0), (10.0, -10.0, 10.0, 0.0)]);
+        assert_eq!(
+            resolve_label_rotation(&tee_junction, 10.0, 0.0, None),
+            (0.0, "legacy_fallback")
+        );
+    }
+
+    #[test]
+    fn label_effects_follow_rotation_justification() {
+        let left = format!("{:?}", label_effects(0.0));
+        let right = format!("{:?}", label_effects(180.0));
+        assert!(left.contains("left"));
+        assert!(right.contains("right"));
+    }
+
+    #[test]
+    fn add_label_schema_leaves_rotation_to_the_tool() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "add_schematic_net_label")
+            .expect("add_schematic_net_label tool");
+        let rotation = &tool.input_schema["properties"]["rotation"];
+        assert!(rotation.get("default").is_none());
+        assert!(rotation["description"]
+            .as_str()
+            .expect("rotation description")
+            .contains("Konnect derives"));
+    }
 }
 
 #[cfg(test)]
