@@ -104,9 +104,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "integration",
-        description: "JLCPCB parts database, Freerouting installation discovery, datasheet URLs",
+        description: "JLCPCB parts database, local Freerouting MCP routing, datasheet URLs",
         category: "integration",
-        tool_count: 8,
+        tool_count: 9,
     },
     ToolsetMeta {
         name: "verification",

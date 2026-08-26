@@ -60,10 +60,14 @@ schematic parity. `verification.rs`, `pcb_export.rs`, `design_review.rs`, and
 `manufacturing.rs` consume that complete result; unavailable categories or a
 failed CLI run cannot be treated as a clean board.
 
-Freerouting remains usable through its KiCad ActionPlugin, but Konnect does not
-currently have a safe DSN/SES bridge. The `autoroute` behavior in
-`tools/integration.rs` reports that limitation instead of claiming KiCad removed
-CLI commands that never existed.
+Konnect's Freerouting bridge keeps the KiCad and routing responsibilities
+separate: `export_specctra_dsn` snapshots the live board and writes a
+revision-bound DSN job, `route_specctra_dsn` drives the discovered local JAR
+through Freerouting's native headless MCP server, and
+`plan_specctra_ses_import` / `apply_specctra_ses` validate and apply the result
+through one KiCad undo transaction. Board data stays local, output files are
+created without replacement, and the Freerouting child process is bounded and
+owned by Konnect.
 
 ## Configuration
 
