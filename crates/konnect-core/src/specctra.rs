@@ -116,6 +116,10 @@ struct ManifestComponent {
     reference: String,
     kiid: String,
     image_name: String,
+    x_um: i64,
+    y_um: i64,
+    rotation_degrees: f64,
+    side: &'static str,
     pads: Vec<ManifestPin>,
 }
 
@@ -786,6 +790,10 @@ fn build_manifest(
             reference: footprint.reference.clone(),
             kiid: footprint.kiid.clone(),
             image_name: footprint.image_name.clone(),
+            x_um: footprint.x_um,
+            y_um: footprint.y_um,
+            rotation_degrees: footprint.rotation_degrees,
+            side: "front",
             pads: footprint
                 .pads
                 .iter()
@@ -975,6 +983,12 @@ mod tests {
         assert!(first.dsn.contains("(boundary"));
         assert!(first.dsn.contains("(net GND"));
         assert!(first.dsn.contains("R1-1"));
+        let manifest: serde_json::Value = serde_json::from_str(&first.manifest).unwrap();
+        assert_eq!(manifest["components"][0]["reference"], "R1");
+        assert_eq!(manifest["components"][0]["x_um"], 100_000);
+        assert_eq!(manifest["components"][0]["y_um"], -50_000);
+        assert_eq!(manifest["components"][0]["rotation_degrees"], 0.0);
+        assert_eq!(manifest["components"][0]["side"], "front");
     }
 
     /// Optional local parity check against the Freerouting engine. CI does not
