@@ -124,7 +124,7 @@ pub const HOOK_SKILLS: &[HookSkillManifest] = &[
         content: "These PCB tools require KiCAD to be running with the board file open.\n\
                   If you get a connection error, tell the user: \"Please open KiCAD and load\n\
                   your .kicad_pcb file, then try again.\" Do not retry more than once.",
-        tool_matcher: "mcp__konnect__(place_component|move_component|rotate_component|route_trace|add_via|route_differential_pair|route_pad_to_pad|refill_zones)",
+        tool_matcher: "mcp__konnect__(place_component|move_component|rotate_component|route_trace|add_via|route_differential_pair|route_pad_to_pad|plan_specctra_ses_import|apply_specctra_ses|refill_zones)",
         event: "PreToolUse",
     },
 ];

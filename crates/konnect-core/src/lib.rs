@@ -5,4 +5,5 @@ pub mod mcp;
 pub mod observability;
 pub mod router;
 pub(crate) mod specctra;
+pub(crate) mod specctra_ses;
 pub mod tools;
