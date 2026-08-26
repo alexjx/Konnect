@@ -32,6 +32,7 @@ REQUIRED_ZIP_ENTRIES = [
     "plugins/__init__.py",
     "plugins/plugin.json",
     "plugins/settings_dialog.py",
+    "plugins/native_bridge.py",
     "plugins/resources/icon.png",
     "resources/icon.png",
 ]

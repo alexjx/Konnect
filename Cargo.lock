@@ -2484,6 +2484,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.23.1",
+ "dirs",
  "konnect-ipc",
  "konnect-render",
  "konnect-schematic-editor",

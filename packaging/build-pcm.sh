@@ -9,6 +9,7 @@
 #     __init__.py                 ActionPlugin launcher (settings dialog, server control)
 #     plugin.json                 KiCAD 10 IPC plugin manifest (entrypoint stamped)
 #     settings_dialog.py          wxPython settings UI
+#     native_bridge.py            authenticated KiCad 10 native Specctra bridge
 #     resources/icon.png          toolbar icon (referenced by __init__.py)
 #     bin/konnect                 the MCP server binary
 #     bin/schematic-viewer        (optional) live schematic viewer
@@ -96,6 +97,7 @@ mkdir -p "$staging/plugins/bin" "$staging/plugins/resources" "$staging/resources
 cp "$repo_root/plugin/__init__.py"        "$staging/plugins/"
 cp "$repo_root/plugin/plugin.json"        "$staging/plugins/"
 cp "$repo_root/plugin/settings_dialog.py" "$staging/plugins/"
+cp "$repo_root/plugin/native_bridge.py"   "$staging/plugins/"
 cp "$binary"                              "$staging/plugins/bin/$bin_name"
 chmod +x "$staging/plugins/bin/$bin_name"
 if [ -n "$viewer" ] && [ -f "$viewer" ]; then

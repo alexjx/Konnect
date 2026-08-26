@@ -8,7 +8,7 @@
 use anyhow::{bail, Context, Result};
 use konnect_ipc::IpcEffectiveRoutingRules;
 use konnect_sexp::{parse_sexp, SexpNode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use specctra::read::{ListTokenizer, ReadDsn};
 use specctra::structure as dsn;
@@ -31,7 +31,7 @@ pub(crate) struct ExportBundle {
     pub class_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum PadShape {
     Circle,
@@ -79,12 +79,12 @@ struct RuleKey {
 type RuleGroups = BTreeMap<RuleKey, Vec<String>>;
 type NetClassNames = BTreeMap<String, String>;
 
-#[derive(Debug, Serialize)]
-struct Manifest<'a> {
+#[derive(Debug, Deserialize, Serialize)]
+struct Manifest {
     schema_version: u32,
     board_path: String,
-    source_sha256: &'a str,
-    coordinate_unit: &'static str,
+    source_sha256: String,
+    coordinate_unit: String,
     resolution: u32,
     supported_profile: SupportedProfile,
     layers: Vec<ManifestLayer>,
@@ -93,25 +93,25 @@ struct Manifest<'a> {
     padstacks: Vec<ManifestPadstack>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct SupportedProfile {
     copper_layers: u32,
-    component_side: &'static str,
-    pad_shapes: Vec<&'static str>,
+    component_side: String,
+    pad_shapes: Vec<String>,
     existing_routing: bool,
     copper_zones: bool,
     custom_rules: bool,
-    outline: &'static str,
+    outline: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ManifestLayer {
     kicad_name: String,
     dsn_name: String,
     index: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ManifestComponent {
     reference: String,
     kiid: String,
@@ -119,11 +119,11 @@ struct ManifestComponent {
     x_um: i64,
     y_um: i64,
     rotation_degrees: f64,
-    side: &'static str,
+    side: String,
     pads: Vec<ManifestPin>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ManifestPin {
     pad_number: String,
     dsn_pin: String,
@@ -131,17 +131,17 @@ struct ManifestPin {
     padstack_name: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ManifestNet {
     name: String,
     pins: Vec<String>,
     class_name: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ManifestPadstack {
     name: String,
-    purpose: &'static str,
+    purpose: String,
     shape: PadShape,
     layers: Vec<String>,
     size_x_um: i64,
@@ -244,6 +244,488 @@ pub(crate) fn export_dsn(
         net_count: net_pins.len(),
         class_count: class_nets.len(),
     })
+}
+
+/// Replace Konnect's deterministic DSN with a KiCad-native DSN while keeping
+/// the same fail-closed board profile and rewriting the reverse manifest to
+/// the exact identifiers KiCad emitted. This lets the strict SES importer
+/// remain authoritative instead of trusting a second, looser return path.
+pub(crate) fn adopt_native_dsn(
+    mut baseline: ExportBundle,
+    native_dsn: String,
+) -> Result<ExportBundle> {
+    validate_dsn_syntax(&native_dsn, "KiCad native DSN")?;
+    let baseline_tree = parse_dsn_sexp(&baseline.dsn).context("parse Konnect baseline DSN")?;
+    let native_tree = parse_dsn_sexp(&native_dsn).context("parse KiCad native DSN")?;
+    let baseline_identity = dsn_identity(&baseline_tree)?;
+    let native_identity = dsn_identity(&native_tree)?;
+    let mut manifest: Manifest =
+        serde_json::from_str(&baseline.manifest).context("parse baseline routing manifest")?;
+
+    let layer_names = correlate_layers(&baseline_identity, &native_identity)?;
+    let (class_names, via_names) = correlate_classes(&baseline_identity, &native_identity)?;
+    let padstack_names = correlate_components(&baseline_identity, &native_identity)?;
+    validate_native_nets(&baseline_identity, &native_identity)?;
+
+    for layer in &mut manifest.layers {
+        layer.dsn_name = layer_names
+            .get(&layer.dsn_name)
+            .with_context(|| format!("native DSN omitted layer '{}'", layer.dsn_name))?
+            .clone();
+    }
+    for component in &mut manifest.components {
+        let native = native_identity
+            .components
+            .get(&component.reference)
+            .with_context(|| format!("native DSN omitted component '{}'", component.reference))?;
+        component.image_name = native.image_name.clone();
+        for pin in &mut component.pads {
+            pin.padstack_name = padstack_names
+                .get(&pin.padstack_name)
+                .with_context(|| {
+                    format!(
+                        "native DSN omitted padstack mapping for {}-{}",
+                        component.reference, pin.pad_number
+                    )
+                })?
+                .clone();
+        }
+    }
+    for net in &mut manifest.nets {
+        net.class_name = class_names
+            .get(&net.class_name)
+            .with_context(|| format!("native DSN omitted class mapping for '{}'", net.name))?
+            .clone();
+    }
+    for padstack in &mut manifest.padstacks {
+        let mapping = if padstack.purpose == "via" {
+            &via_names
+        } else {
+            &padstack_names
+        };
+        padstack.name = mapping
+            .get(&padstack.name)
+            .with_context(|| format!("native DSN omitted padstack '{}'", padstack.name))?
+            .clone();
+    }
+    manifest
+        .padstacks
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    baseline.manifest =
+        serde_json::to_string_pretty(&manifest).context("serialize native routing manifest")?;
+    baseline.dsn = native_dsn;
+    Ok(baseline)
+}
+
+#[derive(Debug, Clone)]
+struct DsnPlacementIdentity {
+    image_name: String,
+    x: i64,
+    y: i64,
+    side: String,
+    rotation: OrderedF64,
+    pins: BTreeMap<String, DsnPinIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DsnPinIdentity {
+    padstack: String,
+    x: i64,
+    y: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct OrderedF64(u64);
+
+impl OrderedF64 {
+    fn new(value: f64) -> Result<Self> {
+        if !value.is_finite() {
+            bail!("DSN contains a non-finite number");
+        }
+        Ok(Self(value.to_bits()))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DsnClassIdentity {
+    nets: BTreeSet<String>,
+    via_name: String,
+    width: i64,
+    clearance: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DsnShapeIdentity {
+    Circle {
+        layer: String,
+        diameter: i64,
+    },
+    Rect {
+        layer: String,
+        x1: i64,
+        y1: i64,
+        x2: i64,
+        y2: i64,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct DsnIdentity {
+    layers: BTreeMap<usize, String>,
+    components: BTreeMap<String, DsnPlacementIdentity>,
+    nets: BTreeMap<String, BTreeSet<String>>,
+    classes: BTreeMap<String, DsnClassIdentity>,
+    padstacks: BTreeMap<String, Vec<DsnShapeIdentity>>,
+}
+
+fn validate_dsn_syntax(source: &str, label: &str) -> Result<()> {
+    let cursor = Cursor::new(source.as_bytes());
+    let mut tokenizer = ListTokenizer::new(BufReader::new(cursor));
+    dsn::DsnFile::read_dsn(&mut tokenizer)
+        .map_err(|error| anyhow::anyhow!("{label} failed Specctra parser validation: {error}"))?;
+    Ok(())
+}
+
+fn parse_dsn_sexp(source: &str) -> Result<SexpNode> {
+    // Specctra represents the quote delimiter as the bare token
+    // `(string_quote ")`. KiCad's S-expression parser correctly treats the
+    // opening quote as a string delimiter, so give only this metadata token an
+    // escaped representation for structural inspection. The original DSN is
+    // retained byte-for-byte and independently validated by Topola's parser.
+    let compatible = source.replace("(string_quote \")", "(string_quote \"\\\"\")");
+    parse_sexp(&compatible).context("parse normalized Specctra S-expression")
+}
+
+fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
+    if root.head() != Some("pcb") {
+        bail!("Specctra export root is not 'pcb'");
+    }
+    let structure = root.find("structure").context("DSN has no structure")?;
+    let mut layers = BTreeMap::new();
+    for layer in structure.find_all("layer") {
+        let name = dsn_atom(layer, 1, "layer name")?.to_string();
+        let index = layer
+            .find("property")
+            .and_then(|property| property.find("index"))
+            .and_then(|index| index.get(1))
+            .and_then(SexpNode::as_str)
+            .context("DSN layer has no index")?
+            .parse::<usize>()
+            .context("DSN layer index is not an integer")?;
+        if layers.insert(index, name).is_some() {
+            bail!("DSN repeats a layer index");
+        }
+    }
+
+    let library = root.find("library").context("DSN has no library")?;
+    let mut image_pins = BTreeMap::<String, BTreeMap<String, DsnPinIdentity>>::new();
+    for image in library.find_all("image") {
+        let name = dsn_atom(image, 1, "image name")?.to_string();
+        let mut pins = BTreeMap::new();
+        for pin in image.find_all("pin") {
+            let padstack = dsn_atom(pin, 1, "pin padstack")?.to_string();
+            let number = dsn_atom(pin, 2, "pin number")?.to_string();
+            let identity = DsnPinIdentity {
+                padstack,
+                x: dsn_integer(pin, 3, "pin x")?,
+                y: dsn_integer(pin, 4, "pin y")?,
+            };
+            if pins.insert(number, identity).is_some() {
+                bail!("DSN image '{name}' repeats a pin number");
+            }
+        }
+        if image_pins.insert(name.clone(), pins).is_some() {
+            bail!("DSN repeats image '{name}'");
+        }
+    }
+    let mut padstacks = BTreeMap::new();
+    for padstack in library.find_all("padstack") {
+        let name = dsn_atom(padstack, 1, "padstack name")?.to_string();
+        let shapes = padstack
+            .find_all("shape")
+            .into_iter()
+            .map(|shape| {
+                let geometry = shape.get(1).context("DSN shape has no geometry")?;
+                match geometry.head() {
+                    Some("circle") => Ok(DsnShapeIdentity::Circle {
+                        layer: dsn_atom(geometry, 1, "circle layer")?.to_string(),
+                        diameter: dsn_integer(geometry, 2, "circle diameter")?,
+                    }),
+                    Some("rect") => Ok(DsnShapeIdentity::Rect {
+                        layer: dsn_atom(geometry, 1, "rect layer")?.to_string(),
+                        x1: dsn_integer(geometry, 2, "rect x1")?,
+                        y1: dsn_integer(geometry, 3, "rect y1")?,
+                        x2: dsn_integer(geometry, 4, "rect x2")?,
+                        y2: dsn_integer(geometry, 5, "rect y2")?,
+                    }),
+                    other => bail!("DSN padstack has unsupported shape {other:?}"),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if shapes.is_empty() || padstacks.insert(name.clone(), shapes).is_some() {
+            bail!("DSN contains an empty or duplicate padstack '{name}'");
+        }
+    }
+
+    let placement = root.find("placement").context("DSN has no placement")?;
+    let mut components = BTreeMap::new();
+    for component in placement.find_all("component") {
+        let image_name = dsn_atom(component, 1, "component image")?.to_string();
+        let pins = image_pins
+            .get(&image_name)
+            .with_context(|| format!("DSN placement uses unknown image '{image_name}'"))?
+            .clone();
+        for place in component.find_all("place") {
+            let reference = dsn_atom(place, 1, "place reference")?.to_string();
+            let x = dsn_integer(place, 2, "place x")?;
+            let y = dsn_integer(place, 3, "place y")?;
+            let side = dsn_atom(place, 4, "place side")?.to_string();
+            let rotation = OrderedF64::new(dsn_number(place, 5, "place rotation")?)?;
+            let identity = DsnPlacementIdentity {
+                image_name: image_name.clone(),
+                x,
+                y,
+                side,
+                rotation,
+                pins: pins.clone(),
+            };
+            if components.insert(reference.clone(), identity).is_some() {
+                bail!("DSN repeats component '{reference}'");
+            }
+        }
+    }
+
+    let network = root.find("network").context("DSN has no network")?;
+    let mut nets = BTreeMap::new();
+    for net in network.find_all("net") {
+        let name = dsn_atom(net, 1, "net name")?.to_string();
+        let pins = net
+            .find("pins")
+            .context("DSN net has no pins")?
+            .children()
+            .context("DSN pins is not a list")?
+            .iter()
+            .skip(1)
+            .map(|pin| {
+                pin.as_str()
+                    .map(str::to_string)
+                    .context("DSN pins contains a list")
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        if pins.is_empty() || nets.insert(name.clone(), pins).is_some() {
+            bail!("DSN contains an empty or duplicate net '{name}'");
+        }
+    }
+    let mut classes = BTreeMap::new();
+    for class in network.find_all("class") {
+        let name = dsn_atom(class, 1, "class name")?.to_string();
+        let children = class.children().context("DSN class is not a list")?;
+        let nets = children
+            .iter()
+            .skip(2)
+            .take_while(|child| child.as_str().is_some())
+            .map(|child| child.as_str().unwrap().to_string())
+            .collect::<BTreeSet<_>>();
+        let via_name = class
+            .find("circuit")
+            .and_then(|circuit| circuit.find("use_via"))
+            .and_then(|via| via.get(1))
+            .and_then(SexpNode::as_str)
+            .context("DSN class has no use_via")?
+            .to_string();
+        let rule = class.find("rule").context("DSN class has no rule")?;
+        let width = rule.find("width").context("DSN class has no width")?;
+        let clearance = rule
+            .find("clearance")
+            .context("DSN class has no clearance")?;
+        let width = dsn_integer(width, 1, "class width")?;
+        let clearance = dsn_integer(clearance, 1, "class clearance")?;
+        if nets.is_empty()
+            || !nets.iter().all(|net| {
+                network
+                    .find_all("net")
+                    .iter()
+                    .any(|node| node.get(1).and_then(SexpNode::as_str) == Some(net))
+            })
+            || classes
+                .insert(
+                    name.clone(),
+                    DsnClassIdentity {
+                        nets,
+                        via_name,
+                        width,
+                        clearance,
+                    },
+                )
+                .is_some()
+        {
+            bail!("DSN contains an invalid or duplicate class '{name}'");
+        }
+    }
+    Ok(DsnIdentity {
+        layers,
+        components,
+        nets,
+        classes,
+        padstacks,
+    })
+}
+
+fn correlate_layers(
+    baseline: &DsnIdentity,
+    native: &DsnIdentity,
+) -> Result<BTreeMap<String, String>> {
+    if baseline.layers.len() != native.layers.len() {
+        bail!("native DSN changed the copper-layer count");
+    }
+    let mappings = baseline
+        .layers
+        .iter()
+        .map(|(index, baseline_name)| {
+            let native_name = native
+                .layers
+                .get(index)
+                .with_context(|| format!("native DSN omitted layer index {index}"))?;
+            Ok((baseline_name.clone(), native_name.clone()))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    if mappings.iter().any(|(baseline, native)| baseline != native) {
+        bail!("native DSN renamed a KiCad copper layer");
+    }
+    Ok(mappings)
+}
+
+fn correlate_components(
+    baseline: &DsnIdentity,
+    native: &DsnIdentity,
+) -> Result<BTreeMap<String, String>> {
+    if baseline.components.len() != native.components.len() {
+        bail!("native DSN changed the component count");
+    }
+    let mut padstacks = BTreeMap::new();
+    for (reference, baseline_component) in &baseline.components {
+        let native_component = native
+            .components
+            .get(reference)
+            .with_context(|| format!("native DSN omitted component '{reference}'"))?;
+        if baseline_component.x != native_component.x
+            || baseline_component.y != native_component.y
+            || baseline_component.side != native_component.side
+            || baseline_component.rotation != native_component.rotation
+            || baseline_component.pins.keys().collect::<Vec<_>>()
+                != native_component.pins.keys().collect::<Vec<_>>()
+        {
+            bail!("native DSN changed placement or pins for component '{reference}'");
+        }
+        for (pin, baseline_pin) in &baseline_component.pins {
+            let native_pin = native_component.pins.get(pin).unwrap();
+            if baseline_pin.x != native_pin.x || baseline_pin.y != native_pin.y {
+                bail!("native DSN changed pin position for component '{reference}' pin '{pin}'");
+            }
+            let baseline_shape = baseline
+                .padstacks
+                .get(&baseline_pin.padstack)
+                .with_context(|| {
+                    format!("baseline DSN omitted padstack '{}'", baseline_pin.padstack)
+                })?;
+            let native_shape = native
+                .padstacks
+                .get(&native_pin.padstack)
+                .with_context(|| {
+                    format!("native DSN omitted padstack '{}'", native_pin.padstack)
+                })?;
+            if baseline_shape != native_shape {
+                bail!("native DSN changed pad geometry for component '{reference}' pin '{pin}'");
+            }
+            if padstacks
+                .insert(baseline_pin.padstack.clone(), native_pin.padstack.clone())
+                .is_some_and(|previous| previous != native_pin.padstack)
+            {
+                bail!("native DSN maps one pad geometry to inconsistent padstacks");
+            }
+        }
+    }
+    Ok(padstacks)
+}
+
+fn validate_native_nets(baseline: &DsnIdentity, native: &DsnIdentity) -> Result<()> {
+    if baseline.nets != native.nets {
+        bail!("native DSN changed net or pin membership");
+    }
+    Ok(())
+}
+
+fn correlate_classes(
+    baseline: &DsnIdentity,
+    native: &DsnIdentity,
+) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
+    if baseline.classes.len() != native.classes.len() {
+        bail!("native DSN changed the routing-class count");
+    }
+    let mut class_names = BTreeMap::new();
+    let mut via_names = BTreeMap::new();
+    for (baseline_name, baseline_class) in &baseline.classes {
+        let matches = native
+            .classes
+            .iter()
+            .filter(|(_, native_class)| native_class.nets == baseline_class.nets)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            bail!("native DSN has no unique class for '{baseline_name}'");
+        }
+        let (native_name, native_class) = matches[0];
+        if baseline_class.width != native_class.width
+            || baseline_class.clearance != native_class.clearance
+        {
+            bail!("native DSN changed width or clearance for class '{baseline_name}'");
+        }
+        let baseline_via = baseline
+            .padstacks
+            .get(&baseline_class.via_name)
+            .with_context(|| format!("baseline DSN omitted via '{}'", baseline_class.via_name))?;
+        let native_via = native
+            .padstacks
+            .get(&native_class.via_name)
+            .with_context(|| format!("native DSN omitted via '{}'", native_class.via_name))?;
+        if baseline_via != native_via {
+            bail!("native DSN changed via geometry for class '{baseline_name}'");
+        }
+        class_names.insert(baseline_name.clone(), native_name.clone());
+        if via_names
+            .insert(
+                baseline_class.via_name.clone(),
+                native_class.via_name.clone(),
+            )
+            .is_some_and(|previous| previous != native_class.via_name)
+        {
+            bail!("native DSN maps one via rule to inconsistent padstacks");
+        }
+    }
+    Ok((class_names, via_names))
+}
+
+fn dsn_atom<'a>(node: &'a SexpNode, index: usize, label: &str) -> Result<&'a str> {
+    node.get(index)
+        .and_then(SexpNode::as_str)
+        .with_context(|| format!("DSN is missing {label}"))
+}
+
+fn dsn_number(node: &SexpNode, index: usize, label: &str) -> Result<f64> {
+    let value = dsn_atom(node, index, label)?
+        .parse::<f64>()
+        .with_context(|| format!("DSN {label} is not numeric"))?;
+    if !value.is_finite() {
+        bail!("DSN {label} is not finite");
+    }
+    Ok(value)
+}
+
+fn dsn_integer(node: &SexpNode, index: usize, label: &str) -> Result<i64> {
+    let value = dsn_number(node, index, label)?;
+    if value.fract() != 0.0 || value < i64::MIN as f64 || value > i64::MAX as f64 {
+        bail!("DSN {label} is not a supported integer");
+    }
+    Ok(value as i64)
 }
 
 fn reject_unsupported_board_items(tree: &SexpNode) -> Result<()> {
@@ -793,7 +1275,7 @@ fn build_manifest(
             x_um: footprint.x_um,
             y_um: footprint.y_um,
             rotation_degrees: footprint.rotation_degrees,
-            side: "front",
+            side: "front".to_string(),
             pads: footprint
                 .pads
                 .iter()
@@ -818,7 +1300,7 @@ fn build_manifest(
         .iter()
         .map(|(key, name)| ManifestPadstack {
             name: name.clone(),
-            purpose: "pad",
+            purpose: "pad".to_string(),
             shape: key.shape,
             layers: key.layers.clone(),
             size_x_um: key.size_x_um,
@@ -828,7 +1310,7 @@ fn build_manifest(
         .collect::<Vec<_>>();
     padstacks.extend(via_names.iter().map(|(rule, name)| ManifestPadstack {
         name: name.clone(),
-        purpose: "via",
+        purpose: "via".to_string(),
         shape: PadShape::Circle,
         layers: copper_layers.to_vec(),
         size_x_um: rule.via_diameter_um,
@@ -840,17 +1322,17 @@ fn build_manifest(
     serde_json::to_string_pretty(&Manifest {
         schema_version: 1,
         board_path: board_path.display().to_string(),
-        source_sha256,
-        coordinate_unit: "um",
+        source_sha256: source_sha256.to_string(),
+        coordinate_unit: "um".to_string(),
         resolution: DSN_RESOLUTION as u32,
         supported_profile: SupportedProfile {
             copper_layers: 2,
-            component_side: "front",
-            pad_shapes: vec!["circle", "rect"],
+            component_side: "front".to_string(),
+            pad_shapes: vec!["circle".to_string(), "rect".to_string()],
             existing_routing: false,
             copper_zones: false,
             custom_rules: false,
-            outline: "one closed loop of straight Edge.Cuts lines",
+            outline: "one closed loop of straight Edge.Cuts lines".to_string(),
         },
         layers: copper_layers
             .iter()
@@ -968,6 +1450,14 @@ mod tests {
             .collect()
     }
 
+    fn native_fixture_rules() -> IpcEffectiveRoutingRules {
+        let mut rules = rules();
+        for rule in rules.values_mut() {
+            rule.track_width_mm = Some(0.2);
+        }
+        rules
+    }
+
     #[test]
     fn deterministic_export_round_trips_through_specctra_parser() {
         let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
@@ -997,6 +1487,36 @@ mod tests {
         let mut tokenizer = ListTokenizer::new(BufReader::new(Cursor::new(source.as_bytes())));
         dsn::DsnFile::read_dsn(&mut tokenizer)
             .expect("Freerouting v2.3.0 corpus fixture must remain parseable");
+    }
+
+    #[test]
+    fn native_kicad_dsn_rewrites_manifest_identifiers_without_changing_semantics() {
+        let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let native = include_str!("../tests/fixtures/specctra_two_resistors.native-kicad-10.dsn");
+        let baseline = export_dsn(
+            Path::new("board.kicad_pcb"),
+            source,
+            &native_fixture_rules(),
+        )
+        .unwrap();
+        let adopted = adopt_native_dsn(baseline, native.to_string()).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+
+        assert_eq!(adopted.dsn, native);
+        assert_eq!(
+            manifest["components"][0]["image_name"],
+            "Resistor_SMD:R_0402"
+        );
+        assert_eq!(
+            manifest["components"][0]["pads"][0]["padstack_name"],
+            "Rect[T]Pad_600.000000x500.000000_um"
+        );
+        assert_eq!(manifest["nets"][0]["class_name"], "kicad_default");
+        assert!(manifest["padstacks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|padstack| padstack["name"] == "Via[0-1]_600:300_um"));
     }
 
     /// Optional local parity check against the Freerouting engine. CI does not
@@ -1043,6 +1563,47 @@ mod tests {
         let ses = std::fs::read_to_string(&ses_path).expect("read Freerouting SES");
         crate::specctra_ses::parse_import_plan(&board_path, source, &export.manifest, &ses)
             .expect("Freerouting SES must pass Konnect's strict import planner");
+    }
+
+    /// Real-engine parity for KiCad 10's native exporter identifiers plus the
+    /// rewritten revision manifest consumed by the strict SES planner.
+    #[test]
+    #[ignore = "requires Java and FREEROUTING_JAR"]
+    fn freerouting_round_trips_native_kicad_export() {
+        let jar = std::env::var_os("FREEROUTING_JAR").expect("set FREEROUTING_JAR");
+        let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let native = include_str!("../tests/fixtures/specctra_two_resistors.native-kicad-10.dsn");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let board_path = temp.path().join("board.kicad_pcb");
+        let dsn_path = temp.path().join("board.dsn");
+        let ses_path = temp.path().join("board.ses");
+        std::fs::write(&board_path, source).expect("write board fixture");
+        let baseline = export_dsn(&board_path, source, &native_fixture_rules()).unwrap();
+        let export = adopt_native_dsn(baseline, native.to_string()).unwrap();
+        std::fs::write(&dsn_path, &export.dsn).expect("write native DSN");
+
+        let output = std::process::Command::new("java")
+            .arg("-jar")
+            .arg(jar)
+            .arg("-de")
+            .arg(&dsn_path)
+            .arg("-do")
+            .arg(&ses_path)
+            .arg("-mp")
+            .arg("2")
+            .output()
+            .expect("run Freerouting");
+        assert!(
+            output.status.success(),
+            "Freerouting failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let ses = std::fs::read_to_string(&ses_path).expect("read SES");
+        let plan =
+            crate::specctra_ses::parse_import_plan(&board_path, source, &export.manifest, &ses)
+                .expect("strict SES planner accepts native KiCad identifiers");
+        assert!(!plan.tracks.is_empty() || !plan.vias.is_empty());
     }
 
     #[test]

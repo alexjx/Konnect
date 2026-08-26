@@ -26,6 +26,7 @@ if _plugin_dir not in sys.path:
     sys.path.insert(0, _plugin_dir)
 
 from settings_dialog import KonnectSettingsDialog, load_settings
+from native_bridge import NativeSpecctraBridge
 import wx
 
 PLUGIN_DIR = _plugin_dir
@@ -47,6 +48,23 @@ _CACHE_DIR = os.path.join(
     "konnect", "cache",
 )
 _PID_FILE = os.path.join(_CACHE_DIR, "server.pid")
+_native_bridge = NativeSpecctraBridge(pcbnew, wx)
+
+
+def _sync_native_bridge():
+    """Apply the persisted KiCad-10 bridge setting without exposing internals."""
+    enabled = bool(load_settings(SETTINGS_PATH).get("native_specctra_bridge", False))
+    if enabled:
+        try:
+            _native_bridge.start()
+        except Exception as error:
+            print(f"[Konnect] Native Specctra bridge failed to start: {error}", file=sys.stderr)
+    else:
+        _native_bridge.stop()
+
+
+def _stop_native_bridge():
+    _native_bridge.stop()
 
 
 def _stage(source_path):
@@ -119,6 +137,7 @@ def _terminate_owned_server():
 
 
 atexit.register(_terminate_owned_server)
+atexit.register(_stop_native_bridge)
 
 
 def _kill_tracked():
@@ -246,6 +265,8 @@ class KonnectPlugin(pcbnew.ActionPlugin):
             plugin_dir=PLUGIN_DIR,
             binary_path=BINARY_PATH,
             server_running=is_server_running(),
+            native_bridge_available=_native_bridge.available(),
+            native_bridge_running=_native_bridge.running(),
         )
 
         result = dlg.ShowModal()
@@ -258,7 +279,9 @@ class KonnectPlugin(pcbnew.ActionPlugin):
             stop_server()
 
         dlg.Destroy()
+        _sync_native_bridge()
 
 
 # Register the plugin with KiCAD
+_sync_native_bridge()
 KonnectPlugin().register()

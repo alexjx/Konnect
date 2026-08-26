@@ -3,6 +3,7 @@ pub(crate) mod freerouting_mcp;
 pub mod gates;
 pub mod kicad_install;
 pub mod mcp;
+pub(crate) mod native_specctra_bridge;
 pub mod observability;
 pub mod router;
 pub(crate) mod specctra;
