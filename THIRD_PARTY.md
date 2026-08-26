@@ -5,6 +5,14 @@ projects. Konnect itself is licensed under the AGPL-3.0 (see LICENSE) with a
 commercial option (see COMMERCIAL.md); the notices below travel with every
 distribution of Konnect, under either license.
 
+## topola_specctra
+
+Konnect uses the `topola_specctra` parser, data model, and serializer from the
+[Topola project](https://codeberg.org/topola/topola) to validate and emit
+Specctra DSN syntax. Copyright 2024 Topola contributors; used under the MIT
+license. The MIT permission grant and warranty disclaimer reproduced below
+apply to this dependency.
+
 ## kicad-mcp-pro
 
 Portions of Konnect — including the JLCPCB pick-and-place rotation

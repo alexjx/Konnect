@@ -574,6 +574,32 @@ impl KiCadIpcClient {
         self.find_open_board(requested).map(|_| ())
     }
 
+    /// Serialize the first open PCB through KiCad itself.
+    ///
+    /// This is a read-only IPC snapshot. It deliberately does not read the
+    /// on-disk file, which may lag behind unsaved editor state.
+    pub fn save_document_to_string(&self) -> Result<String> {
+        self.save_document_to_string_in(self.get_board_document()?)
+    }
+
+    /// As [`Self::save_document_to_string`], targeting one proven-open board.
+    pub fn save_document_to_string_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<String> {
+        let command = kiapi::common::commands::SaveDocumentToString {
+            document: Some(document),
+        };
+        let response = unpack_required::<kiapi::common::commands::SavedDocumentResponse>(
+            self.send_command(&command, "kiapi.common.commands.SaveDocumentToString")?,
+            "SaveDocumentToString",
+        )?;
+        if response.contents.is_empty() {
+            anyhow::bail!("KiCad returned an empty PCB snapshot");
+        }
+        Ok(response.contents)
+    }
+
     /// Get all nets on the board.
     pub fn get_nets(&self) -> Result<Vec<IpcNet>> {
         self.get_nets_in(self.get_board_document()?)
@@ -599,6 +625,83 @@ impl KiCadIpcClient {
         } else {
             Ok(vec![])
         }
+    }
+
+    /// Return the effective merged routing rules for every connected net in
+    /// one open board.
+    ///
+    /// KiCad performs the class-priority merge. Konnect preserves missing
+    /// protobuf values as `None` so callers can fail closed.
+    pub fn get_effective_routing_rules_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<IpcEffectiveRoutingRules> {
+        let nets = self.get_nets_in(document)?;
+        if nets.is_empty() {
+            return Ok(IpcEffectiveRoutingRules::new());
+        }
+        let command = kiapi::board::commands::GetNetClassForNets {
+            net: nets
+                .iter()
+                .map(|net| kiapi::board::types::Net {
+                    code: Some(kiapi::board::types::NetCode { value: net.netcode }),
+                    name: net.name.clone(),
+                })
+                .collect(),
+        };
+        let response = unpack_required::<kiapi::board::commands::NetClassForNetsResponse>(
+            self.send_command(&command, "kiapi.board.commands.GetNetClassForNets")?,
+            "GetNetClassForNets",
+        )?;
+
+        let mut rules = IpcEffectiveRoutingRules::new();
+        for net in nets.into_iter().filter(|net| !net.name.is_empty()) {
+            let class = response.classes.get(&net.name).with_context(|| {
+                format!(
+                    "KiCad returned no effective netclass for net '{}'",
+                    net.name
+                )
+            })?;
+            let board = class.board.as_ref();
+            let via_stack = board.and_then(|settings| settings.via_stack.as_ref());
+            let via_diameter_mm = via_stack.and_then(|stack| {
+                stack
+                    .copper_layers
+                    .iter()
+                    .filter_map(|layer| layer.size.as_ref())
+                    .map(|size| nm_to_mm(size.x_nm.max(size.y_nm)))
+                    .filter(|diameter| diameter.is_finite() && *diameter > 0.0)
+                    .reduce(f64::max)
+            });
+            let via_drill_mm = via_stack
+                .and_then(|stack| stack.drill.as_ref())
+                .and_then(|drill| drill.diameter.as_ref())
+                .map(|diameter| nm_to_mm(diameter.x_nm.max(diameter.y_nm)))
+                .filter(|diameter| diameter.is_finite() && *diameter > 0.0);
+            let class_name = if class.name.is_empty() {
+                class.constituents.join("+")
+            } else {
+                class.name.clone()
+            };
+            rules.insert(
+                net.name,
+                IpcRoutingRules {
+                    class_name,
+                    constituents: class.constituents.clone(),
+                    track_width_mm: board
+                        .and_then(|settings| settings.track_width.as_ref())
+                        .map(|distance| nm_to_mm(distance.value_nm))
+                        .filter(|value| value.is_finite() && *value > 0.0),
+                    clearance_mm: board
+                        .and_then(|settings| settings.clearance.as_ref())
+                        .map(|distance| nm_to_mm(distance.value_nm))
+                        .filter(|value| value.is_finite() && *value >= 0.0),
+                    via_diameter_mm,
+                    via_drill_mm,
+                },
+            );
+        }
+        Ok(rules)
     }
 
     /// Get board items by type.

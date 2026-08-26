@@ -112,6 +112,128 @@ fn open_board_response() -> kiapi::common::ApiResponse {
 }
 
 #[test]
+fn save_document_to_string_targets_the_named_open_board() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_board_response());
+        }
+        if message.type_url.ends_with("SaveDocumentToString") {
+            let command =
+                kiapi::common::commands::SaveDocumentToString::decode(message.value.as_slice())
+                    .expect("decode SaveDocumentToString");
+            let document = command.document.expect("target document");
+            assert_eq!(
+                document.identifier,
+                Some(
+                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                        "test.kicad_pcb".to_string()
+                    )
+                )
+            );
+            let response = kiapi::common::commands::SavedDocumentResponse {
+                document: Some(document),
+                contents: "(kicad_pcb (version 20260206))".to_string(),
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.SavedDocumentResponse",
+            )));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = client
+        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+    let snapshot = client
+        .save_document_to_string_in(document)
+        .expect("live board snapshot");
+    assert_eq!(snapshot, "(kicad_pcb (version 20260206))");
+}
+
+#[test]
+fn effective_routing_rules_preserve_complete_kicad_values() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_board_response());
+        }
+        if message.type_url.ends_with("GetNets") {
+            let response = kiapi::board::commands::NetsResponse {
+                nets: vec![kiapi::board::types::Net {
+                    code: Some(kiapi::board::types::NetCode { value: 7 }),
+                    name: "GND".to_string(),
+                }],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.board.commands.NetsResponse",
+            )));
+        }
+        if message.type_url.ends_with("GetNetClassForNets") {
+            let command =
+                kiapi::board::commands::GetNetClassForNets::decode(message.value.as_slice())
+                    .expect("decode GetNetClassForNets");
+            assert_eq!(command.net.len(), 1);
+            assert_eq!(command.net[0].name, "GND");
+            assert_eq!(command.net[0].code.as_ref().map(|code| code.value), Some(7));
+
+            let via_stack = kiapi::board::types::PadStack {
+                drill: Some(kiapi::board::types::DrillProperties {
+                    diameter: Some(kiapi::common::types::Vector2 {
+                        x_nm: 600_000,
+                        y_nm: 600_000,
+                    }),
+                    ..Default::default()
+                }),
+                copper_layers: vec![kiapi::board::types::PadStackLayer {
+                    size: Some(kiapi::common::types::Vector2 {
+                        x_nm: 1_200_000,
+                        y_nm: 1_200_000,
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let class = kiapi::common::project::NetClass {
+                name: "Default".to_string(),
+                board: Some(kiapi::common::project::NetClassBoardSettings {
+                    clearance: Some(kiapi::common::types::Distance { value_nm: 200_000 }),
+                    track_width: Some(kiapi::common::types::Distance { value_nm: 250_000 }),
+                    via_stack: Some(via_stack),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let response = kiapi::board::commands::NetClassForNetsResponse {
+                classes: [("GND".to_string(), class)].into_iter().collect(),
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.board.commands.NetClassForNetsResponse",
+            )));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = client
+        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+    let rules = client
+        .get_effective_routing_rules_in(document)
+        .expect("effective rules");
+    let gnd = rules.get("GND").expect("GND rules");
+    assert_eq!(gnd.class_name, "Default");
+    assert_eq!(gnd.track_width_mm, Some(0.25));
+    assert_eq!(gnd.clearance_mm, Some(0.2));
+    assert_eq!(gnd.via_diameter_mm, Some(1.2));
+    assert_eq!(gnd.via_drill_mm, Some(0.6));
+}
+
+#[test]
 fn ping_roundtrips_through_mock() {
     let mock = spawn_mock(|req| {
         // The envelope must carry a client name and a packed command.

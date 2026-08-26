@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcVector2 {
@@ -216,6 +217,24 @@ pub struct IpcGraphic {
     /// position. `None` when KiCad sent no geometry.
     pub origin: Option<IpcVector2>,
 }
+
+/// Effective PCB routing rules returned by KiCad for one net.
+///
+/// Values are optional because KiCad's protobuf permits an incomplete class.
+/// A routing exporter must refuse an incomplete rule set rather than inventing
+/// manufacturing constraints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcRoutingRules {
+    pub class_name: String,
+    pub constituents: Vec<String>,
+    pub track_width_mm: Option<f64>,
+    pub clearance_mm: Option<f64>,
+    pub via_diameter_mm: Option<f64>,
+    pub via_drill_mm: Option<f64>,
+}
+
+/// Net name to its effective (merged) KiCad routing rules.
+pub type IpcEffectiveRoutingRules = BTreeMap<String, IpcRoutingRules>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcLayer {
