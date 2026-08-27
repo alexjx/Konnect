@@ -12,6 +12,8 @@ use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+const LEGACY_SKILL_NAMES: &[&str] = &["kicad-layout-review", "kicad-package-audit"];
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Full install with console output. Called by `init` subcommand or double-click.
@@ -24,6 +26,7 @@ pub fn run_install() -> Result<()> {
         install_skill(&skills_dir, skill)?;
         println!("  [+] Skill: {}", skill.name);
     }
+    remove_legacy_skills(&skills_dir)?;
 
     // KiCAD detection
     if let Some(kicad_path) = detect_kicad() {
@@ -54,6 +57,7 @@ pub fn run_install_silent() -> Result<()> {
     for skill in SKILLS {
         install_skill(&skills_dir, skill)?;
     }
+    remove_legacy_skills(&skills_dir)?;
 
     // Marker
     let data = data_dir()?;
@@ -79,6 +83,7 @@ pub fn run_uninstall() -> Result<()> {
             println!("  [-] Removed skill: {}", skill.name);
         }
     }
+    remove_legacy_skills(&skills_dir)?;
 
     // Marker
     let data = data_dir()?;
@@ -211,6 +216,55 @@ fn install_skill(skills_dir: &Path, skill: &crate::manifest::SkillManifest) -> R
         fs::write(destination, content)?;
     }
     Ok(())
+}
+
+fn remove_legacy_skills(skills_dir: &Path) -> Result<()> {
+    for name in LEGACY_SKILL_NAMES {
+        let legacy_dir = skills_dir.join(name);
+        if legacy_dir.exists() {
+            fs::remove_dir_all(&legacy_dir).with_context(|| {
+                format!("failed to remove legacy skill {}", legacy_dir.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installs_every_bundled_skill_and_file() {
+        let temp = tempfile::tempdir().expect("temporary install root");
+
+        for name in LEGACY_SKILL_NAMES {
+            let legacy = temp.path().join(name);
+            fs::create_dir_all(&legacy).expect("legacy skill directory");
+            fs::write(legacy.join("SKILL.md"), "legacy").expect("legacy skill marker");
+        }
+
+        for skill in SKILLS {
+            install_skill(temp.path(), skill).expect("install bundled skill");
+        }
+        remove_legacy_skills(temp.path()).expect("remove legacy skill directories");
+
+        assert_eq!(SKILLS.len(), 4);
+        for skill in SKILLS {
+            for (relative, expected) in skill.files {
+                let installed = temp.path().join(skill.name).join(relative);
+                assert_eq!(
+                    fs::read_to_string(&installed).expect("installed skill file"),
+                    *expected,
+                    "installed content mismatch: {}",
+                    installed.display()
+                );
+            }
+        }
+        for name in LEGACY_SKILL_NAMES {
+            assert!(!temp.path().join(name).exists());
+        }
+    }
 }
 
 /// Auto-detect KiCAD installation on Windows.

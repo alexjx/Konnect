@@ -1,5 +1,5 @@
 ---
-name: kicad-layout-review
+name: konnect-kicad-layout-review
 description: Read-only KiCad PCB layout audit with prioritized, evidence-backed findings. Use for general layout reviews, buck-converter layout, two-layer ground neck-down and return-path checks, or comparison with manufacturer datasheet layouts. Do not use for placement, routing, board edits, or fabrication execution.
 ---
 

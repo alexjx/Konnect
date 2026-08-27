@@ -10,26 +10,26 @@ pub struct SkillManifest {
 
 pub const SKILLS: &[SkillManifest] = &[
     SkillManifest {
-        name: "kicad-layout-review",
+        name: "konnect-kicad-layout-review",
         files: &[
             (
                 "SKILL.md",
-                include_str!("../assets/skills/kicad-layout-review/SKILL.md"),
+                include_str!("../assets/skills/konnect-kicad-layout-review/SKILL.md"),
             ),
             (
                 "agents/openai.yaml",
-                include_str!("../assets/skills/kicad-layout-review/agents/openai.yaml"),
+                include_str!("../assets/skills/konnect-kicad-layout-review/agents/openai.yaml"),
             ),
             (
                 "references/general-and-two-layer.md",
                 include_str!(
-                    "../assets/skills/kicad-layout-review/references/general-and-two-layer.md"
+                    "../assets/skills/konnect-kicad-layout-review/references/general-and-two-layer.md"
                 ),
             ),
             (
                 "references/buck-converter.md",
                 include_str!(
-                    "../assets/skills/kicad-layout-review/references/buck-converter.md"
+                    "../assets/skills/konnect-kicad-layout-review/references/buck-converter.md"
                 ),
             ),
         ],
@@ -45,6 +45,39 @@ pub const SKILLS: &[SkillManifest] = &[
                 "agents/openai.yaml",
                 include_str!(
                     "../assets/skills/konnect-kicad-schematic/agents/openai.yaml"
+                ),
+            ),
+        ],
+    },
+    SkillManifest {
+        name: "konnect-kicad-package-audit",
+        files: &[
+            (
+                "SKILL.md",
+                include_str!("../assets/skills/konnect-kicad-package-audit/SKILL.md"),
+            ),
+            (
+                "agents/openai.yaml",
+                include_str!(
+                    "../assets/skills/konnect-kicad-package-audit/agents/openai.yaml"
+                ),
+            ),
+            (
+                "references/configuration.md",
+                include_str!(
+                    "../assets/skills/konnect-kicad-package-audit/references/configuration.md"
+                ),
+            ),
+            (
+                "scripts/generate_package_audit.py",
+                include_str!(
+                    "../assets/skills/konnect-kicad-package-audit/scripts/generate_package_audit.py"
+                ),
+            ),
+            (
+                "scripts/review_markdown.py",
+                include_str!(
+                    "../assets/skills/konnect-kicad-package-audit/scripts/review_markdown.py"
                 ),
             ),
         ],
@@ -93,8 +126,8 @@ mod tests {
     fn layout_review_skill_is_complete_and_safely_packaged() {
         let skill = SKILLS
             .iter()
-            .find(|skill| skill.name == "kicad-layout-review")
-            .expect("kicad-layout-review manifest entry");
+            .find(|skill| skill.name == "konnect-kicad-layout-review")
+            .expect("konnect-kicad-layout-review manifest entry");
         let mut paths = HashSet::new();
         for (path, _) in skill.files {
             assert!(paths.insert(*path), "duplicate embedded path: {path}");
@@ -108,7 +141,7 @@ mod tests {
             .iter()
             .find_map(|(path, content)| (*path == "SKILL.md").then_some(*content))
             .expect("embedded SKILL.md");
-        assert!(skill_md.contains("name: kicad-layout-review"));
+        assert!(skill_md.contains("name: konnect-kicad-layout-review"));
         assert!(!skill_md.contains("[TODO"));
     }
 
@@ -129,5 +162,25 @@ mod tests {
             .iter()
             .any(|(path, _)| *path == "references/layout-rules.md"));
         assert!(skill_md.contains("references/layout-rules.md"));
+    }
+
+    #[test]
+    fn package_audit_skill_is_complete_and_safely_packaged() {
+        let skill = SKILLS
+            .iter()
+            .find(|skill| skill.name == "konnect-kicad-package-audit")
+            .expect("konnect-kicad-package-audit manifest entry");
+        let paths = skill
+            .files
+            .iter()
+            .map(|(path, _)| *path)
+            .collect::<HashSet<_>>();
+
+        assert!(paths.contains("SKILL.md"));
+        assert!(paths.contains("agents/openai.yaml"));
+        assert!(paths.contains("references/configuration.md"));
+        assert!(paths.contains("scripts/generate_package_audit.py"));
+        assert!(paths.contains("scripts/review_markdown.py"));
+        assert_eq!(paths.len(), skill.files.len());
     }
 }

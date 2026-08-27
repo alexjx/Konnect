@@ -1,20 +1,21 @@
-# Back up updated installed skills — 2026-08-21
+# Bundle all Konnect skills in `konnect init` — 2026-08-27
 
-- [x] Locate installed and repository skill directories
-- [x] Compare every maintained skill file and identify installed improvements
-- [x] Copy only changed source files into the repository backup
-- [x] Validate skill structure and any changed detection scripts
-- [x] Review the final diff and document verification results
+- [x] Inspect the installer path and current embedded skill manifest
+- [x] Add the prefixed package-audit skill and every required resource
+- [x] Update README installation documentation
+- [x] Add an isolated installer test covering all bundled files
+- [x] Validate skills, compile tests, formatting, and final diff
 
 ## Review
 
-- Backed up the installed two-layer review improvements in `SKILL.md` and
-  `references/general-and-two-layer.md`.
-- Added the installed PCB `references/layout-rules.md` and connected it to the
-  skill entrypoint and embedded installer manifest so a fresh `konnect init`
-  preserves it.
-- Confirmed the package-audit and schematic skills already matched their
-  installed copies; ignored runtime-only Python bytecode caches.
-- All four skill directories pass `quick_validate.py` under UTF-8.
-- The three copied files match their installed sources, `cargo fmt --check`
-  passes, and both targeted manifest tests pass.
+- Added `konnect-kicad-package-audit` to the embedded manifest with its
+  frontmatter, UI metadata, configuration reference, and both maintained scripts.
+- Updated the README to document all four skills installed by `konnect init`.
+- Added an isolated installer test that writes every embedded file and verifies
+  its exact content for all four skills and removes the two legacy unprefixed
+  directories.
+- All four skills pass `quick_validate.py`; `cargo fmt --check` and the complete
+  `cargo test -p konnect` suite pass.
+- Ran `cargo run -p konnect -- init` against the active installation. It reported
+  four installed skills, and the subsequent `status` command showed `[+]` for
+  every prefixed skill. Confirmed no legacy skill directories remain.

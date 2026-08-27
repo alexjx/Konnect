@@ -95,15 +95,14 @@ Running `konnect init` installs these skills under `$CODEX_HOME/skills`, falling
 back to `~/.codex/skills`:
 
 - `konnect-kicad-schematic` — guarded schematic editing and verification;
-- `konnect-kicad-pcb-layout` — live PCB modification and verification; and
-- `kicad-layout-review` — read-only general, buck-converter, datasheet, and
-  two-layer ground-return review.
+- `konnect-kicad-pcb-layout` — live PCB modification and verification;
+- `konnect-kicad-layout-review` — read-only general, buck-converter, datasheet, and
+  two-layer ground-return review; and
+- `konnect-kicad-package-audit` — symbol, footprint, BOM, package, and
+  manufacturer-evidence comparison.
 
 The skills separate review from mutation. A layout audit does not authorize board
 changes, and a successful tool call alone is not treated as verification.
-
-The repository also contains `kicad-package-audit`. It is maintained separately
-and is not installed by `konnect init`.
 
 ## How it works
 

@@ -1,6 +1,6 @@
 ---
 name: konnect-kicad-pcb-layout
-description: Modify KiCad PCB layout and verify applied changes through Konnect MCP and live KiCad IPC. Use for footprint placement, board geometry, routing, zones, or fabrication preparation; use the guarded workflow whenever it supports the requested mutation. Use kicad-layout-review instead for a read-only layout audit.
+description: Modify KiCad PCB layout and verify applied changes through Konnect MCP and live KiCad IPC. Use for footprint placement, board geometry, routing, zones, or fabrication preparation; use the guarded workflow whenever it supports the requested mutation. Use konnect-kicad-layout-review instead for a read-only layout audit.
 ---
 
 # Konnect KiCad PCB Layout

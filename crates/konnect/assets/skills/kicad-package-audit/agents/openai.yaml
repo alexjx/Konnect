@@ -1,4 +1,0 @@
-interface:
-  display_name: "KiCad Package Audit"
-  short_description: "Audit symbols, footprints, BOM, and datasheets"
-  default_prompt: "Use $kicad-package-audit to generate a complete symbol, footprint, BOM, and datasheet comparison report for this KiCad project."

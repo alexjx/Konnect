@@ -1,5 +1,5 @@
 ---
-name: kicad-package-audit
+name: konnect-kicad-package-audit
 description: Audit every KiCad component reference against its exact device, symbol, assigned library footprint, BOM, design authority, and manufacturer evidence. Use before PCB update or release, and whenever a symbol, footprint, order code, or package contract changes.
 ---
 
