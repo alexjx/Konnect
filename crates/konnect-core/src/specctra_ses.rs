@@ -19,6 +19,7 @@ pub(crate) struct SesImportPlan {
     pub source_sha256: String,
     pub session_id: String,
     pub tracks: Vec<SesTrack>,
+    pub arcs: Vec<SesArc>,
     pub vias: Vec<SesVia>,
 }
 
@@ -31,6 +32,19 @@ pub(crate) struct SesTrack {
     pub y1_mm: f64,
     pub x2_mm: f64,
     pub y2_mm: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct SesArc {
+    pub net_name: String,
+    pub layer: String,
+    pub width_mm: f64,
+    pub start_x_mm: f64,
+    pub start_y_mm: f64,
+    pub mid_x_mm: f64,
+    pub mid_y_mm: f64,
+    pub end_x_mm: f64,
+    pub end_y_mm: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -165,12 +179,12 @@ pub(crate) fn parse_import_plan(
         route_resolution,
         &manifest,
     )?;
-    let (tracks, vias) = parse_network(
+    let (tracks, arcs, vias) = parse_network(
         one_child(routes, "network_out")?,
         route_resolution,
         &manifest,
     )?;
-    if tracks.is_empty() && vias.is_empty() {
+    if tracks.is_empty() && arcs.is_empty() && vias.is_empty() {
         bail!("SES contains no route primitives");
     }
 
@@ -179,6 +193,7 @@ pub(crate) fn parse_import_plan(
         source_sha256: manifest.source_sha256,
         session_id,
         tracks,
+        arcs,
         vias,
     })
 }
@@ -434,7 +449,7 @@ fn parse_network(
     node: &SexpNode,
     resolution: f64,
     manifest: &Manifest,
-) -> Result<(Vec<SesTrack>, Vec<SesVia>)> {
+) -> Result<(Vec<SesTrack>, Vec<SesArc>, Vec<SesVia>)> {
     require_direct_shape(node, 0, &["net"])?;
     let nets = manifest
         .nets
@@ -453,8 +468,10 @@ fn parse_network(
         .map(|padstack| (padstack.name.as_str(), padstack))
         .collect::<BTreeMap<_, _>>();
     let mut tracks = Vec::new();
+    let mut arcs = Vec::new();
     let mut vias = Vec::new();
     let mut seen_tracks = BTreeSet::new();
+    let mut seen_arcs = BTreeSet::new();
     let mut seen_vias = BTreeSet::new();
 
     for net_node in node.find_all("net") {
@@ -464,58 +481,136 @@ fn parse_network(
             bail!("SES route refers to unknown net '{net_name}'");
         }
         for wire in net_node.find_all("wire") {
-            require_direct_shape(wire, 0, &["path"])?;
-            let path = one_child(wire, "path")?;
-            let data = atom_values(path)?;
-            if data.len() < 6 || (data.len() - 2) % 2 != 0 {
-                bail!("SES path for net '{net_name}' does not contain complete point pairs");
-            }
-            let layer = layers
-                .get(data[0])
-                .with_context(|| format!("SES path uses unknown layer '{}'", data[0]))?;
-            let width_um = scaled_positive(
-                number_text(data[1], "path width")?,
-                resolution,
-                "path width",
-            )?;
-            let width_mm = width_um / UM_PER_MM;
-            let points = data[2..]
-                .chunks_exact(2)
-                .map(|pair| {
-                    let x_um = scaled(number_text(pair[0], "path x")?, resolution, "path x")?;
-                    let y_um = scaled(number_text(pair[1], "path y")?, resolution, "path y")?;
-                    Ok((x_um / UM_PER_MM, -y_um / UM_PER_MM))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            for pair in points.windows(2) {
-                let (x1_mm, y1_mm) = pair[0];
-                let (x2_mm, y2_mm) = pair[1];
-                if x1_mm == x2_mm && y1_mm == y2_mm {
-                    bail!("SES path for net '{net_name}' contains a zero-length segment");
+            require_direct_shape(wire, 0, &["path", "qarc"])?;
+            let path = optional_child(wire, "path")?;
+            let qarc = optional_child(wire, "qarc")?;
+            match (path, qarc) {
+                (Some(path), None) => {
+                    let data = atom_values(path)?;
+                    if data.len() < 6 || (data.len() - 2) % 2 != 0 {
+                        bail!(
+                            "SES path for net '{net_name}' does not contain complete point pairs"
+                        );
+                    }
+                    let layer = layers
+                        .get(data[0])
+                        .with_context(|| format!("SES path uses unknown layer '{}'", data[0]))?;
+                    let width_um = scaled_positive(
+                        number_text(data[1], "path width")?,
+                        resolution,
+                        "path width",
+                    )?;
+                    let width_mm = width_um / UM_PER_MM;
+                    let points = data[2..]
+                        .chunks_exact(2)
+                        .map(|pair| {
+                            let x_um =
+                                scaled(number_text(pair[0], "path x")?, resolution, "path x")?;
+                            let y_um =
+                                scaled(number_text(pair[1], "path y")?, resolution, "path y")?;
+                            Ok((x_um / UM_PER_MM, -y_um / UM_PER_MM))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    for pair in points.windows(2) {
+                        let (x1_mm, y1_mm) = pair[0];
+                        let (x2_mm, y2_mm) = pair[1];
+                        if x1_mm == x2_mm && y1_mm == y2_mm {
+                            bail!("SES path for net '{net_name}' contains a zero-length segment");
+                        }
+                        let mut endpoints = [
+                            (ordered_f64(x1_mm), ordered_f64(y1_mm)),
+                            (ordered_f64(x2_mm), ordered_f64(y2_mm)),
+                        ];
+                        endpoints.sort();
+                        let key = (
+                            net_name.to_string(),
+                            (*layer).to_string(),
+                            ordered_f64(width_mm),
+                            endpoints,
+                        );
+                        if !seen_tracks.insert(key) {
+                            bail!("SES repeats a route segment on net '{net_name}'");
+                        }
+                        tracks.push(SesTrack {
+                            net_name: net_name.to_string(),
+                            layer: (*layer).to_string(),
+                            width_mm,
+                            x1_mm,
+                            y1_mm,
+                            x2_mm,
+                            y2_mm,
+                        });
+                    }
                 }
-                let mut endpoints = [
-                    (ordered_f64(x1_mm), ordered_f64(y1_mm)),
-                    (ordered_f64(x2_mm), ordered_f64(y2_mm)),
-                ];
-                endpoints.sort();
-                let key = (
-                    net_name.to_string(),
-                    (*layer).to_string(),
-                    ordered_f64(width_mm),
-                    endpoints,
-                );
-                if !seen_tracks.insert(key) {
-                    bail!("SES repeats a route segment on net '{net_name}'");
+                (None, Some(qarc)) => {
+                    let data = atom_values(qarc)?;
+                    if data.len() != 8 {
+                        bail!("SES qarc for net '{net_name}' must contain layer, width, start, end, and center");
+                    }
+                    let layer = layers
+                        .get(data[0])
+                        .with_context(|| format!("SES qarc uses unknown layer '{}'", data[0]))?;
+                    let width_mm = scaled_positive(
+                        number_text(data[1], "qarc width")?,
+                        resolution,
+                        "qarc width",
+                    )? / UM_PER_MM;
+                    let point = |x: &str, y: &str, label: &str| -> Result<(f64, f64)> {
+                        Ok((
+                            scaled(number_text(x, &format!("{label} x"))?, resolution, label)?
+                                / UM_PER_MM,
+                            -scaled(number_text(y, &format!("{label} y"))?, resolution, label)?
+                                / UM_PER_MM,
+                        ))
+                    };
+                    let start = point(data[2], data[3], "qarc start")?;
+                    let end = point(data[4], data[5], "qarc end")?;
+                    let center = point(data[6], data[7], "qarc center")?;
+                    let start_vector = (start.0 - center.0, start.1 - center.1);
+                    let end_vector = (end.0 - center.0, end.1 - center.1);
+                    let start_radius = start_vector.0.hypot(start_vector.1);
+                    let end_radius = end_vector.0.hypot(end_vector.1);
+                    let scale = start_radius.max(end_radius).max(1.0);
+                    if start_radius <= f64::EPSILON
+                        || (start_radius - end_radius).abs() > 1e-6 * scale
+                        || (start_vector.0 * end_vector.0 + start_vector.1 * end_vector.1).abs()
+                            > 1e-6 * start_radius * end_radius
+                    {
+                        bail!("SES qarc for net '{net_name}' is not a finite quarter-circle");
+                    }
+                    let bisector = (start_vector.0 + end_vector.0, start_vector.1 + end_vector.1);
+                    let bisector_length = bisector.0.hypot(bisector.1);
+                    if bisector_length <= f64::EPSILON {
+                        bail!("SES qarc for net '{net_name}' has no unique midpoint");
+                    }
+                    let mid = (
+                        center.0 + start_radius * bisector.0 / bisector_length,
+                        center.1 + start_radius * bisector.1 / bisector_length,
+                    );
+                    let key = (
+                        net_name.to_string(),
+                        (*layer).to_string(),
+                        ordered_f64(width_mm),
+                        (ordered_f64(start.0), ordered_f64(start.1)),
+                        (ordered_f64(end.0), ordered_f64(end.1)),
+                        (ordered_f64(center.0), ordered_f64(center.1)),
+                    );
+                    if !seen_arcs.insert(key) {
+                        bail!("SES repeats an arc on net '{net_name}'");
+                    }
+                    arcs.push(SesArc {
+                        net_name: net_name.to_string(),
+                        layer: (*layer).to_string(),
+                        width_mm,
+                        start_x_mm: start.0,
+                        start_y_mm: start.1,
+                        mid_x_mm: mid.0,
+                        mid_y_mm: mid.1,
+                        end_x_mm: end.0,
+                        end_y_mm: end.1,
+                    });
                 }
-                tracks.push(SesTrack {
-                    net_name: net_name.to_string(),
-                    layer: (*layer).to_string(),
-                    width_mm,
-                    x1_mm,
-                    y1_mm,
-                    x2_mm,
-                    y2_mm,
-                });
+                _ => bail!("SES wire for net '{net_name}' must contain exactly one path or qarc"),
             }
         }
         for via_node in net_node.find_all("via") {
@@ -554,7 +649,7 @@ fn parse_network(
             });
         }
     }
-    Ok((tracks, vias))
+    Ok((tracks, arcs, vias))
 }
 
 fn parse_resolution(node: &SexpNode) -> Result<f64> {
@@ -771,12 +866,25 @@ mod tests {
         let plan = parse_import_plan(&board, &source, &manifest, sample_ses()).unwrap();
         assert_eq!(plan.tracks.len(), 2);
         assert_eq!(plan.vias.len(), 1);
+        assert!(plan.arcs.is_empty());
         assert_eq!(plan.tracks[0].width_mm, 0.25);
         assert_eq!(plan.tracks[0].x1_mm, 99.5);
         assert_eq!(plan.tracks[0].y1_mm, 50.0);
         assert_eq!(plan.vias[0].x_mm, 105.0);
         assert_eq!(plan.vias[0].y_mm, 51.0);
         assert_eq!(plan.vias[0].drill_mm, 0.3);
+    }
+
+    #[test]
+    fn freerouting_owned_ses_corpus_parses() {
+        let source = include_str!("../tests/fixtures/freerouting_issue368_no_gui_v2_3_0.ses");
+        let root = parse_sexp(source).unwrap();
+        require_head(&root, "session").unwrap();
+        assert_eq!(
+            atom(&root, 1, "session id").unwrap(),
+            "corney_island_wireless"
+        );
+        assert_eq!(one_child(&root, "routes").unwrap().head(), Some("routes"));
     }
 
     #[test]
@@ -800,15 +908,28 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_route_syntax_is_refused() {
+    fn quarter_arc_lowers_to_kicad_start_mid_end() {
         let (_dir, board, source, manifest) = fixture();
         let ses = sample_ses().replace(
             "(wire (path F.Cu 2500",
-            "(wire (qarc F.Cu 2500 0 0 1 1) (path F.Cu 2500",
+            "(wire (qarc F.Cu 2500 995000 -500000 1000000 -495000 1000000 -500000)) (wire (path F.Cu 2500",
+        );
+        let plan = parse_import_plan(&board, &source, &manifest, &ses).unwrap();
+        assert_eq!(plan.arcs.len(), 1);
+        assert_eq!(plan.arcs[0].mid_x_mm, 99.64644660940672);
+        assert_eq!(plan.arcs[0].mid_y_mm, 49.64644660940672);
+    }
+
+    #[test]
+    fn mixed_path_and_qarc_wire_is_refused() {
+        let (_dir, board, source, manifest) = fixture();
+        let ses = sample_ses().replace(
+            "(wire (path F.Cu 2500",
+            "(wire (qarc F.Cu 2500 995000 -500000 1000000 -495000 1000000 -500000) (path F.Cu 2500",
         );
         let error = parse_import_plan(&board, &source, &manifest, &ses)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("qarc"), "{error}");
+        assert!(error.contains("exactly one path or qarc"), "{error}");
     }
 }

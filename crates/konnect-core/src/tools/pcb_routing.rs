@@ -131,10 +131,10 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Open source .kicad_pcb used for the DSN export" },
-                    "ses": { "type": "string", "description": "Freerouting .ses result" },
-                    "manifest": { "type": "string", "description": "Konnect reverse manifest written with the DSN" }
+                    "ses_path": { "type": "string", "description": "Freerouting .ses result" },
+                    "manifest_path": { "type": "string", "description": "Konnect reverse manifest written with the DSN" }
                 },
-                "required": ["board", "ses", "manifest"]
+                "required": ["board", "ses_path", "manifest_path"]
             }),
             |args, ctx| async move { handle_plan_specctra_ses_import(args, ctx).await }
         ),
@@ -145,11 +145,11 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Open source .kicad_pcb used for the DSN export" },
-                    "ses": { "type": "string", "description": "Freerouting .ses result" },
-                    "manifest": { "type": "string", "description": "Konnect reverse manifest written with the DSN" },
-                    "candidate_output": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced." }
+                    "ses_path": { "type": "string", "description": "Freerouting .ses result" },
+                    "manifest_path": { "type": "string", "description": "Konnect reverse manifest written with the DSN" },
+                    "candidate_output_path": { "type": "string", "description": "New .kicad_pcb path. Existing files are never replaced." }
                 },
-                "required": ["board", "ses", "manifest", "candidate_output"]
+                "required": ["board", "ses_path", "manifest_path", "candidate_output_path"]
             }),
             |args, ctx| async move { handle_apply_specctra_ses(args, ctx).await }
         ),
@@ -561,17 +561,17 @@ fn invalid_specctra_argument(name: &str, reason: &str) -> CallToolResult {
 async fn read_specctra_inputs(
     args: &serde_json::Value,
 ) -> anyhow::Result<Result<(std::path::PathBuf, String, String), CallToolResult>> {
-    let ses_path = get_path(args, "ses")?;
-    let manifest_path = get_path(args, "manifest")?;
+    let ses_path = get_path(args, "ses_path")?;
+    let manifest_path = get_path(args, "manifest_path")?;
     if !extension_is(&ses_path, "ses") {
         return Ok(Err(invalid_specctra_argument(
-            "ses",
+            "ses_path",
             "must have the .ses extension",
         )));
     }
     if !manifest_path.is_file() {
         return Ok(Err(invalid_specctra_argument(
-            "manifest",
+            "manifest_path",
             "must name an existing reverse-manifest JSON file",
         )));
     }
@@ -624,8 +624,10 @@ async fn handle_plan_specctra_ses_import(
             "source_sha256": plan.source_sha256,
             "session_id": plan.session_id,
             "track_count": plan.tracks.len(),
+            "arc_count": plan.arcs.len(),
             "via_count": plan.vias.len(),
             "tracks": plan.tracks,
+            "arcs": plan.arcs,
             "vias": plan.vias,
             "mutated": false
         }))),
@@ -643,6 +645,7 @@ struct ApplyEvidence {
     source_sha256: String,
     session_id: String,
     track_count: usize,
+    arc_count: usize,
     via_count: usize,
     created_count: usize,
     drc_violations: usize,
@@ -655,7 +658,7 @@ async fn handle_apply_specctra_ses(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let candidate = get_path(args, "candidate_output")?;
+    let candidate = get_path(args, "candidate_output_path")?;
     if !extension_is(&board, "kicad_pcb") {
         return Ok(invalid_specctra_argument(
             "board",
@@ -664,7 +667,7 @@ async fn handle_apply_specctra_ses(
     }
     if !extension_is(&candidate, "kicad_pcb") {
         return Ok(invalid_specctra_argument(
-            "candidate_output",
+            "candidate_output_path",
             "must have the .kicad_pcb extension",
         ));
     }
@@ -729,8 +732,9 @@ async fn handle_apply_specctra_ses(
 
         use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as ObjectType;
         let existing_tracks = client.get_items_in(document.clone(), ObjectType::KotPcbTrace)?;
+        let existing_arcs = client.get_items_in(document.clone(), ObjectType::KotPcbArc)?;
         let existing_vias = client.get_items_in(document.clone(), ObjectType::KotPcbVia)?;
-        if !existing_tracks.is_empty() || !existing_vias.is_empty() {
+        if !existing_tracks.is_empty() || !existing_arcs.is_empty() || !existing_vias.is_empty() {
             anyhow::bail!(
                 "live board contains routing even though the bound export profile did not"
             );
@@ -740,7 +744,7 @@ async fn handle_apply_specctra_ses(
             .into_iter()
             .map(|net| (net.name, net.netcode))
             .collect::<BTreeMap<_, _>>();
-        let mut items = Vec::with_capacity(plan.tracks.len() + plan.vias.len());
+        let mut items = Vec::with_capacity(plan.tracks.len() + plan.arcs.len() + plan.vias.len());
         for track in &plan.tracks {
             konnect_ipc::builders::try_layer_from_name(&track.layer)?;
             let net_code = *net_codes
@@ -760,6 +764,18 @@ async fn handle_apply_specctra_ses(
                 &item,
                 "kiapi.board.types.Track",
             ));
+        }
+        for arc in &plan.arcs {
+            konnect_ipc::builders::try_layer_from_name(&arc.layer)?;
+            let net_code = *net_codes
+                .get(&arc.net_name)
+                .with_context(|| format!("live board has no net '{}'", arc.net_name))?;
+            let item = konnect_ipc::builders::build_track_arc(
+                &arc.net_name, net_code, &arc.layer, arc.width_mm,
+                arc.start_x_mm, arc.start_y_mm, arc.mid_x_mm, arc.mid_y_mm,
+                arc.end_x_mm, arc.end_y_mm,
+            );
+            items.push(konnect_ipc::builders::pack_any(&item, "kiapi.board.types.Arc"));
         }
         for via in &plan.vias {
             let net_code = *net_codes
@@ -794,14 +810,16 @@ async fn handle_apply_specctra_ses(
                 );
             }
             let read_tracks = client.get_items_in(document.clone(), ObjectType::KotPcbTrace)?;
+            let read_arcs = client.get_items_in(document.clone(), ObjectType::KotPcbArc)?;
             let read_vias = client.get_items_in(document.clone(), ObjectType::KotPcbVia)?;
-            if read_tracks.len() != plan.tracks.len() || read_vias.len() != plan.vias.len() {
+            if read_tracks.len() != plan.tracks.len()
+                || read_arcs.len() != plan.arcs.len()
+                || read_vias.len() != plan.vias.len()
+            {
                 anyhow::bail!(
-                    "IPC read-back mismatch: planned {} tracks/{} vias, read {} tracks/{} vias",
-                    plan.tracks.len(),
-                    plan.vias.len(),
-                    read_tracks.len(),
-                    read_vias.len()
+                    "IPC read-back mismatch: planned {} tracks/{} arcs/{} vias, read {} tracks/{} arcs/{} vias",
+                    plan.tracks.len(), plan.arcs.len(), plan.vias.len(),
+                    read_tracks.len(), read_arcs.len(), read_vias.len()
                 );
             }
             let candidate_source = client.save_document_to_string_in(document.clone())?;
@@ -821,6 +839,7 @@ async fn handle_apply_specctra_ses(
                 source_sha256: plan.source_sha256.clone(),
                 session_id: plan.session_id.clone(),
                 track_count: read_tracks.len(),
+                arc_count: read_arcs.len(),
                 via_count: read_vias.len(),
                 created_count: created.len(),
                 drc_violations: drc.violations.len(),
@@ -858,12 +877,13 @@ async fn handle_apply_specctra_ses(
             "success": true,
             "method": "strict_atomic_kicad_ipc_import",
             "board": board,
-            "candidate_output": candidate,
+            "candidate_output_path": candidate,
             "source_overwritten": false,
             "undo_description": "Import Freerouting SES",
             "source_sha256": evidence.source_sha256,
             "session_id": evidence.session_id,
             "track_count": evidence.track_count,
+            "arc_count": evidence.arc_count,
             "via_count": evidence.via_count,
             "created_count": evidence.created_count,
             "ipc_readback": "exact_count_match",

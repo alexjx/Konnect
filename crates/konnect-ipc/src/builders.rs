@@ -213,6 +213,32 @@ pub fn build_track(
     }
 }
 
+/// Build an arc-shaped copper track from KiCad's native start/mid/end form.
+#[allow(clippy::too_many_arguments)]
+pub fn build_track_arc(
+    net_name: &str,
+    net_code: i32,
+    layer: &str,
+    width_mm: f64,
+    start_x: f64,
+    start_y: f64,
+    mid_x: f64,
+    mid_y: f64,
+    end_x: f64,
+    end_y: f64,
+) -> kiapi::board::types::Arc {
+    kiapi::board::types::Arc {
+        id: None,
+        start: Some(vec2(start_x, start_y)),
+        mid: Some(vec2(mid_x, mid_y)),
+        end: Some(vec2(end_x, end_y)),
+        width: Some(distance(width_mm)),
+        locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+        layer: layer_from_name(layer) as i32,
+        net: Some(net(net_name, net_code)),
+    }
+}
+
 /// Build a through-via `Via` protobuf message (F.Cu → B.Cu).
 ///
 /// Mirrors [`build_track`]: the caller `pack_any`s the result and hands it to
@@ -937,6 +963,17 @@ pub(crate) mod tests {
         let error = try_layer_from_name("Not.A.Layer").expect_err("must refuse");
         let message = format!("{error:#}");
         assert!(message.contains("Not.A.Layer"), "{message}");
+    }
+
+    #[test]
+    fn track_arc_carries_route_geometry_layer_width_and_net() {
+        let arc = build_track_arc("GND", 3, "B.Cu", 0.25, 10.0, 20.0, 11.0, 21.0, 12.0, 20.0);
+        assert_eq!(arc.start.unwrap().x_nm, 10_000_000);
+        assert_eq!(arc.mid.unwrap().y_nm, 21_000_000);
+        assert_eq!(arc.end.unwrap().x_nm, 12_000_000);
+        assert_eq!(arc.width.unwrap().value_nm, 250_000);
+        assert_eq!(arc.layer, kiapi::board::types::BoardLayer::BlBCu as i32);
+        assert_eq!(arc.net.unwrap().name, "GND");
     }
 
     #[test]
