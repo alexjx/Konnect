@@ -991,6 +991,14 @@ mod tests {
         assert_eq!(manifest["components"][0]["side"], "front");
     }
 
+    #[test]
+    fn freerouting_owned_dsn_corpus_parses() {
+        let source = include_str!("../tests/fixtures/freerouting_issue269_minimal_v2_3_0.dsn");
+        let mut tokenizer = ListTokenizer::new(BufReader::new(Cursor::new(source.as_bytes())));
+        dsn::DsnFile::read_dsn(&mut tokenizer)
+            .expect("Freerouting v2.3.0 corpus fixture must remain parseable");
+    }
+
     /// Optional local parity check against the Freerouting engine. CI does not
     /// install Java or Freerouting; maintainers can opt in with
     /// `FREEROUTING_JAR=/path/to/freerouting.jar cargo test -p konnect-core

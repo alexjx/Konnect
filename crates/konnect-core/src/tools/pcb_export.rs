@@ -285,7 +285,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "New .dsn file path. Existing files are never replaced."
                     },
-                    "manifest_output": {
+                    "manifest_output_path": {
                         "type": "string",
                         "description": "Optional new reverse-manifest JSON path. Defaults to <output>.konnect.json. Existing files are never replaced."
                     }
@@ -704,7 +704,7 @@ async fn handle_export_specctra_dsn(
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let output_path = get_path(args, "output")?;
-    let manifest_output_path = args["manifest_output"]
+    let manifest_output_path = args["manifest_output_path"]
         .as_str()
         .map(PathBuf::from)
         .unwrap_or_else(|| default_specctra_manifest_path(&output_path));
@@ -723,7 +723,7 @@ async fn handle_export_specctra_dsn(
     }
     if output_path == manifest_output_path {
         return Ok(invalid_export_argument(
-            "manifest_output",
+            "manifest_output_path",
             "must not name the DSN output path",
         ));
     }
@@ -805,13 +805,19 @@ async fn handle_export_specctra_dsn(
             "method": "kicad_ipc_snapshot",
             "board": board_path,
             "output": output_path,
-            "manifest_output": manifest_output_path,
+            "manifest_output_path": manifest_output_path,
             "source_sha256": export.source_sha256,
             "component_count": export.component_count,
             "pad_count": export.pad_count,
             "net_count": export.net_count,
             "routing_class_count": export.class_count,
-            "supported_profile": "two_layer_front_side_circle_rect_no_existing_routing_or_zones"
+            "capabilities": {
+                "dsn_export_available": true,
+                "ses_import_available": false,
+                "freerouting_bridge_available": false,
+                "source_revision_bound": true,
+                "supported_profile": "two_layer_front_side_circle_rect_no_existing_routing_or_zones"
+            }
         })
         .to_string(),
     ))
