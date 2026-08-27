@@ -78,7 +78,7 @@ checks that the native DSN has the same components, pads, nets, layers, and
 routing rules, and writes the revision-bound reverse manifest. The temporary
 file is consumed and deleted.
 
-The `native_bridge` tool argument controls selection: `prefer` (the default)
+The `native_bridge_mode` tool argument controls selection: `prefer` (the default)
 uses a running bridge and otherwise falls back to the Rust DSN exporter,
 `require` fails if native export cannot be used, and `disable` uses Rust only.
 Native export is disabled in the plugin settings by default. This bridge is a

@@ -292,7 +292,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Optional new reverse-manifest JSON path. Defaults to <output>.konnect.json. Existing files are never replaced."
                     },
-                    "native_bridge": {
+                    "native_bridge_mode": {
                         "type": "string",
                         "enum": ["prefer", "require", "disable"],
                         "default": "prefer",
@@ -717,7 +717,7 @@ async fn handle_export_specctra_dsn(
         .as_str()
         .map(PathBuf::from)
         .unwrap_or_else(|| default_specctra_manifest_path(&output_path));
-    let native_bridge_mode = args["native_bridge"].as_str().unwrap_or("prefer");
+    let native_bridge_mode = args["native_bridge_mode"].as_str().unwrap_or("prefer");
 
     if !extension_is(&board_path, "kicad_pcb") {
         return Ok(invalid_export_argument(
@@ -739,7 +739,7 @@ async fn handle_export_specctra_dsn(
     }
     if !matches!(native_bridge_mode, "prefer" | "require" | "disable") {
         return Ok(invalid_export_argument(
-            "native_bridge",
+            "native_bridge_mode",
             "must be 'prefer', 'require', or 'disable'",
         ));
     }
