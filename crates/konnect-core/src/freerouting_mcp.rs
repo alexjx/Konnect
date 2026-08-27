@@ -7,7 +7,7 @@
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -50,6 +50,7 @@ pub(crate) struct RouteEvidence {
     pub elapsed_seconds: f64,
     pub ses_bytes: u64,
     pub server_protocol_version: String,
+    pub diagnostics_path: Option<String>,
 }
 
 pub(crate) async fn route_local(
@@ -89,6 +90,7 @@ pub(crate) async fn route_local(
         )
     })?;
     let diagnostics = client.close().await;
+    let diagnostics_path = write_diagnostics(ses_output, &diagnostics).await?;
 
     let result = match route_result {
         Ok(evidence) => Ok(evidence),
@@ -103,7 +105,6 @@ pub(crate) async fn route_local(
     let evidence = match result {
         Ok(evidence) => evidence,
         Err(error) => {
-            let _ = tokio::fs::remove_file(&temporary).await;
             return Err(error);
         }
     };
@@ -133,8 +134,25 @@ pub(crate) async fn route_local(
         .with_context(|| format!("remove temporary SES {}", temporary.display()))?;
     Ok(RouteEvidence {
         ses_bytes: metadata.len(),
+        diagnostics_path,
         ..evidence
     })
+}
+
+async fn write_diagnostics(output: &Path, diagnostics: &str) -> Result<Option<String>> {
+    if diagnostics.is_empty() {
+        return Ok(None);
+    }
+    let path = output.with_extension("freerouting.log");
+    if path.exists() {
+        bail!(
+            "Freerouting diagnostics output already exists: {}",
+            path.display()
+        );
+    }
+    konnect_sexp::write_new_atomic(&path, diagnostics)
+        .with_context(|| format!("create Freerouting diagnostics {}", path.display()))?;
+    Ok(Some(path.display().to_string()))
 }
 
 fn validate_inputs(
@@ -187,9 +205,10 @@ async fn run_state_machine(
     started: Instant,
 ) -> Result<RouteEvidence> {
     let tools = client.list_tools().await?;
+    validate_tool_contracts(&tools)?;
     let missing = REQUIRED_TOOLS
         .iter()
-        .filter(|name| !tools.contains(**name))
+        .filter(|name| !tools.contains_key(**name))
         .copied()
         .collect::<Vec<_>>();
     if !missing.is_empty() {
@@ -229,7 +248,7 @@ async fn run_state_machine(
         );
     }
     if !job_settings.is_empty() {
-        if !tools.contains("update_job_settings") {
+        if !tools.contains_key("update_job_settings") {
             bail!("Freerouting MCP does not expose update_job_settings");
         }
         client
@@ -273,7 +292,69 @@ async fn run_state_machine(
         elapsed_seconds: started.elapsed().as_secs_f64(),
         ses_bytes: 0,
         server_protocol_version: client.server_protocol_version.clone(),
+        diagnostics_path: None,
     })
+}
+
+fn validate_tool_contracts(tools: &BTreeMap<String, Value>) -> Result<()> {
+    for (tool, paths) in [
+        ("enqueue_job", &[(&["body", "session_id"][..], false)][..]),
+        (
+            "upload_job_input_from_local_file",
+            &[(&["jobId"][..], true), (&["filePath"][..], true)][..],
+        ),
+        ("start_job", &[(&["path", "jobId"][..], true)][..]),
+        ("get_job_details", &[(&["path", "jobId"][..], true)][..]),
+        (
+            "download_job_output_to_local_file",
+            &[(&["jobId"][..], true), (&["filePath"][..], true)][..],
+        ),
+    ] {
+        let schema = tools
+            .get(tool)
+            .with_context(|| format!("Freerouting MCP is missing required tool '{tool}'"))?;
+        for (path, leaf_must_be_required) in paths {
+            require_schema_path(tool, schema, path, *leaf_must_be_required)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_schema_path(
+    tool: &str,
+    schema: &Value,
+    path: &[&str],
+    leaf_must_be_required: bool,
+) -> Result<()> {
+    let mut current = schema;
+    for (index, key) in path.iter().enumerate() {
+        if current.get("type").and_then(Value::as_str) != Some("object") {
+            bail!(
+                "Freerouting MCP tool '{tool}' has an incompatible input schema at '{}'",
+                path.join(".")
+            );
+        }
+        let required = current
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(key)));
+        if !required && (index + 1 < path.len() || leaf_must_be_required) {
+            bail!(
+                "Freerouting MCP tool '{tool}' does not require argument '{}'",
+                path.join(".")
+            );
+        }
+        current = current
+            .get("properties")
+            .and_then(|properties| properties.get(*key))
+            .with_context(|| {
+                format!(
+                    "Freerouting MCP tool '{tool}' has no argument '{}'",
+                    path.join(".")
+                )
+            })?;
+    }
+    Ok(())
 }
 
 struct LocalMcpClient {
@@ -354,7 +435,7 @@ impl LocalMcpClient {
         Ok(client)
     }
 
-    async fn list_tools(&mut self) -> Result<BTreeSet<String>> {
+    async fn list_tools(&mut self) -> Result<BTreeMap<String, Value>> {
         let result = self
             .request("tools/list", json!({}), REQUEST_TIMEOUT)
             .await?;
@@ -365,10 +446,16 @@ impl LocalMcpClient {
         tools
             .iter()
             .map(|tool| {
-                tool.get("name")
+                let name = tool
+                    .get("name")
                     .and_then(Value::as_str)
                     .map(str::to_string)
-                    .context("Freerouting tools/list contains an unnamed tool")
+                    .context("Freerouting tools/list contains an unnamed tool")?;
+                let schema = tool
+                    .get("inputSchema")
+                    .cloned()
+                    .context("Freerouting tools/list contains a tool without inputSchema")?;
+                Ok((name, schema))
             })
             .collect()
     }
@@ -597,6 +684,54 @@ mod tests {
         assert_eq!(first.parent(), output.parent());
         assert_ne!(first, second);
         assert!(extension_is(&first, "ses"));
+    }
+
+    #[test]
+    fn required_tool_schema_drift_is_refused_before_routing() {
+        let object = |properties: Value, required: Value| json!({ "type": "object", "properties": properties, "required": required });
+        let mut tools = BTreeMap::new();
+        tools.insert("enqueue_job".into(), object(json!({"body": object(json!({"session_id": {"type":"string"}}), json!(["session_id"]))}), json!(["body"])));
+        tools.insert(
+            "upload_job_input_from_local_file".into(),
+            object(
+                json!({"jobId":{"type":"string"},"filePath":{"type":"string"}}),
+                json!(["jobId", "filePath"]),
+            ),
+        );
+        tools.insert(
+            "start_job".into(),
+            object(
+                json!({"path": object(json!({"jobId":{"type":"string"}}), json!(["jobId"]))}),
+                json!(["path"]),
+            ),
+        );
+        tools.insert("get_job_details".into(), tools["start_job"].clone());
+        tools.insert(
+            "download_job_output_to_local_file".into(),
+            tools["upload_job_input_from_local_file"].clone(),
+        );
+        validate_tool_contracts(&tools).unwrap();
+
+        tools.get_mut("start_job").unwrap()["properties"]["path"]["required"] = json!([]);
+        let error = validate_tool_contracts(&tools).unwrap_err().to_string();
+        assert!(
+            error.contains("start_job") && error.contains("path.jobId"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_diagnostics_are_preserved_beside_the_requested_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("board.ses");
+        let path = write_diagnostics(&output, "router failed at pass 3")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "router failed at pass 3"
+        );
     }
 
     /// Optional local parity check for Freerouting's actual stdio MCP state
