@@ -39,6 +39,10 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 
 ## Component Placement
 
+Read [`references/common-lib-ids.md`](references/common-lib-ids.md) when choosing
+a common generic KiCad symbol. It is a quick-start index, not an allowlist;
+search the active libraries when the required part is absent or package-specific.
+
 ### Workflow
 
 1. Search the library first: use `search_symbols` to find the correct lib_id
@@ -88,6 +92,11 @@ Power symbols: GND uses 0 (arrow points down), VCC/VDD/+3V3/+5V use 0 (arrow poi
 ---
 
 ## Wiring
+
+Read [`references/wiring-patterns.md`](references/wiring-patterns.md) when
+choosing between direct wires and labels or when building one of its common
+subcircuits. Verify every named pin against the placed symbol before applying a
+pattern.
 
 ### Connection Methods — Decision Table
 

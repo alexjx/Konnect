@@ -2,6 +2,10 @@
 name: kicad-design-review-agent
 description: "Performs a thorough hardware design review of a KiCAD project. Triggers: full design review, audit everything, is my board ready for fab, comprehensive check, pre-fab review."
 model: sonnet
+skills:
+  - konnect
+  - kicad-review
+  - kicad-manufacture
 tools:
   - mcp__konnect__*
 maxTurns: 25

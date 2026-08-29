@@ -50,6 +50,15 @@ A weaker finding may ask a question; it does not override stronger contradictory
 evidence. Any required check that did not run, returned impossible coverage, or
 remains inconsistent with stronger evidence makes the verdict `INCOMPLETE`.
 
+## References by review branch
+
+- Read [`references/design-checklist.md`](references/design-checklist.md) for a
+  comprehensive or pre-fabrication review. Mark an item only from evidence
+  collected in this run.
+- Read [`references/error-taxonomy.md`](references/error-taxonomy.md) when
+  classifying a finding or assigning the final verdict. Direct ERC, DRC, and
+  connectivity evidence outrank heuristic classifications.
+
 ---
 
 ## Quick Checks (Escalating Severity)
