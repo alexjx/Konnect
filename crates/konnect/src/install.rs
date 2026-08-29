@@ -756,6 +756,13 @@ mod tests {
             registered.get("route_trace"),
             Some(&konnect_core::tools::BoardAccess::LiveOnly)
         );
+        for tool_name in ["plan_specctra_ses_import", "apply_specctra_ses"] {
+            assert_eq!(
+                registered.get(tool_name),
+                Some(&konnect_core::tools::BoardAccess::LiveOnly),
+                "{tool_name} must remain in the live-only Claude hook class"
+            );
+        }
         assert_eq!(
             registered.get("place_component"),
             Some(&konnect_core::tools::BoardAccess::LivePreferredWithFallback)

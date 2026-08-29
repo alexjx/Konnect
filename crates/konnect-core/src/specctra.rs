@@ -1008,10 +1008,12 @@ mod tests {
     fn freerouting_accepts_exported_fixture() {
         let jar = std::env::var_os("FREEROUTING_JAR").expect("set FREEROUTING_JAR");
         let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
-        let export = export_dsn(Path::new("board.kicad_pcb"), source, &rules()).unwrap();
         let temp = tempfile::tempdir().expect("tempdir");
+        let board_path = temp.path().join("board.kicad_pcb");
         let dsn_path = temp.path().join("board.dsn");
         let ses_path = temp.path().join("board.ses");
+        std::fs::write(&board_path, source).expect("write board fixture");
+        let export = export_dsn(&board_path, source, &rules()).unwrap();
         std::fs::write(&dsn_path, export.dsn).expect("write DSN");
 
         let output = std::process::Command::new("java")
@@ -1038,6 +1040,9 @@ mod tests {
                 .unwrap_or(false),
             "Freerouting did not produce a non-empty SES"
         );
+        let ses = std::fs::read_to_string(&ses_path).expect("read Freerouting SES");
+        crate::specctra_ses::parse_import_plan(&board_path, source, &export.manifest, &ses)
+            .expect("Freerouting SES must pass Konnect's strict import planner");
     }
 
     #[test]
