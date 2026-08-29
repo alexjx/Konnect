@@ -74,18 +74,31 @@ names the layer and the item.
 `Connector:BJB_Pico_46.110.1001_Receptacle_Horizontal` can kill KiCAD outright.
 Update to v0.6.1 or later.
 
-## A closed-board edit landed after KiCAD crashed
+## `unsafe_file_fallback` after KiCad disappears
 
-`place_component`, `move_component` and `rotate_component` edit the board file
-directly when the IPC transport is unreachable, which is safe when KiCAD was
-never running.
+Konnect remembers each board it positively observes open through IPC during the
+current server process. If IPC later becomes unreachable, a board-file mutation
+for that same board fails with `error.kind: "unsafe_file_fallback"` instead of
+editing the saved file. KiCad may have crashed or been force-quit with unsaved
+state, so the saved `.kicad_pcb` is not known to be authoritative. The error
+confirms that Konnect left it unchanged
+([#240](https://github.com/mixelpixx/Konnect/issues/240)).
 
-They cannot currently tell that from "KiCAD died a second ago holding this
-board" — the transport looks identical
-([#240](https://github.com/mixelpixx/Konnect/issues/240)). If KiCAD crashes or
-is force-quit mid-session, the next such call may edit the file behind it and
-report success. Reopen the board and check before continuing, and prefer
-reopening KiCAD first.
+Recover deliberately:
+
+1. Reopen or recover the board in KiCad.
+2. Reconcile any recovered/unsaved work and save the authoritative board.
+3. Continue through live IPC.
+
+If KiCad was intentionally closed cleanly and closed-board mode is desired,
+first confirm that the saved file is authoritative, then restart Konnect to
+begin a new server session. Repeating the tool call does not clear the safety
+memory, and an agent must not restart Konnect or edit `.kicad_pcb` directly to
+bypass the refusal.
+
+This memory is intentionally process-local. It cannot detect a KiCad crash that
+happened before the current Konnect process started. File-fallback success
+therefore carries a warning describing that cold-start limitation.
 
 ## An older schematic-to-PCB sync left extra unnamed pads
 

@@ -51,6 +51,9 @@ pub enum ToolErrorKind {
     FileNotFound { path: String },
     /// A mutation would replace one or more existing filesystem targets.
     Conflict { paths: Vec<String> },
+    /// A board was live earlier in this server process, but IPC is now gone;
+    /// its saved file may be stale relative to lost editor state.
+    UnsafeFileFallback { path: String },
     /// Catch-all for handler `anyhow::Error` that hasn't been migrated yet.
     /// Eventually each variant above subsumes a subset of these.
     HandlerError { reason: String },
@@ -67,6 +70,7 @@ impl ToolErrorKind {
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::FileNotFound { .. } => "file_not_found",
             Self::Conflict { .. } => "conflict",
+            Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::HandlerError { .. } => "handler_error",
         }
     }
@@ -166,6 +170,7 @@ mod tests {
             ToolErrorKind::Conflict {
                 paths: vec!["p".into()],
             },
+            ToolErrorKind::UnsafeFileFallback { path: "p".into() },
             ToolErrorKind::HandlerError { reason: "r".into() },
         ];
         for kind in kinds {

@@ -1,5 +1,17 @@
 # Common KiCAD Library Identifiers
 
+This is a non-exhaustive shortcut for common generic symbols, **not an allowlist**
+and not evidence that a symbol matches a manufacturer package. Verify every ID
+against the active KiCad libraries with `search_symbols` and inspect pins with
+`get_symbol_info`. If the required part is absent or uncertain, search rather
+than choosing the nearest name.
+
+Keep personal or project favorites in the user's/project's preference overlay,
+not in this shared upstream cache. For manufacturer-specific ICs, discrete
+semiconductors, connectors, displays, tubes, sockets, and other
+package-sensitive parts, the exact MPN/package datasheet and the
+`kicad-library` physical pin-map acceptance contract outrank this list.
+
 ## Passive Components (Device library)
 | lib_id | Description | Reference prefix |
 |--------|-------------|-----------------|

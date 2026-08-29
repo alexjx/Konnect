@@ -643,7 +643,7 @@ async fn handle_set_predefined_sizes(
     }
 
     if let Some(refusal) = crate::tools::pcb_board::refuse_if_board_open_in_kicad(
-        ctx.config.ipc_address.clone(),
+        ctx,
         &board,
         "Pre-defined Sizes list",
     )

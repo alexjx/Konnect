@@ -196,6 +196,7 @@ pub(crate) fn tool() -> ToolDef {
         }),
         |args, ctx| async move { handle_update_footprints_from_library(args, ctx).await }
     )
+    .with_board_access(crate::tools::BoardAccess::LiveOnly)
 }
 
 pub(crate) async fn handle_update_footprints_from_library(
@@ -245,7 +246,7 @@ pub(crate) async fn handle_update_footprints_from_library(
         "footprint library update apply"
     };
     let result = attempt_ipc_write(
-        ctx.config.ipc_address.clone(),
+        ctx,
         &board_path,
         operation,
         move |client| {
