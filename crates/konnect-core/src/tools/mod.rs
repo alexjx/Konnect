@@ -1,5 +1,6 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
+mod board_session;
 pub mod cli;
 pub mod config;
 pub mod design_review;
@@ -57,9 +58,37 @@ pub struct ToolDef {
     pub description: &'static str,
     pub input_schema: Value,
     pub handler: ToolHandlerFn,
+    /// How the tool interacts with a board held by KiCad. Client guidance can
+    /// derive warnings from this runtime contract instead of maintaining a
+    /// second list of tool names.
+    pub board_access: BoardAccess,
+}
+
+/// The board-state contract of a tool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BoardAccess {
+    /// The tool does not need board-state guidance.
+    #[default]
+    None,
+    /// The requested board must be open in a reachable KiCad instance.
+    LiveOnly,
+    /// Live IPC is preferred, with a guarded file fallback only when KiCad is
+    /// unreachable and the board is safe to edit offline.
+    LivePreferredWithFallback,
+    /// The operation writes the file directly and therefore requires KiCad to
+    /// have the board closed.
+    ClosedBoardOnly,
+    /// Planning is non-mutating, while applying has a stricter board-state
+    /// requirement described by the tool itself.
+    ApplyModeDependent,
 }
 
 impl ToolDef {
+    pub fn with_board_access(mut self, board_access: BoardAccess) -> Self {
+        self.board_access = board_access;
+        self
+    }
+
     pub fn to_mcp_description(&self) -> McpToolDescription {
         McpToolDescription {
             name: self.name.to_string(),
@@ -90,6 +119,9 @@ pub struct ToolContext {
     pub observer: crate::observability::CallObserver,
     /// In-memory TTL cache for repeated JLCPCB parts-database queries.
     pub jlcpcb_cache: QueryCache,
+    /// Boards positively observed open through IPC during this server process.
+    /// Sticky state prevents an unsafe file fallback after KiCad disappears.
+    pub(crate) board_session: board_session::BoardSessionMemory,
 }
 
 impl ToolContext {
@@ -101,6 +133,7 @@ impl ToolContext {
             router,
             observer: crate::observability::CallObserver::new(None),
             jlcpcb_cache: QueryCache::default(),
+            board_session: board_session::BoardSessionMemory::default(),
         }
     }
 
@@ -116,6 +149,7 @@ impl ToolContext {
             router,
             observer,
             jlcpcb_cache: QueryCache::default(),
+            board_session: board_session::BoardSessionMemory::default(),
         }
     }
 }
@@ -256,6 +290,7 @@ macro_rules! tool {
             description: $desc,
             input_schema: $schema,
             handler: h,
+            board_access: $crate::tools::BoardAccess::None,
         }
     }};
 }
@@ -287,6 +322,30 @@ where
         Ok(result) => Ok(result),
         Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
     }
+}
+
+/// Run a board-targeted IPC call and remember the requested board as soon as
+/// KiCad positively identifies it. Observation happens before `f`, so a later
+/// command rejection, timeout, or editor crash cannot make the next file
+/// fallback treat this board as never having been live.
+pub(crate) async fn with_board_ipc_classified<T, F>(
+    ctx: &ToolContext,
+    board_path: &std::path::Path,
+    f: F,
+) -> anyhow::Result<Result<T, konnect_ipc::IpcFailure>>
+where
+    T: Send + 'static,
+    F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
+{
+    let requested = board_path.to_path_buf();
+    let observation = requested.clone();
+    let memory = ctx.board_session.clone();
+    with_ipc_classified(ctx.config.ipc_address.clone(), move |client| {
+        client.ensure_board_is_active(&requested)?;
+        memory.observe_live(&observation);
+        f(client)
+    })
+    .await
 }
 
 // ─── Argument helpers ─────────────────────────────────────────────────────────

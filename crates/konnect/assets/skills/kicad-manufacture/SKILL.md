@@ -33,6 +33,14 @@ load_toolset('pcb_export')       # export_3d for visual verification
 
 Always call `get_active_toolsets()` first to see what is already loaded.
 
+### References by manufacturing branch
+
+- Read [`references/gerber-layers.md`](references/gerber-layers.md) when
+  selecting manual plot layers or checking the generated artifact inventory.
+- Read [`references/jlcpcb-rules.md`](references/jlcpcb-rules.md) only when
+  JLCPCB is the selected fabricator or assembler. Verify time-sensitive limits,
+  field names, pricing, and part categories against the current order contract.
+
 ---
 
 ## Pre-Flight Checklist

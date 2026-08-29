@@ -74,7 +74,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "ic_reference"]
             }),
             |args, ctx| async move { handle_place_decoupling(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
         tool!(
             "plan_bga_fanout",
             "Plan a BGA fanout: outer-ring pads escape directly; each inner pad gets a via \
@@ -93,7 +94,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference"]
             }),
             |args, ctx| async move { handle_bga_fanout(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
         tool!(
             "auto_place_from_schematic",
             "Deterministic first placement: cluster footprints by shared nets (union-find), \
@@ -112,7 +114,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_auto_place(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
         tool!(
             "refine_placement_force_directed",
             "Refine placement with a deterministic spring embedder: shared nets pull \
@@ -133,7 +136,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_force_directed(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
     ]
 }
 
@@ -544,12 +548,9 @@ async fn handle_place_decoupling(
     }
 
     // Applying: never edit a board a live KiCad holds open.
-    if let Some(refusal) = super::pcb_board::refuse_if_board_open_in_kicad(
-        ctx.config.ipc_address.clone(),
-        &board,
-        "place_decoupling_caps",
-    )
-    .await?
+    if let Some(refusal) =
+        super::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "place_decoupling_caps")
+            .await?
     {
         return Ok(refusal);
     }
@@ -726,10 +727,7 @@ async fn handle_bga_fanout(
             )
         })
         .collect();
-    let addr = ctx.config.ipc_address.clone();
-    let requested_board = board.clone();
-    let created = match super::with_ipc_classified(addr, move |c| {
-        c.ensure_board_is_active(&requested_board)?;
+    let created = match super::with_board_ipc_classified(ctx, &board, move |c| {
         c.apply_fanout(
             &net_stubs,
             &via_list,
@@ -1006,12 +1004,9 @@ async fn handle_auto_place(
         })));
     }
 
-    if let Some(refusal) = super::pcb_board::refuse_if_board_open_in_kicad(
-        ctx.config.ipc_address.clone(),
-        &board,
-        "auto_place_from_schematic",
-    )
-    .await?
+    if let Some(refusal) =
+        super::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "auto_place_from_schematic")
+            .await?
     {
         return Ok(refusal);
     }
@@ -1326,7 +1321,7 @@ async fn handle_force_directed(
     }
 
     if let Some(refusal) = super::pcb_board::refuse_if_board_open_in_kicad(
-        ctx.config.ipc_address.clone(),
+        ctx,
         &board,
         "refine_placement_force_directed",
     )

@@ -36,6 +36,29 @@ load_toolset('pcb_routing')      # query_traces, get_nets_list
 
 Always call `get_active_toolsets()` first to see what is already loaded.
 
+## Evidence hierarchy
+
+Judge findings in this order:
+
+1. Exact design requirements and manufacturer datasheets.
+2. Direct KiCad ERC/DRC and saved or exported connectivity.
+3. Direct Konnect net, short, pad, trace, via, unrouted, and inventory evidence.
+4. Aggregate review and manufacturing summaries.
+5. Heuristic orphan, single-pin, decoupling, protection, and best-practice findings.
+
+A weaker finding may ask a question; it does not override stronger contradictory
+evidence. Any required check that did not run, returned impossible coverage, or
+remains inconsistent with stronger evidence makes the verdict `INCOMPLETE`.
+
+## References by review branch
+
+- Read [`references/design-checklist.md`](references/design-checklist.md) for a
+  comprehensive or pre-fabrication review. Mark an item only from evidence
+  collected in this run.
+- Read [`references/error-taxonomy.md`](references/error-taxonomy.md) when
+  classifying a finding or assigning the final verdict. Direct ERC, DRC, and
+  connectivity evidence outrank heuristic classifications.
+
 ---
 
 ## Quick Checks (Escalating Severity)
@@ -48,8 +71,9 @@ Run these first — they are fast and catch the most critical issues.
 find_orphan_items()
 ```
 
-Finds floating wires, labels, and symbols not connected to anything.
-These are almost always bugs (leftover from edits or incomplete wiring).
+Finds floating wires, labels, and symbols not connected to anything. Treat the
+result as a heuristic candidate list and corroborate it with direct connectivity
+or ERC before calling an item a defect.
 
 ### Level 2: Critical Net Issues
 
@@ -62,7 +86,8 @@ Detects nets that are connected together but should not be. A shorted net means:
 - Power rails bridged unintentionally
 - Signal nets merged by accident
 
-**This is always a critical error. Fix before proceeding.**
+A confirmed unintended short is critical. Resolve disagreement with requirements
+or direct ERC/connectivity evidence before assigning severity.
 
 ### Level 3: Suspicious Connections
 
@@ -70,7 +95,7 @@ Detects nets that are connected together but should not be. A shorted net means:
 find_single_pin_nets()
 ```
 
-A net with only one pin connected is almost always a mistake:
+A one-pin net is a heuristic review candidate:
 - Incomplete wiring (forgot to connect the other end)
 - Orphan net labels (typo in name, so it does not match)
 - Leftover stubs from deleted components
@@ -175,8 +200,9 @@ Checks:
 run_design_review()
 ```
 
-Runs ALL audits and checks in sequence, producing a consolidated report.
-Use this for a comprehensive pre-manufacturing review.
+Runs the aggregate design audits and produces a consolidated report. Use it to
+organize findings, not as a substitute for the direct ERC, DRC, and connectivity
+checks above.
 
 Read `status`, `coverage`, and `diagnostics` before interpreting the findings.
 If `status` is `partial` or `failed`, the verdict is `INCOMPLETE — review could
@@ -185,16 +211,9 @@ diagnostics and unevaluated coverage, and do not describe the design as ready,
 passing, clean, or looking good. Findings gathered before the coverage gap are
 still valid and should still be reported.
 
-Equivalent to running:
-1. find_orphan_items
-2. find_shorted_nets
-3. find_single_pin_nets
-4. run_erc
-5. get_drc_violations
-6. audit_decoupling
-7. audit_connections
-8. audit_power_rails
-9. audit_manufacturing
+Collect direct `run_erc`, `get_drc_violations`, short, and connectivity evidence
+separately. Then compare the aggregate findings with that stronger evidence and
+report any disagreement.
 
 ---
 
@@ -286,11 +305,13 @@ Present findings grouped by severity with actionable fix suggestions:
 ### Full Review (comprehensive)
 
 1. Load all review toolsets
-2. `run_design_review()` — full audit suite
-3. Check `status`, `coverage`, and `diagnostics`; never approve an incomplete review
-4. Classify all gathered findings by severity
-5. Present report with fix suggestions
-6. Offer to fix CRITICAL issues immediately
+2. Run direct short/connectivity checks, `run_erc`, and `get_drc_violations`
+3. `run_design_review()` — aggregate audit suite
+4. Check `status`, `coverage`, and `diagnostics`; never approve an incomplete review
+5. Reconcile aggregate or heuristic findings with stronger direct evidence
+6. Classify all gathered findings by severity
+7. Present report with fix suggestions
+8. Offer to fix CRITICAL issues immediately
 
 ### Pre-Manufacturing Review
 

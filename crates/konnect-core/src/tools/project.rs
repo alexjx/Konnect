@@ -313,12 +313,15 @@ async fn handle_open_project(
     };
     let (requested_path, requested_board, requested_open, requested_check_error) = match requested {
         Some((project_or_board, board)) if connected => match ipc.find_open_board(&board) {
-            Ok(_) => (
-                Some(project_or_board),
-                Some(board.display().to_string()),
-                Some(true),
-                None,
-            ),
+            Ok(_) => {
+                ctx.board_session.observe_live(&board);
+                (
+                    Some(project_or_board),
+                    Some(board.display().to_string()),
+                    Some(true),
+                    None,
+                )
+            }
             Err(error) => (
                 Some(project_or_board),
                 Some(board.display().to_string()),

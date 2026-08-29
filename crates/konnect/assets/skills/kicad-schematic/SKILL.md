@@ -21,6 +21,9 @@ Before any schematic work, load the required toolsets:
 ```
 load_toolset('sch_components')   # place, move, rotate, delete symbols
 load_toolset('sch_wiring')       # wires, net labels, power symbols, connections
+load_toolset('sch_analysis')     # connection validation, short and orphan checks
+load_toolset('sch_export')       # direct ERC and rendered schematic evidence
+load_toolset('project')          # save_project before formal checks
 ```
 
 Load additional toolsets as needed:
@@ -28,7 +31,6 @@ Load additional toolsets as needed:
 ```
 load_toolset('library')          # search_symbols, get_symbol_info, list_symbol_libraries
 load_toolset('sch_batch')        # batch operations for 3+ items
-load_toolset('sch_analysis')     # find components, get pin info, inspect nets
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
@@ -37,12 +39,31 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 
 ## Component Placement
 
+Read [`references/common-lib-ids.md`](references/common-lib-ids.md) when choosing
+a common generic KiCad symbol. It is a quick-start index, not an allowlist;
+search the active libraries when the required part is absent or package-specific.
+
 ### Workflow
 
 1. Search the library first: use `search_symbols` to find the correct lib_id
 2. Get pin info: use `get_symbol_info` to see pin names, numbers, and positions
 3. Place on the 1.27mm grid (KiCAD default schematic grid)
 4. Verify placement with `list_schematic_components`
+
+### Package-sensitive and custom parts
+
+Before placing or wiring a custom symbol, a manufacturer-specific discrete,
+or any package whose view can be mirrored, require the `kicad-library` skill's
+**accepted physical pin map** for the exact MPN and package suffix. The map must
+join each datasheet lead to the symbol pin and footprint pad, identify the
+drawing view/direction, reconcile duplicate and mechanical pads, and include
+query-back plus disposable rendered inspection. `get_symbol_info` proves the
+library data that exists; it does not prove that data matches the package.
+
+If the accepted physical pin map is missing, incomplete, based on a different
+suffix, or ambiguous about top/bottom/mating view, stop before real schematic
+placement. Do not infer physical numbering from a generic symbol name or from
+the order pins appear on screen.
 
 ### Common Library IDs
 
@@ -86,6 +107,11 @@ Power symbols: GND uses 0 (arrow points down), VCC/VDD/+3V3/+5V use 0 (arrow poi
 ---
 
 ## Wiring
+
+Read [`references/wiring-patterns.md`](references/wiring-patterns.md) when
+choosing between direct wires and labels or when building one of its common
+subcircuits. Verify every named pin against the placed symbol before applying a
+pattern.
 
 ### Connection Methods — Decision Table
 
@@ -224,14 +250,14 @@ Finds floating wires, labels, and symbols that are not connected to anything.
 
 ### Verification Workflow
 
-1. Place all components
-2. Complete all wiring
-3. Run `annotate_schematic`
-4. Run `validate_wire_connections`
-5. Run `validate_component_connections`
-6. Run `find_orphan_items`
-7. Fix any reported issues
-8. Save with `save_project`
+1. Place and wire complete functional blocks.
+2. Run `annotate_schematic`, then save with `save_project`.
+3. Run `validate_wire_connections` and `validate_component_connections`.
+4. Run `find_shorted_nets`; reconcile each finding against the intended nets.
+5. Run `find_orphan_items` as a heuristic and corroborate its findings.
+6. Run direct KiCad ERC with `run_erc` and classify every violation.
+7. Run `render_schematic_png` with inline output and inspect the actual image.
+8. Fix findings and repeat every check invalidated by the edits.
 
 ---
 
@@ -249,8 +275,26 @@ The agent can see its own schematic. After meaningful edits:
    a normal state, and a baseline from an older renderer is flagged rather
    than silently trusted.
 
-Use the loop to catch what connectivity checks cannot: overlapping symbols,
-text collisions, a component moved somewhere absurd.
+Use the loop to catch what connectivity checks cannot. Completion requires
+coherent functional grouping, label-inclusive overlap inspection, clear signal
+flow, and page-boundary acceptance for every symbol, label, and note. Inspect
+the image itself; a successful render command is not visual acceptance.
+
+## Evidence and completion gate
+
+Apply this order when evidence disagrees:
+
+1. Exact requirements and manufacturer datasheets.
+2. Direct KiCad ERC and saved/exported connectivity.
+3. Direct net, short, pin, and component evidence from Konnect.
+4. Aggregate review results.
+5. Heuristic orphan, single-pin, decoupling, and best-practice findings.
+
+A weaker heuristic may raise a question but does not override stronger direct
+evidence. If any required check did not run, failed structurally, returned
+impossible coverage, or contradicts stronger evidence without resolution, the
+result is `INCOMPLETE`. Report the blocked evidence and stop short of a clean or
+production-ready claim.
 
 ## Rules
 
