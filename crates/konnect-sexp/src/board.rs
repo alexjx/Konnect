@@ -138,13 +138,10 @@ pub struct ZoneOutline {
     /// Layers the zone lives on: KiCad 10 writes `(layers …)` (plural), older
     /// single-layer zones `(layer …)`. Both shapes land here.
     pub layers: Vec<String>,
-    /// Every finite coordinate defining the zone's first
-    /// `(polygon (pts …))`, in file order. An `(xy …)` contributes one point;
-    /// an arc contributes its start, mid, and end. Always ≥ 3 points — fewer
-    /// cannot enclose area, so such a zone is skipped.
-    ///
-    /// This retains the original point-only view for straight polygons. Use
-    /// [`Self::elements`] when the distinction between lines and arcs matters.
+    /// Straight `(xy …)` vertices from the zone's first
+    /// `(polygon (pts …))`, in file order. This retains the original
+    /// point-only view; it is empty for an arc-only outline. Use
+    /// [`Self::elements`] for the complete geometry.
     pub points: Vec<(f64, f64)>,
     /// Lossless ordered outline geometry. Unknown or incomplete elements make
     /// the zone unreadable rather than being silently dropped.
@@ -258,25 +255,27 @@ pub fn zones(tree: &SexpNode) -> Scan<ZoneOutline> {
             let pts = zone.find("polygon")?.find("pts")?;
             let mut points = Vec::new();
             let mut elements = Vec::new();
+            let mut defining_coordinate_count = 0usize;
             for node in pts.children()?.iter().skip(1) {
                 match node.head()? {
                     "xy" => {
                         let point = coordinate_pair(node)?;
                         points.push(point);
                         elements.push(ZoneOutlineElement::Point(point));
+                        defining_coordinate_count += 1;
                     }
                     "arc" => {
                         let start = point(node, "start")?;
                         let mid = point(node, "mid")?;
                         let end = point(node, "end")?;
-                        points.extend([start, mid, end]);
                         elements.push(ZoneOutlineElement::Arc { start, mid, end });
+                        defining_coordinate_count += 3;
                     }
                     _ => return None,
                 }
             }
-            if points.len() < 3 {
-                return None; // fewer than 3 vertices encloses no area
+            if defining_coordinate_count < 3 {
+                return None; // fewer than 3 coordinates cannot enclose area
             }
             Some(ZoneOutline {
                 net: resolve_net(zone, &table),
@@ -1133,7 +1132,7 @@ mod tests {
         assert_eq!(scan.items.len(), 2);
         assert_eq!(scan.items[0].net.as_deref(), Some("VSYS"));
         assert_eq!(scan.items[0].layers, vec!["B.Cu"]);
-        assert_eq!(scan.items[0].points.len(), 24);
+        assert!(scan.items[0].points.is_empty());
         assert_eq!(scan.items[0].elements.len(), 8);
         assert_eq!(
             scan.items[0].elements.first(),
@@ -1153,7 +1152,7 @@ mod tests {
         );
         assert_eq!(scan.items[1].net.as_deref(), Some("+BATT"));
         assert_eq!(scan.items[1].layers, vec!["In2.Cu"]);
-        assert_eq!(scan.items[1].points.len(), 21);
+        assert!(scan.items[1].points.is_empty());
         assert_eq!(scan.items[1].elements.len(), 7);
         assert_eq!(
             scan.items[1].elements.first(),
