@@ -6,9 +6,10 @@
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, opt_f64, require_f64, require_str, ToolContext, ToolDef};
+use crate::tools::{
+    get_path, opt_f64, require_f64, require_str, with_board_ipc_classified, ToolContext, ToolDef,
+};
 use anyhow::Context;
-use konnect_ipc::client::KiCadIpcClient;
 use konnect_sexp::writer::{apply_edits, write_atomic, SexpEdit};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -16,35 +17,15 @@ use std::path::Path;
 
 use super::cli;
 
-// ─── IPC helper ───────────────────────────────────────────────────────────────
-
-async fn with_ipc<T, F>(addr: String, f: F) -> anyhow::Result<Result<T, String>>
-where
-    T: Send + 'static,
-    F: FnOnce(&KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
-{
-    match tokio::task::spawn_blocking(move || f(&KiCadIpcClient::new(&addr))).await {
-        Ok(Ok(r)) => Ok(Ok(r)),
-        Ok(Err(e)) => Ok(Err(e.to_string())),
-        Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
-    }
-}
-
 macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
-        let addr = $ctx.config.ipc_address.clone();
         let requested_board = get_path($args, "board")?;
-        match with_ipc(addr, move |$c| {
-            $c.ensure_board_is_active(&requested_board)?;
-            $body
-        })
-        .await?
-        {
+        match with_board_ipc_classified($ctx, &requested_board, move |$c| $body).await? {
             Ok(v) => v,
-            Err(msg) => {
+            Err(error) => {
                 return Ok(CallToolResult::error(format!(
                     "KiCAD must be running with the board loaded (IPC error: {})",
-                    msg
+                    error.message()
                 )))
             }
         }
@@ -87,7 +68,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_name", "layer", "x1", "y1", "x2", "y2"]
             }),
             |args, ctx| async move { handle_route_trace(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "route_pad_to_pad",
             "Route a direct trace between two pads of named components (L-bend routing) via KiCAD IPC.",
@@ -106,7 +88,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_name", "ref1", "pad1", "ref2", "pad2"]
             }),
             |args, ctx| async move { handle_route_pad_to_pad(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "add_via",
             "Add a through-hole via at a given position and assign it to a net via KiCAD IPC.",
@@ -123,7 +106,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_name", "x", "y"]
             }),
             |args, ctx| async move { handle_add_via(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "plan_specctra_ses_import",
             "Validate a Freerouting Specctra SES against its revision-bound Konnect manifest and the exact live KiCad board. Returns every track and via that would be created; never mutates or saves the board.",
@@ -137,7 +121,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "ses_path", "manifest_path"]
             }),
             |args, ctx| async move { handle_plan_specctra_ses_import(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
             "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC before committing.",
@@ -152,7 +137,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "ses_path", "manifest_path", "candidate_output_path"]
             }),
             |args, ctx| async move { handle_apply_specctra_ses(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "add_copper_pour",
             "Alias of pcb_board's add_zone, kept for compatibility: identical arguments, \
@@ -161,7 +147,8 @@ pub fn tools() -> Vec<ToolDef> {
              only when no live KiCAD answers.",
             crate::tools::pcb_board::zone_schema(),
             |args, ctx| async move { handle_add_copper_pour(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "delete_trace",
             "Delete a trace segment identified by its UUID via KiCAD IPC.",
@@ -174,7 +161,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "uuid"]
             }),
             |args, ctx| async move { handle_delete_trace(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "query_traces",
             "List trace segments on the board, optionally filtered by net and/or layer. \
@@ -189,7 +177,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_query_traces(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "get_nets_list",
             "Return all nets defined on the PCB via KiCAD IPC.",
@@ -201,7 +190,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_nets_list(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "modify_trace",
             "Modify a trace segment by deleting and re-adding it with new parameters.",
@@ -219,7 +209,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "uuid", "net_name", "layer", "x1", "y1", "x2", "y2"]
             }),
             |args, ctx| async move { handle_modify_trace(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "create_netclass",
             "Create or update a netclass in the project's design rules. Writes \
@@ -304,7 +295,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_pos", "net_neg", "x1", "y1", "x2", "y2"]
             }),
             |args, ctx| async move { handle_route_diff_pair(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
     ]
 }
 
@@ -599,8 +591,7 @@ async fn handle_plan_specctra_ses_import(
         .canonicalize()
         .with_context(|| format!("resolve board {}", board.display()))?;
     let board_for_ipc = board.clone();
-    let addr = ctx.config.ipc_address.clone();
-    let result = with_ipc(addr, move |client| {
+    let result = with_board_ipc_classified(ctx, &board, move |client| {
         let document = client.find_open_board(&board_for_ipc)?;
         let before = client.save_document_to_string_in(document.clone())?;
         let plan = crate::specctra_ses::parse_import_plan(
@@ -631,12 +622,15 @@ async fn handle_plan_specctra_ses_import(
             "vias": plan.vias,
             "mutated": false
         }))),
-        Err(reason) => Ok(CallToolResult::error_kind(
-            ToolErrorKind::HandlerError {
-                reason: reason.clone(),
-            },
-            format!("Specctra SES import refused: {reason}"),
-        )),
+        Err(failure) => {
+            let reason = failure.message().to_string();
+            Ok(CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: reason.clone(),
+                },
+                format!("Specctra SES import refused: {reason}"),
+            ))
+        }
     }
 }
 
@@ -706,9 +700,8 @@ async fn handle_apply_specctra_ses(
     let drc_output_for_ipc = drc_output.clone();
     let cli_path = ctx.config.kicad_cli.clone();
     let runtime = tokio::runtime::Handle::current();
-    let addr = ctx.config.ipc_address.clone();
 
-    let result = with_ipc(addr, move |client| {
+    let result = with_board_ipc_classified(ctx, &board, move |client| {
         let open_boards = client.get_open_board_paths()?;
         if open_boards.len() != 1 {
             anyhow::bail!(
@@ -893,12 +886,15 @@ async fn handle_apply_specctra_ses(
                 "schematic_parity_violations": evidence.schematic_parity_violations
             }
         }))),
-        Err(reason) => Ok(CallToolResult::error_kind(
-            ToolErrorKind::HandlerError {
-                reason: reason.clone(),
-            },
-            format!("Specctra SES import refused or rolled back: {reason}"),
-        )),
+        Err(failure) => {
+            let reason = failure.message().to_string();
+            Ok(CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: reason.clone(),
+                },
+                format!("Specctra SES import refused or rolled back: {reason}"),
+            ))
+        }
     }
 }
 
@@ -2541,7 +2537,7 @@ mod zone_net_format_tests {
         assert_eq!(body["source"], json!("file"));
         assert!(body["warning"]
             .as_str()
-            .is_some_and(|w| w.contains("File → Revert")));
+            .is_some_and(|w| w.contains("current Konnect server session")));
     }
 
     /// The new arguments reach the alias too — it is the same handler, and a

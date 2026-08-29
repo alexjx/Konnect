@@ -34,6 +34,234 @@ fn asset_files() -> Vec<PathBuf> {
     files
 }
 
+fn assets_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("assets")
+}
+
+/// Every installed reference is named by its parent skill. Copying a file into
+/// `references/` is not progressive disclosure unless the skill tells the
+/// agent that it exists and when to read it (#357).
+#[test]
+fn every_reference_is_reachable_from_its_parent_skill() {
+    let skills = assets_root().join("skills");
+    let mut unreachable = Vec::new();
+
+    for entry in std::fs::read_dir(&skills).unwrap().flatten() {
+        let skill_dir = entry.path();
+        let references = skill_dir.join("references");
+        if !references.is_dir() {
+            continue;
+        }
+        let skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        for reference in std::fs::read_dir(references).unwrap().flatten() {
+            let path = reference.path();
+            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !skill.contains(filename) {
+                unreachable.push(format!(
+                    "{} does not name references/{filename}",
+                    display(&skill_dir.join("SKILL.md"))
+                ));
+            }
+        }
+    }
+
+    assert!(
+        unreachable.is_empty(),
+        "installed references have no parent-skill pointer:\n  {}",
+        unreachable.join("\n  ")
+    );
+}
+
+/// Every bundled Claude agent preloads at least one real bundled skill. Agent
+/// context is isolated, so relying on the caller to have read a skill leaves
+/// the agent running a stale condensed copy instead (#357).
+#[test]
+fn agents_preload_existing_skills() {
+    let skills_root = assets_root().join("skills");
+    let known: BTreeSet<String> = std::fs::read_dir(skills_root)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().join("SKILL.md").is_file())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    let mut bad = Vec::new();
+
+    for entry in std::fs::read_dir(assets_root().join("agents"))
+        .unwrap()
+        .flatten()
+    {
+        let path = entry.path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let normalized = text.replace("\r\n", "\n");
+        let frontmatter = normalized
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+            .map(|(head, _)| head)
+            .unwrap_or("");
+        let preloaded = yaml_list(frontmatter, "skills");
+        if preloaded.is_empty() {
+            bad.push(format!("{} preloads no skills", display(&path)));
+            continue;
+        }
+        for skill in preloaded {
+            if !known.contains(&skill) {
+                bad.push(format!(
+                    "{} preloads missing skill `{skill}`",
+                    display(&path)
+                ));
+            }
+        }
+    }
+
+    assert!(
+        bad.is_empty(),
+        "bundled agents do not preload valid bundled skills:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
+/// The top-level router names every installed agent so a caller can delegate
+/// deliberately instead of leaving agents undiscoverable (#357).
+#[test]
+fn top_level_skill_routes_every_bundled_agent() {
+    let router = std::fs::read_to_string(assets_root().join("skills/konnect/SKILL.md")).unwrap();
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir(assets_root().join("agents"))
+        .unwrap()
+        .flatten()
+    {
+        let path = entry.path();
+        let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !router.contains(name) {
+            missing.push(name.to_string());
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "top-level konnect skill does not route bundled agent(s): {}",
+        missing.join(", ")
+    );
+}
+
+fn yaml_list(frontmatter: &str, key: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut in_list = false;
+    for line in frontmatter.lines() {
+        if line == format!("{key}:") {
+            in_list = true;
+            continue;
+        }
+        if in_list {
+            if let Some(value) = line.strip_prefix("  - ") {
+                values.push(value.trim().to_string());
+            } else if !line.trim().is_empty() {
+                break;
+            }
+        }
+    }
+    values
+}
+
+/// Agent reports may only claim evidence that their prescribed setup can
+/// collect. v0.10.0 asked both agents to report ERC without loading
+/// `sch_export`, and the schematic builder never ran ERC, short detection, or
+/// rendered inspection at all (#357).
+#[test]
+fn agents_make_claimed_evidence_executable() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+    let cases = [
+        (
+            "kicad-schematic-build-agent.md",
+            &["sch_analysis", "sch_export"][..],
+            &[
+                "find_shorted_nets",
+                "run_erc",
+                "render_schematic_png",
+                "INCOMPLETE",
+            ][..],
+        ),
+        (
+            "kicad-design-review-agent.md",
+            &["sch_export", "pcb_export"][..],
+            &["run_erc", "get_drc_violations", "INCOMPLETE"][..],
+        ),
+    ];
+    let mut missing = Vec::new();
+
+    for (filename, required_toolsets, required_markers) in cases {
+        let path = root.join(filename);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded: BTreeSet<String> = text.lines().flat_map(toolset_names_in).collect();
+        for toolset in required_toolsets {
+            if !loaded.contains(*toolset) {
+                missing.push(format!("agents/{filename} does not load `{toolset}`"));
+            }
+        }
+        for marker in required_markers {
+            if !text.contains(*marker) {
+                missing.push(format!("agents/{filename} does not prescribe `{marker}`"));
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "agent output claims outrun their executable workflow:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
+/// The skill and its agent share the same completion boundary. These markers
+/// are the parts v0.10.0 omitted while still promising a production-quality
+/// result: direct checks, rendered readability, and a fail-closed verdict.
+#[test]
+fn skills_define_the_same_evidence_boundary_as_their_agents() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/skills");
+    let cases = [
+        (
+            "kicad-schematic/SKILL.md",
+            &[
+                "find_shorted_nets",
+                "run_erc",
+                "render_schematic_png",
+                "label-inclusive",
+                "page-boundary",
+                "INCOMPLETE",
+            ][..],
+        ),
+        (
+            "kicad-review/SKILL.md",
+            &[
+                "Evidence hierarchy",
+                "run_erc",
+                "get_drc_violations",
+                "INCOMPLETE",
+            ][..],
+        ),
+    ];
+    let mut missing = Vec::new();
+
+    for (relative, required_markers) in cases {
+        let text = std::fs::read_to_string(root.join(relative)).unwrap();
+        for marker in required_markers {
+            if !text.contains(*marker) {
+                missing.push(format!("skills/{relative} does not define `{marker}`"));
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "skill completion criteria omit required evidence:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
 /// Every `load_toolset('name')` in the shipped prose names a real toolset.
 #[test]
 fn documented_toolsets_exist_in_the_registry() {
@@ -350,6 +578,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "match_all",
         "replace_existing",
         "roundrect_rratio",
+        // Structured MCP error discriminant, not a callable tool.
+        "unsafe_file_fallback",
     ];
 
     let mut phantom = Vec::new();
@@ -428,6 +658,32 @@ fn snake_words(line: &str) -> Vec<String> {
 }
 
 // ─── Library identifiers in guidance (skips without KiCad) ───────────────────
+
+/// Package-sensitive parts need a lead-by-lead electrical acceptance record,
+/// not only prose telling the agent to "check the datasheet". This pins the
+/// minimum evidence an agent must collect before using a custom symbol and
+/// footprint in a real design.
+#[test]
+fn package_sensitive_parts_require_a_physical_pin_map_and_visible_acceptance() {
+    let library_skill = include_str!("../assets/skills/kicad-library/SKILL.md");
+    let schematic_skill = include_str!("../assets/skills/kicad-schematic/SKILL.md");
+    let common_ids = include_str!("../assets/skills/kicad-schematic/references/common-lib-ids.md");
+
+    for marker in [
+        "Physical pin-map acceptance contract",
+        "Datasheet lead",
+        "Symbol pin / name / type",
+        "Footprint pad",
+        "Drawing view / direction",
+        "disposable",
+        "Refuse acceptance",
+    ] {
+        assert!(library_skill.contains(marker), "missing marker: {marker}");
+    }
+    assert!(schematic_skill.contains("accepted physical pin map"));
+    assert!(common_ids.contains("not an allowlist"));
+    assert!(common_ids.contains("personal or project favorites"));
+}
 
 /// Every `Lib:Symbol` identifier the bundled guidance quotes must resolve to a
 /// symbol in the installed KiCad libraries.

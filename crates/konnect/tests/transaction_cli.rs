@@ -28,6 +28,20 @@ fn client_scoped_installer_help_is_advertised() {
 }
 
 #[test]
+fn claude_pretooluse_hook_emits_only_structured_json() {
+    let output = konnect().args(["hook", "pre-pcb-ipc"]).output().unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    assert!(value["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .is_some_and(|message| message.contains("live-IPC-only")));
+    assert_eq!(value.as_object().unwrap().len(), 1);
+}
+
+#[test]
 fn malformed_journal_requires_force_and_can_be_abandoned() {
     let project = tempfile::tempdir().unwrap();
     let active = project
