@@ -19,14 +19,23 @@ ALL modifications go through MCP tools — never edit .kicad_pcb files directly.
 Most PCB layout operations require KiCAD to be running with the board file open. The IPC
 connection communicates with the running KiCAD instance in real-time.
 
-`place_component`, `move_component`, `rotate_component`, and `flip_component` are
-narrow exceptions for closed boards. Placement, move, and rotation fall back when
-IPC is unreachable. Flip intentionally requires IPC to be unreachable because KiCAD's
-typed IPC API has no native footprint-flip command. The file paths use revision-aware
-atomic writes: placement preserves pads, graphics, attributes, and models; moves
-preserve the existing angle; rotations update the footprint and its child angles;
-flips mirror supported geometry and swap front/back layers. If KiCAD is reachable and
-rejects a request, the fallback stays disabled to avoid racing a live editor.
+Some board-construction and component tools have guarded closed-board paths. IPC-first
+tools fall back to the file only when the transport is unreachable and the target board
+has not been observed live during this server session. File-only operations such as
+`flip_component` proceed only when KiCad does not hold the target board open. These
+paths use revision-aware atomic writes: placement preserves pads, graphics, attributes,
+and models; moves preserve the existing angle; rotations update the footprint and its
+child angles; flips mirror supported geometry and swap front/back layers. A reachable
+KiCad rejection stays closed instead of racing the editor.
+
+`unsafe_file_fallback` is a stop condition. It means Konnect reached this board live
+earlier in the current server session but IPC is now unreachable, so the saved file may
+be older than lost editor state. Pause mutation work, tell the user that Konnect left
+the file unchanged, and ask them to reopen/recover, reconcile, and save the board in
+KiCad. Continue through live IPC afterward. Preserve the guard: do not retry-loop,
+restart Konnect automatically, or edit `.kicad_pcb` directly. If the user confirms a
+clean close and an authoritative saved file, they may restart Konnect to deliberately
+begin a new closed-board session.
 
 If connection fails:
 - Tell the user to open KiCAD and load the project
@@ -260,8 +269,9 @@ add_zone(board, net_name, layer, points, clearance?, min_width?,
 - With KiCad running on this board the zone is created over IPC and refilled
   for you, so it appears at once and is in KiCad's undo stack. Without a live
   KiCad it goes into the file instead, and the result says so (`source: file`)
-  and carries a `warning` — a file-only edit is invisible to an open pcbnew
-  and is lost on its next save
+  and carries a `warning` describing the process-local evidence and cold-start
+  limitation. A board observed live earlier in this server session fails with
+  `unsafe_file_fallback` instead of writing the file.
 
 ### refill_zones
 
@@ -335,9 +345,9 @@ Common DRC errors and fixes:
 4. **Refill zones after changes** — stale zone fills cause phantom DRC errors
 5. **Check DRC before finishing** — run `run_drc()` and resolve all errors
 6. **Use netclasses for consistency** — define track widths per net type, not per trace
-7. **KiCAD normally must be running** — `place_component`, `move_component`, and
-   `rotate_component` have safe IPC-unreachable file fallbacks; `flip_component`
-   requires a closed board; other PCB edits still require the live IPC connection
+7. **KiCAD normally must be running** — use guarded closed-board paths only when a
+   tool explicitly offers them. Treat `unsafe_file_fallback` as a human recovery
+   boundary; other PCB edits still require the live IPC connection.
 8. **Save frequently** — call `save_project` after major operations
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need
 10. **Copper pour last** — add zones only after routing is substantially complete

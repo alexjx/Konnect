@@ -1,5 +1,6 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
+mod board_session;
 pub mod cli;
 pub mod config;
 pub mod design_review;
@@ -90,6 +91,9 @@ pub struct ToolContext {
     pub observer: crate::observability::CallObserver,
     /// In-memory TTL cache for repeated JLCPCB parts-database queries.
     pub jlcpcb_cache: QueryCache,
+    /// Boards positively observed open through IPC during this server process.
+    /// Sticky state prevents an unsafe file fallback after KiCad disappears.
+    pub(crate) board_session: board_session::BoardSessionMemory,
 }
 
 impl ToolContext {
@@ -101,6 +105,7 @@ impl ToolContext {
             router,
             observer: crate::observability::CallObserver::new(None),
             jlcpcb_cache: QueryCache::default(),
+            board_session: board_session::BoardSessionMemory::default(),
         }
     }
 
@@ -116,6 +121,7 @@ impl ToolContext {
             router,
             observer,
             jlcpcb_cache: QueryCache::default(),
+            board_session: board_session::BoardSessionMemory::default(),
         }
     }
 }
@@ -287,6 +293,30 @@ where
         Ok(result) => Ok(result),
         Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
     }
+}
+
+/// Run a board-targeted IPC call and remember the requested board as soon as
+/// KiCad positively identifies it. Observation happens before `f`, so a later
+/// command rejection, timeout, or editor crash cannot make the next file
+/// fallback treat this board as never having been live.
+pub(crate) async fn with_board_ipc_classified<T, F>(
+    ctx: &ToolContext,
+    board_path: &std::path::Path,
+    f: F,
+) -> anyhow::Result<Result<T, konnect_ipc::IpcFailure>>
+where
+    T: Send + 'static,
+    F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
+{
+    let requested = board_path.to_path_buf();
+    let observation = requested.clone();
+    let memory = ctx.board_session.clone();
+    with_ipc_classified(ctx.config.ipc_address.clone(), move |client| {
+        client.ensure_board_is_active(&requested)?;
+        memory.observe_live(&observation);
+        f(client)
+    })
+    .await
 }
 
 // ─── Argument helpers ─────────────────────────────────────────────────────────

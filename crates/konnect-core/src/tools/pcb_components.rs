@@ -7,9 +7,9 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
-use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite};
+use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite, FILE_FALLBACK_WARNING};
 use crate::tools::{
-    get_path, require_array, require_f64, require_str, require_u64, with_ipc_classified,
+    get_path, require_array, require_f64, require_str, require_u64, with_board_ipc_classified,
     ToolContext, ToolDef,
 };
 use anyhow::Context;
@@ -25,30 +25,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
-// ─── IPC helper ───────────────────────────────────────────────────────────────
-
-async fn with_ipc<T, F>(addr: String, f: F) -> anyhow::Result<Result<T, String>>
-where
-    T: Send + 'static,
-    F: FnOnce(&KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
-{
-    match tokio::task::spawn_blocking(move || f(&KiCadIpcClient::new(&addr))).await {
-        Ok(Ok(r)) => Ok(Ok(r)),
-        Ok(Err(e)) => Ok(Err(format!("{e:#}"))),
-        Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
-    }
-}
-
 macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
-        let addr = $ctx.config.ipc_address.clone();
         let requested_board = get_path($args, "board")?;
-        match with_ipc_classified(addr, move |$c| {
-            $c.ensure_board_is_active(&requested_board)?;
-            $body
-        })
-        .await?
-        {
+        match with_board_ipc_classified($ctx, &requested_board, move |$c| $body).await? {
             Ok(v) => v,
             // Only an unreachable transport justifies "KiCAD must be running".
             // This used to say it for every failure, so a tool that refused a
@@ -936,7 +916,7 @@ enum FootprintPlacementUpdate {
 /// The handlers have to tell a caller's mistake — a reference that is not on
 /// this board — from a board Konnect declines to edit, from a genuine I/O
 /// failure, and report each differently. Deciding that by matching on the
-/// error's message text is exactly what [`with_ipc_classified`]'s contract
+/// error's message text is exactly what [`with_board_ipc_classified`]'s contract
 /// forbids two screens up, and it left every case except the missing
 /// reference surfacing as an unstructured `handler_error` (#194's class).
 #[derive(Debug)]
@@ -2120,16 +2100,14 @@ async fn handle_place_component(
         .to_string();
 
     // Try IPC first. The fallback gate is the typed transport classification:
-    // only when the request never reached a live KiCad (unconfigured socket,
-    // failed dial/send) is it safe to edit the board file directly. A KiCad
-    // that answered — even with an error — may hold this board open, and a
-    // file edited behind a live editor is silently overwritten on its next
-    // save, so a rejection fails closed with no fallback.
-    let requested_board = board.clone();
+    // only when the transport is unreachable and this server has never
+    // observed the requested board live is the guarded file path available.
+    // A KiCad that answered — even with an error — fails closed.
     let footprint_ipc = footprint.clone();
     let reference_ipc = reference.clone();
     let layer_ipc = layer.clone();
-    let attempt = with_ipc_classified(ctx.config.ipc_address.clone(), move |c| {
+    let requested_board = board.clone();
+    let attempt = attempt_ipc_write(ctx, &board, "placement", move |c| {
         c.place_footprint(
             &requested_board,
             &footprint_ipc,
@@ -2147,19 +2125,15 @@ async fn handle_place_component(
     .await?;
 
     match attempt {
-        Ok(fp) => Ok(CallToolResult::json(&json!({
+        BoardWrite::Ipc(fp) => Ok(CallToolResult::json(&json!({
             "placed": fp.reference,
             "footprint": fp.footprint,
             "x": fp.position.x, "y": fp.position.y,
             "rotation": fp.rotation, "layer": fp.layer,
             "source": "ipc"
         }))),
-        Err(konnect_ipc::IpcFailure::Rejected(message)) => Ok(CallToolResult::error(format!(
-            "KiCAD rejected the placement over IPC: {message}. \
-             The board file was not modified — KiCAD is reachable and may hold this \
-             board open, so editing the file directly could be silently overwritten."
-        ))),
-        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
+        BoardWrite::Refused(result) => Ok(result),
+        BoardWrite::File => {
             // No live KiCad on the other end of this transport: fall back to
             // editing the board file directly.
             if board_contains_reference(&board, &reference)? {
@@ -2191,9 +2165,7 @@ async fn handle_place_component(
                 "footprint": footprint,
                 "x": x, "y": y, "rotation": rotation, "layer": layer,
                 "source": "file",
-                "warning": "KiCAD IPC was not reachable, so the board file was edited \
-                            directly. KiCAD will show this footprint when it next loads \
-                            the board."
+                "warning": FILE_FALLBACK_WARNING
             })))
         }
     }
@@ -2218,7 +2190,7 @@ async fn handle_move_component(
     };
 
     let ref_ipc = reference.clone();
-    match attempt_ipc_write(ctx.config.ipc_address.clone(), &board, "move", move |c| {
+    match attempt_ipc_write(ctx, &board, "move", move |c| {
         c.move_footprint(&ref_ipc, x, y)
     })
     .await?
@@ -2238,7 +2210,7 @@ async fn handle_move_component(
                     "x": x,
                     "y": y,
                     "source": "file",
-                    "warning": "KiCAD IPC was not reachable, so the closed board file was edited directly."
+                    "warning": FILE_FALLBACK_WARNING
                 }))),
                 Err(error) => Ok(error.into_result()),
             }
@@ -2320,12 +2292,9 @@ async fn handle_rotate_component(
     };
 
     let ref_ipc = reference.clone();
-    match attempt_ipc_write(
-        ctx.config.ipc_address.clone(),
-        &board,
-        "rotation",
-        move |c| c.rotate_footprint(&ref_ipc, rotation),
-    )
+    match attempt_ipc_write(ctx, &board, "rotation", move |c| {
+        c.rotate_footprint(&ref_ipc, rotation)
+    })
     .await?
     {
         BoardWrite::Ipc(()) => Ok(CallToolResult::json(&json!({
@@ -2344,7 +2313,7 @@ async fn handle_rotate_component(
                     "rotated": reference,
                     "rotation": rotation,
                     "source": "file",
-                    "warning": "KiCAD IPC was not reachable, so the closed board file was edited directly."
+                    "warning": FILE_FALLBACK_WARNING
                 }))),
                 Err(error) => Ok(error.into_result()),
             }
@@ -2423,12 +2392,9 @@ async fn handle_set_component_placements(
     };
 
     let placements_ipc = placements.clone();
-    match attempt_ipc_write(
-        ctx.config.ipc_address.clone(),
-        &board,
-        "component placement batch",
-        move |client| client.set_footprint_placements(&placements_ipc),
-    )
+    match attempt_ipc_write(ctx, &board, "component placement batch", move |client| {
+        client.set_footprint_placements(&placements_ipc)
+    })
     .await?
     {
         BoardWrite::Ipc(applied) => Ok(CallToolResult::json(&json!({
@@ -2443,7 +2409,7 @@ async fn handle_set_component_placements(
                 "count": applied.len(),
                 "placements": applied,
                 "source": "file",
-                "warning": "KiCad IPC was not reachable, so the closed board file was edited once with a revision check."
+                "warning": FILE_FALLBACK_WARNING
             }))),
             Err(error) => Ok(error.into_result()),
         },
@@ -2495,12 +2461,9 @@ async fn handle_flip_component(
     // does not exist here — so the refusal is equally untested for
     // `add_zone` and the copper-pour path, this helper's two other callers.
     // Tracked as #241 rather than pretended away.
-    if let Some(refusal) = crate::tools::pcb_board::refuse_if_board_open_in_kicad(
-        ctx.config.ipc_address.clone(),
-        &board,
-        "footprint flip",
-    )
-    .await?
+    if let Some(refusal) =
+        crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "footprint flip")
+            .await?
     {
         return Ok(refusal);
     }
@@ -2828,7 +2791,7 @@ async fn handle_repair_corrupted_footprints(
     let board_for_ipc = board.clone();
     let expected_for_ipc = expected_revision.clone();
     let outcome = attempt_ipc_write(
-        ctx.config.ipc_address.clone(),
+        ctx,
         &board,
         "legacy footprint repair",
         move |client| {
@@ -3146,7 +3109,7 @@ async fn handle_get_component_pads(
     // live one. The file stays the fallback for an offline session.
     let ipc_board = board_path.clone();
     let ipc_reference = reference.clone();
-    let live = with_ipc_classified(ctx.config.ipc_address.clone(), move |c| {
+    let live = with_board_ipc_classified(ctx, &board_path, move |c| {
         let document = c.find_open_board(&ipc_board)?;
         c.get_footprint_pads_in(document, &ipc_reference)
     })
@@ -3435,10 +3398,8 @@ async fn handle_place_array(
         }
     }
 
-    let requested_board = board.clone();
     let footprint_id = footprint.clone();
-    let placed = match with_ipc(ctx.config.ipc_address.clone(), move |c| {
-        c.ensure_board_is_active(&requested_board)?;
+    let placed = match with_board_ipc_classified(ctx, &board, move |c| {
         let existing = c
             .list_footprints()?
             .into_iter()
@@ -3498,7 +3459,7 @@ async fn handle_place_array(
     .await?
     {
         Ok(placed) => placed,
-        Err(error) => return Ok(CallToolResult::error(format!("IPC array error: {error:#}"))),
+        Err(error) => return Ok(CallToolResult::error(format!("IPC array error: {error}"))),
     };
     Ok(CallToolResult::json(
         &json!({ "placed_count": placed.len(), "components": placed }),
@@ -3535,9 +3496,7 @@ async fn handle_align_components(
         Err(e) => return Ok(e),
     };
 
-    let requested_board = board.clone();
-    let aligned = match with_ipc(ctx.config.ipc_address.clone(), move |c| {
-        c.ensure_board_is_active(&requested_board)?;
+    let aligned = match with_board_ipc_classified(ctx, &board, move |c| {
         c.run_commit("Align footprints", |c| {
             references
                 .iter()
@@ -3559,7 +3518,7 @@ async fn handle_align_components(
     .await?
     {
         Ok(aligned) => aligned,
-        Err(error) => return Ok(CallToolResult::error(format!("IPC align error: {error:#}"))),
+        Err(error) => return Ok(CallToolResult::error(format!("IPC align error: {error}"))),
     };
     Ok(CallToolResult::json(
         &json!({ "aligned_count": aligned.len(), "components": aligned }),
@@ -4192,8 +4151,8 @@ mod tests {
     #[tokio::test]
     async fn unreachable_ipc_falls_back_to_writing_the_board_file() {
         // ipc_address is empty in test_ctx, which classifies as
-        // transport-unreachable — the one condition under which editing the
-        // board file directly cannot race a live editor.
+        // transport-unreachable, and this fresh context has never observed the
+        // board live, so the guarded file path is available.
         let tmp = tempfile::tempdir().unwrap();
         let board = fallback_fixture(tmp.path());
 
@@ -4212,7 +4171,8 @@ mod tests {
         assert!(
             out["warning"]
                 .as_str()
-                .is_some_and(|w| w.contains("edited") && w.contains("loads")),
+                .is_some_and(|w| w.contains("current Konnect server session")
+                    && w.contains("crashed or was force-quit")),
             "the fallback must warn that the file was edited directly: {out}"
         );
 
@@ -4244,6 +4204,31 @@ mod tests {
             0,
             "board is no longer balanced:\n{written}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_previously_live_board_blocks_place_components_file_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = fallback_fixture(tmp.path());
+        let before = std::fs::read(&board).unwrap();
+        let ctx = test_ctx();
+        ctx.board_session.observe_live(&board);
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": "Resistor_SMD:R_0805_2012Metric",
+            "reference": "R7",
+            "x": 50.0,
+            "y": 60.0,
+        });
+
+        let result = handle_place_component(&args, &ctx).await.unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("unsafe_file_fallback")
+        );
+        assert_eq!(std::fs::read(&board).unwrap(), before);
     }
 
     #[tokio::test]
