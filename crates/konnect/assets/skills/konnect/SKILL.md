@@ -90,13 +90,30 @@ unload_toolset("name")  → Remove a toolset when done
 |----------|----------|
 | Project | project |
 | Schematic | sch_components, sch_wiring, sch_bus, sch_analysis, sch_batch, sch_export, sch_hierarchy |
-| PCB | pcb_board, pcb_components, pcb_routing, pcb_export |
+| PCB | pcb_board, pcb_components, pcb_routing, pcb_export, placement |
 | Library | library |
 | Integration | integration (JLCPCB parts, Freerouting installation checks, datasheets) |
 | Verification & Review | verification, design_review |
 | Config | config |
 | Templates | templates |
 | Manufacturing | manufacturing |
+
+## Agent Routing and Mutation Ownership
+
+Use one design owner at a time. Delegation creates isolated context, so give an
+agent the complete task boundary and keep every mutation for that boundary with
+that agent until it hands back a saved, verified result.
+
+- Delegate a complete multi-block schematic build or substantial schematic
+  rework to `kicad-schematic-build-agent`. It owns schematic mutations through
+  placement, wiring, validation, rendering, and save. The caller does not make
+  concurrent schematic edits.
+- Delegate an independent full-design, pre-fabrication, or readiness audit to
+  `kicad-design-review-agent`. It gathers and reports evidence without mutating
+  the design. Return fixes to the current design owner, then run a fresh review.
+- Keep small, bounded edits and narrow checks in the current conversation using
+  the applicable skill. Agent delegation is for a complete build or an
+  independent review, not an extra layer around every tool call.
 
 ## Design Rules Quick Reference
 

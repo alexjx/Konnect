@@ -36,6 +36,15 @@ load_toolset('pcb_routing')      # query_traces, get_nets_list
 
 Always call `get_active_toolsets()` first to see what is already loaded.
 
+### References by review branch
+
+- Read [`references/design-checklist.md`](references/design-checklist.md) for a
+  comprehensive or pre-fabrication review. Mark an item only from evidence
+  collected in this run.
+- Read [`references/error-taxonomy.md`](references/error-taxonomy.md) when
+  classifying a finding or assigning the final verdict. Direct ERC, DRC, and
+  connectivity evidence outrank heuristic classifications.
+
 ---
 
 ## Quick Checks (Escalating Severity)

@@ -34,6 +34,139 @@ fn asset_files() -> Vec<PathBuf> {
     files
 }
 
+fn assets_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("assets")
+}
+
+/// Every installed reference is named by its parent skill. Copying a file into
+/// `references/` is not progressive disclosure unless the skill tells the
+/// agent that it exists and when to read it (#357).
+#[test]
+fn every_reference_is_reachable_from_its_parent_skill() {
+    let skills = assets_root().join("skills");
+    let mut unreachable = Vec::new();
+
+    for entry in std::fs::read_dir(&skills).unwrap().flatten() {
+        let skill_dir = entry.path();
+        let references = skill_dir.join("references");
+        if !references.is_dir() {
+            continue;
+        }
+        let skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        for reference in std::fs::read_dir(references).unwrap().flatten() {
+            let path = reference.path();
+            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !skill.contains(filename) {
+                unreachable.push(format!(
+                    "{} does not name references/{filename}",
+                    display(&skill_dir.join("SKILL.md"))
+                ));
+            }
+        }
+    }
+
+    assert!(
+        unreachable.is_empty(),
+        "installed references have no parent-skill pointer:\n  {}",
+        unreachable.join("\n  ")
+    );
+}
+
+/// Every bundled Claude agent preloads at least one real bundled skill. Agent
+/// context is isolated, so relying on the caller to have read a skill leaves
+/// the agent running a stale condensed copy instead (#357).
+#[test]
+fn agents_preload_existing_skills() {
+    let skills_root = assets_root().join("skills");
+    let known: BTreeSet<String> = std::fs::read_dir(skills_root)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().join("SKILL.md").is_file())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    let mut bad = Vec::new();
+
+    for entry in std::fs::read_dir(assets_root().join("agents"))
+        .unwrap()
+        .flatten()
+    {
+        let path = entry.path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let normalized = text.replace("\r\n", "\n");
+        let frontmatter = normalized
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+            .map(|(head, _)| head)
+            .unwrap_or("");
+        let preloaded = yaml_list(frontmatter, "skills");
+        if preloaded.is_empty() {
+            bad.push(format!("{} preloads no skills", display(&path)));
+            continue;
+        }
+        for skill in preloaded {
+            if !known.contains(&skill) {
+                bad.push(format!(
+                    "{} preloads missing skill `{skill}`",
+                    display(&path)
+                ));
+            }
+        }
+    }
+
+    assert!(
+        bad.is_empty(),
+        "bundled agents do not preload valid bundled skills:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
+/// The top-level router names every installed agent so a caller can delegate
+/// deliberately instead of leaving agents undiscoverable (#357).
+#[test]
+fn top_level_skill_routes_every_bundled_agent() {
+    let router = std::fs::read_to_string(assets_root().join("skills/konnect/SKILL.md")).unwrap();
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir(assets_root().join("agents"))
+        .unwrap()
+        .flatten()
+    {
+        let path = entry.path();
+        let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !router.contains(name) {
+            missing.push(name.to_string());
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "top-level konnect skill does not route bundled agent(s): {}",
+        missing.join(", ")
+    );
+}
+
+fn yaml_list(frontmatter: &str, key: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut in_list = false;
+    for line in frontmatter.lines() {
+        if line == format!("{key}:") {
+            in_list = true;
+            continue;
+        }
+        if in_list {
+            if let Some(value) = line.strip_prefix("  - ") {
+                values.push(value.trim().to_string());
+            } else if !line.trim().is_empty() {
+                break;
+            }
+        }
+    }
+    values
+}
+
 /// Every `load_toolset('name')` in the shipped prose names a real toolset.
 #[test]
 fn documented_toolsets_exist_in_the_registry() {
