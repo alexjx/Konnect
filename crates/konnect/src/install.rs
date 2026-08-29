@@ -5,6 +5,7 @@
 
 use crate::manifest::{AGENTS, HOOK_SKILLS, SKILLS};
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -119,6 +120,74 @@ pub fn print_skill_content(name: &str) -> Result<()> {
     }
     eprintln!("Unknown skill: {}", name);
     std::process::exit(1);
+}
+
+/// Emit the structured response Claude consumes for a hook event. Stdout is
+/// intentionally one JSON object and nothing else.
+pub fn print_hook_output(name: &str) -> Result<()> {
+    let hook = HOOK_SKILLS
+        .iter()
+        .find(|hook| hook.name == name)
+        .with_context(|| format!("unknown hook: {name}"))?;
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": hook.event,
+                "additionalContext": hook.content
+            }
+        }))?
+    );
+    Ok(())
+}
+
+fn hook_tool_names(board_access: konnect_core::tools::BoardAccess) -> Vec<&'static str> {
+    let mut names = BTreeSet::new();
+    for toolset in konnect_core::router::registry::ALL_TOOLSETS {
+        if let Some(tools) = konnect_core::router::registry::tools_for(toolset.name) {
+            for tool in tools {
+                if tool.board_access == board_access {
+                    names.insert(tool.name);
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+fn hook_matcher(hook: &crate::manifest::HookSkillManifest) -> Result<String> {
+    let names = hook_tool_names(hook.board_access);
+    if names.is_empty() {
+        anyhow::bail!("hook '{}' has no registered tool targets", hook.name);
+    }
+    Ok(format!("mcp__konnect__({})", names.join("|")))
+}
+
+fn quote_command_arg(argument: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("\"{}\"", argument.replace('"', "\\\""))
+    }
+    #[cfg(not(windows))]
+    {
+        format!("'{}'", argument.replace('\'', "'\\''"))
+    }
+}
+
+fn hook_command(exe_str: &str, subcommand: &str, hook_name: &str) -> String {
+    format!(
+        "{} {} {}",
+        quote_command_arg(exe_str),
+        subcommand,
+        quote_command_arg(hook_name)
+    )
+}
+
+/// Exact command representation written by releases before the structured
+/// hook subcommand. It was unquoted and doubled Windows backslashes before
+/// JSON serialization; retain this only for surgical migration/removal.
+fn legacy_hook_command(exe_str: &str, hook_name: &str) -> String {
+    format!("{} skill {}", exe_str.replace('\\', "\\\\"), hook_name)
 }
 
 /// Double-click behavior remains Claude-focused for backward compatibility.
@@ -305,7 +374,11 @@ fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) 
                 }
             }
         }
-        remove_hooks_from_settings(&paths.claude_settings_path())?;
+        let exe = std::env::current_exe()?;
+        remove_hooks_from_settings(
+            &paths.claude_settings_path(),
+            exe.to_string_lossy().as_ref(),
+        )?;
         if verbose {
             println!("  [-] Removed hook entries from settings.json");
         }
@@ -414,11 +487,17 @@ fn patch_claude_settings(path: &Path, exe_str: &str) -> Result<usize> {
 
     let mut added = 0;
     for hook in HOOK_SKILLS {
+        let command = hook_command(exe_str, "hook", hook.name);
+        let legacy_command = legacy_hook_command(exe_str, hook.name);
         let event_arr = hooks_obj
             .entry(hook.event)
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut()
             .context("hook event field is not an array")?;
+        // Migrate the exact handler installed by the old plain-stdout form.
+        // Do not use substring matching: user-authored neighboring handlers
+        // and unrelated commands containing "konnect" are not ours.
+        remove_exact_commands(event_arr, &[legacy_command.as_str()]);
         let already_exists = event_arr.iter().any(|entry| {
             entry
                 .get("hooks")
@@ -428,20 +507,16 @@ fn patch_claude_settings(path: &Path, exe_str: &str) -> Result<usize> {
                         hook_entry
                             .get("command")
                             .and_then(|command| command.as_str())
-                            .is_some_and(|command| {
-                                command.contains("konnect") && command.contains(hook.name)
-                            })
+                            .is_some_and(|candidate| candidate == command)
                     })
                 })
         });
         if !already_exists {
-            // Preserve the established Claude hook command representation.
-            let exe_escaped = exe_str.replace('\\', "\\\\");
             event_arr.push(serde_json::json!({
-                "matcher": hook.tool_matcher,
+                "matcher": hook_matcher(hook)?,
                 "hooks": [{
                     "type": "command",
-                    "command": format!("{} skill {}", exe_escaped, hook.name)
+                    "command": command
                 }]
             }));
             added += 1;
@@ -451,7 +526,29 @@ fn patch_claude_settings(path: &Path, exe_str: &str) -> Result<usize> {
     Ok(added)
 }
 
-fn remove_hooks_from_settings(path: &Path) -> Result<()> {
+fn remove_exact_commands(event_arr: &mut Vec<serde_json::Value>, commands: &[&str]) {
+    for entry in event_arr.iter_mut() {
+        if let Some(handlers) = entry
+            .get_mut("hooks")
+            .and_then(|hooks| hooks.as_array_mut())
+        {
+            handlers.retain(|handler| {
+                !handler
+                    .get("command")
+                    .and_then(|command| command.as_str())
+                    .is_some_and(|command| commands.contains(&command))
+            });
+        }
+    }
+    event_arr.retain(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|hooks| hooks.as_array())
+            .is_none_or(|handlers| !handlers.is_empty())
+    });
+}
+
+fn remove_hooks_from_settings(path: &Path, exe_str: &str) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -466,19 +563,9 @@ fn remove_hooks_from_settings(path: &Path) -> Result<()> {
                 .get_mut(hook.event)
                 .and_then(|event| event.as_array_mut())
             {
-                event_arr.retain(|entry| {
-                    !entry
-                        .get("hooks")
-                        .and_then(|hooks| hooks.as_array())
-                        .is_some_and(|hooks| {
-                            hooks.iter().any(|hook_entry| {
-                                hook_entry
-                                    .get("command")
-                                    .and_then(|command| command.as_str())
-                                    .is_some_and(|command| command.contains("konnect"))
-                            })
-                        })
-                });
+                let current = hook_command(exe_str, "hook", hook.name);
+                let legacy = legacy_hook_command(exe_str, hook.name);
+                remove_exact_commands(event_arr, &[current.as_str(), legacy.as_str()]);
             }
         }
     }
@@ -624,9 +711,128 @@ mod tests {
         let settings: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(settings_path).unwrap()).unwrap();
         assert_eq!(settings["theme"], "dark");
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), HOOK_SKILLS.len());
         for hook in HOOK_SKILLS {
-            assert_eq!(settings["hooks"][hook.event].as_array().unwrap().len(), 1);
+            let expected_command = hook_command(
+                std::env::current_exe().unwrap().to_string_lossy().as_ref(),
+                "hook",
+                hook.name,
+            );
+            assert!(entries.iter().any(|entry| {
+                entry["matcher"] == hook_matcher(hook).unwrap()
+                    && entry["hooks"][0]["command"] == expected_command
+            }));
         }
+    }
+
+    #[test]
+    fn hook_matchers_are_derived_from_registered_board_contracts() {
+        let registered = konnect_core::router::registry::ALL_TOOLSETS
+            .iter()
+            .flat_map(|toolset| {
+                konnect_core::router::registry::tools_for(toolset.name).unwrap_or_default()
+            })
+            .map(|tool| (tool.name, tool.board_access))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        for hook in HOOK_SKILLS {
+            let matcher = hook_matcher(hook).unwrap();
+            let targets = matcher
+                .strip_prefix("mcp__konnect__(")
+                .and_then(|value| value.strip_suffix(')'))
+                .unwrap()
+                .split('|')
+                .collect::<Vec<_>>();
+            assert!(!targets.is_empty());
+            for target in targets {
+                assert_eq!(registered.get(target), Some(&hook.board_access), "{target}");
+            }
+        }
+        assert!(!HOOK_SKILLS
+            .iter()
+            .any(|hook| hook_matcher(hook).unwrap().contains("refill_zones")));
+        assert_eq!(
+            registered.get("route_trace"),
+            Some(&konnect_core::tools::BoardAccess::LiveOnly)
+        );
+        assert_eq!(
+            registered.get("place_component"),
+            Some(&konnect_core::tools::BoardAccess::LivePreferredWithFallback)
+        );
+        assert_eq!(
+            registered.get("flip_component"),
+            Some(&konnect_core::tools::BoardAccess::ClosedBoardOnly)
+        );
+        assert_eq!(
+            registered.get("plan_bga_fanout"),
+            Some(&konnect_core::tools::BoardAccess::ApplyModeDependent)
+        );
+    }
+
+    #[test]
+    fn spaced_windows_executable_survives_settings_json_roundtrip() {
+        let temp = TempDir::new().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let exe = r"C:\Program Files\Konnect Tools\konnect.exe";
+
+        patch_claude_settings(&settings_path, exe).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(settings_path).unwrap()).unwrap();
+        let commands = settings["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| entry["hooks"].as_array().unwrap())
+            .map(|handler| handler["command"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        for hook in HOOK_SKILLS {
+            assert!(commands.contains(&hook_command(exe, "hook", hook.name).as_str()));
+        }
+        #[cfg(windows)]
+        assert!(commands.iter().all(|command| command.starts_with('"')));
+    }
+
+    #[test]
+    fn install_migrates_the_exact_legacy_plain_stdout_handler() {
+        let temp = TempDir::new().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let exe = r"C:\Program Files\Konnect\konnect.exe";
+        let hook = &HOOK_SKILLS[0];
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": {
+                    hook.event: [{
+                        "matcher": "old-static-matcher",
+                        "hooks": [{
+                            "type": "command",
+                            "command": legacy_hook_command(exe, hook.name)
+                        }, {
+                            "type": "command",
+                            "command": "user-neighbor"
+                        }]
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        patch_claude_settings(&settings_path, exe).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(settings_path).unwrap()).unwrap();
+        let commands = settings["hooks"][hook.event]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| entry["hooks"].as_array().unwrap())
+            .map(|handler| handler["command"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!commands.contains(&legacy_hook_command(exe, hook.name).as_str()));
+        assert!(commands.contains(&hook_command(exe, "hook", hook.name).as_str()));
+        assert!(commands.contains(&"user-neighbor"));
     }
 
     #[test]
@@ -687,5 +893,44 @@ mod tests {
         let entries = remaining["hooks"][HOOK_SKILLS[0].event].as_array().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["hooks"][0]["command"], "other-tool");
+    }
+
+    #[test]
+    fn exact_uninstall_preserves_mixed_and_similarly_named_handlers() {
+        let temp = TempDir::new().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let exe = r"C:\Program Files\Konnect\konnect.exe";
+        patch_claude_settings(&settings_path, exe).unwrap();
+
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let entries = settings["hooks"]["PreToolUse"].as_array_mut().unwrap();
+        entries[0]["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "command",
+                "command": "user-board-check"
+            }));
+        entries.push(serde_json::json!({
+            "matcher": "Write",
+            "hooks": [{
+                "type": "command",
+                "command": "C:/tools/konnect-helper.exe audit"
+            }]
+        }));
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        remove_hooks_from_settings(&settings_path, exe).unwrap();
+        let remaining = fs::read_to_string(settings_path).unwrap();
+        assert!(remaining.contains("user-board-check"));
+        assert!(remaining.contains("konnect-helper.exe audit"));
+        for hook in HOOK_SKILLS {
+            assert!(!remaining.contains(&hook_command(exe, "hook", hook.name)));
+        }
     }
 }
