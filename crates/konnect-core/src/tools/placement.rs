@@ -74,7 +74,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "ic_reference"]
             }),
             |args, ctx| async move { handle_place_decoupling(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
         tool!(
             "plan_bga_fanout",
             "Plan a BGA fanout: outer-ring pads escape directly; each inner pad gets a via \
@@ -93,7 +94,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference"]
             }),
             |args, ctx| async move { handle_bga_fanout(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
         tool!(
             "auto_place_from_schematic",
             "Deterministic first placement: cluster footprints by shared nets (union-find), \
@@ -112,7 +114,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_auto_place(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
         tool!(
             "refine_placement_force_directed",
             "Refine placement with a deterministic spring embedder: shared nets pull \
@@ -133,7 +136,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_force_directed(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
     ]
 }
 

@@ -745,7 +745,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "width", "height"]
             }),
             |args, ctx| async move { handle_set_board_size(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "get_board_info",
             "Return metadata about the PCB: title, revision, company, layer count, paper size, \
@@ -800,7 +801,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "layer_name"]
             }),
             |args, ctx| async move { handle_add_layer(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "set_active_layer",
             "Set the active layer recorded in the board file's setup section.",
@@ -813,7 +815,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "layer"]
             }),
             |args, ctx| async move { handle_set_active_layer(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "add_board_outline",
             "Add a rectangular board outline on Edge.Cuts, optionally using circular rounded \
@@ -833,7 +836,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "x1", "y1", "x2", "y2"]
             }),
             |args, ctx| async move { handle_add_board_outline(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "delete_graphics",
             "Delete board graphics — lines, rectangles, arcs, circles, polygons, curves, text, \
@@ -870,7 +874,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_delete_graphics(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "add_mounting_hole",
             "Add an NPTH mounting hole footprint at the specified position.",
@@ -886,7 +891,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "x", "y"]
             }),
             |args, ctx| async move { handle_add_mounting_hole(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "add_board_text",
             "Add a silkscreen or fabrication text string to the board.",
@@ -904,7 +910,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "text", "x", "y"]
             }),
             |args, ctx| async move { handle_add_board_text(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "add_zone",
             "Add a copper fill zone polygon on a specified layer and net. Tries KiCAD IPC \
@@ -916,7 +923,8 @@ pub fn tools() -> Vec<ToolDef> {
              declare rather than binding copper to net 0.",
             zone_schema(),
             |args, ctx| async move { handle_add_zone(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "import_svg_logo",
             "Import an SVG file as filled silkscreen or copper artwork (a logo, icon, or other \
@@ -936,7 +944,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "svg", "width_mm"]
             }),
             |args, ctx| async move { handle_import_svg_logo(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
     ]
 }
 

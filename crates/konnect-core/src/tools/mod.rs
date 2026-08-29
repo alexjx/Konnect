@@ -58,9 +58,37 @@ pub struct ToolDef {
     pub description: &'static str,
     pub input_schema: Value,
     pub handler: ToolHandlerFn,
+    /// How the tool interacts with a board held by KiCad. Client guidance can
+    /// derive warnings from this runtime contract instead of maintaining a
+    /// second list of tool names.
+    pub board_access: BoardAccess,
+}
+
+/// The board-state contract of a tool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BoardAccess {
+    /// The tool does not need board-state guidance.
+    #[default]
+    None,
+    /// The requested board must be open in a reachable KiCad instance.
+    LiveOnly,
+    /// Live IPC is preferred, with a guarded file fallback only when KiCad is
+    /// unreachable and the board is safe to edit offline.
+    LivePreferredWithFallback,
+    /// The operation writes the file directly and therefore requires KiCad to
+    /// have the board closed.
+    ClosedBoardOnly,
+    /// Planning is non-mutating, while applying has a stricter board-state
+    /// requirement described by the tool itself.
+    ApplyModeDependent,
 }
 
 impl ToolDef {
+    pub fn with_board_access(mut self, board_access: BoardAccess) -> Self {
+        self.board_access = board_access;
+        self
+    }
+
     pub fn to_mcp_description(&self) -> McpToolDescription {
         McpToolDescription {
             name: self.name.to_string(),
@@ -262,6 +290,7 @@ macro_rules! tool {
             description: $desc,
             input_schema: $schema,
             handler: h,
+            board_access: $crate::tools::BoardAccess::None,
         }
     }};
 }

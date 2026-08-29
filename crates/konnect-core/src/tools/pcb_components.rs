@@ -1745,7 +1745,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "footprint", "reference", "x", "y"]
             }),
             |args, ctx| async move { handle_place_component(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "move_component",
             "Move a placed footprint to a new X/Y position. Uses live KiCAD IPC when reachable; \
@@ -1761,7 +1762,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference", "x", "y"]
             }),
             |args, ctx| async move { handle_move_component(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "rotate_component",
             "Set the rotation angle of a placed footprint. Uses live KiCAD IPC when reachable; \
@@ -1776,7 +1778,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference", "rotation"]
             }),
             |args, ctx| async move { handle_rotate_component(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "set_component_placements",
             "Set X/Y positions and rotations for multiple existing footprints atomically. Uses one live KiCAD IPC update and one undo step when reachable; otherwise safely edits a closed board file once with revision checks.",
@@ -1802,7 +1805,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "placements"]
             }),
             |args, ctx| async move { handle_set_component_placements(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "flip_component",
             "Set a placed footprint to F.Cu or B.Cu with KiCAD-equivalent geometry mirroring. \
@@ -1818,7 +1822,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference", "layer"]
             }),
             |args, ctx| async move { handle_flip_component(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "delete_component",
             "Remove a footprint from the board via KiCAD IPC.",
@@ -1831,7 +1836,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference"]
             }),
             |args, ctx| async move { handle_delete_component(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "edit_component",
             "Update the value or other properties of a placed footprint via KiCAD IPC.",
@@ -1845,7 +1851,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference"]
             }),
             |args, ctx| async move { handle_edit_component(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "repair_corrupted_footprints",
             "Repair the exact legacy corruption from Konnect issue #244: footprint drawing \
@@ -1876,7 +1883,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_repair_corrupted_footprints(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "find_component",
             "Find a footprint on the board by reference designator and return its position.",
@@ -1889,7 +1897,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference"]
             }),
             |args, ctx| async move { handle_find_component(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         super::pcb_footprint_update::tool(),
         tool!(
             "list_board_footprint_graphics",
@@ -1904,7 +1913,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference"]
             }),
             |args, ctx| async move { handle_list_board_footprint_graphics(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "edit_board_footprint_graphic",
             "Replace the vertices of a polygon inside a footprint placed on the board, selected by UUID. Points are footprint-local millimetres, as the .kicad_mod shows them. Use this to bring one placed instance in line with a library change without re-placing the part. Only a single-outline polygon with no holes can be replaced; anything else is refused by name rather than flattened. Requires KiCAD running with the board open.",
@@ -1930,7 +1940,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference", "uuid", "points"]
             }),
             |args, ctx| async move { handle_edit_board_footprint_graphic(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "get_component_pads",
             "Return live board-space pad positions, layers and net assignments for a footprint. \
@@ -1949,7 +1960,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference"]
             }),
             |args, ctx| async move { handle_get_component_pads(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "get_pad_position",
             "Return the live board-space position, layers and net of a specific pad number on a footprint.",
@@ -1963,7 +1975,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference", "pad_number"]
             }),
             |args, ctx| async move { handle_get_pad_position(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "get_component_list",
             "List all footprints on the board with their positions, layers, and values.",
@@ -1975,7 +1988,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_component_list(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "place_component_array",
             "Place multiple copies of a footprint in a grid or line array via KiCAD IPC.",
@@ -1996,7 +2010,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "footprint", "start_x", "start_y", "count_x", "spacing_x"]
             }),
             |args, ctx| async move { handle_place_array(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "align_components",
             "Align multiple footprints along a common X or Y axis via KiCAD IPC.",
@@ -2011,7 +2026,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "references", "value"]
             }),
             |args, ctx| async move { handle_align_components(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "duplicate_component",
             "Duplicate an existing footprint at a new position via KiCAD IPC.",
@@ -2027,7 +2043,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference", "new_reference", "x", "y"]
             }),
             |args, ctx| async move { handle_duplicate_component(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "get_board_2d_view",
             "Render the board with kicad-cli and return it as a base64 PNG. Note this is              kicad-cli's 3-D board render viewed from the top, not a layer plot -- there is              no layer selection. Use export_svg for layer-aware 2-D output.",
