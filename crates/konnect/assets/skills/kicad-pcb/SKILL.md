@@ -66,6 +66,18 @@ load_toolset('verification')     # run_drc, set_design_rules, set_predefined_siz
 
 Always call `get_active_toolsets()` first to see what is already loaded.
 
+### References by decision
+
+- Read [`references/layer-reference.md`](references/layer-reference.md) when
+  selecting a copper, fabrication, user, or mechanical layer or deciding which
+  side owns an item.
+- Read [`references/trace-width-table.md`](references/trace-width-table.md) when
+  estimating an initial trace width. Treat it as a starting point; the selected
+  stackup, current and voltage-drop budget, impedance calculation, netclass,
+  and fabricator contract decide the actual value.
+- Read [`references/design-rules.md`](references/design-rules.md) when creating
+  netclasses, configuring project constraints, or adjudicating DRC results.
+
 ---
 
 ## Layout Order
