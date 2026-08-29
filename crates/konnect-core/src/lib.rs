@@ -4,4 +4,5 @@ pub mod kicad_install;
 pub mod mcp;
 pub mod observability;
 pub mod router;
+pub(crate) mod specctra;
 pub mod tools;

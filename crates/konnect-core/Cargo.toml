@@ -11,6 +11,7 @@ konnect-sexp.workspace = true
 konnect-render.workspace = true
 konnect-ipc.workspace = true
 konnect-schematic-editor.workspace = true
+topola_specctra.workspace = true
 
 prost-types.workspace = true
 prost.workspace = true

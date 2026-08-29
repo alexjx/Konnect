@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **20 toolsets** organized into 10 categories
-- **217 registered tools** + **6 always-visible meta-tools** = **223 total**
+- **218 registered tools** + **6 always-visible meta-tools** = **224 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -284,8 +284,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ---
 
-### `pcb_export` · 13 tools
-**Purpose:** Gerber, PDF, SVG, 3D model, BOM, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++.
+### `pcb_export` · 14 tools
+**Purpose:** Gerber, PDF, SVG, 3D model, BOM, revision-bound Specctra DSN, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++.
 **Source:** [`crates/konnect-core/src/tools/pcb_export.rs`](crates/konnect-core/src/tools/pcb_export.rs)
 
 | Tool | Description |
@@ -296,6 +296,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `export_3d` | Export the PCB as a 3D model using kicad-cli, with explicit control over unspecified footprint models. |
 | `export_bom` | Generate KiCad 10's CSV Bill of Materials from schematic fields. |
 | `export_netlist` | Export the PCB netlist in KiCAD or IPC-D-356 format. |
+| `export_specctra_dsn` | Export a deterministic, revision-bound Specctra DSN plus reverse manifest from a supported live KiCad board; refuses unsupported geometry or incomplete rules. |
 | `export_position_file` | Generate a component placement (pick-and-place) position file for SMT assembly. |
 | `export_dxf` | Export the PCB to DXF, one file per requested layer, using kicad-cli. `layers` is required — there is no all-layers default. For mechanical CAD interchange. |
 | `export_gencad` | Export the PCB in GenCAD format using kicad-cli. |

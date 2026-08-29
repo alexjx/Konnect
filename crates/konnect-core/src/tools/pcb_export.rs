@@ -1,14 +1,16 @@
 //! `pcb_export` toolset — Gerber, PDF, SVG, 3D, BOM, netlist, position file, DRC,
 //! zone refill, and DXF/GenCAD/IPC-2581/ODB++ interchange formats.
 //!
-//! All operations delegate to `kicad-cli` via the `cli` module, except `refill_zones`
-//! which uses the KiCAD IPC API.
+//! Most operations delegate to `kicad-cli` via the `cli` module. `refill_zones`
+//! and revision-bound Specctra export use the KiCad IPC API.
 
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_array, ToolContext, ToolDef};
 use anyhow::Context;
 use serde_json::json;
+use std::path::{Path, PathBuf};
 use tokio::task;
 
 use super::cli;
@@ -261,6 +263,36 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "output"]
             }),
             |args, ctx| async move { handle_export_netlist(args, ctx).await }
+        ),
+        tool!(
+            "export_specctra_dsn",
+            "Export a deterministic Specctra DSN routing job from the exact live KiCad PCB \
+             editor revision. Requires the named board to be open with IPC enabled. The first \
+             supported profile is deliberately narrow: two copper layers, front-side SMD or \
+             through-hole footprints, circle/rectangle pads, one straight-line closed outline, \
+             and no existing tracks, vias, or zones. Konnect refuses unsupported geometry or \
+             custom DRC rules, or incomplete effective routing rules instead of approximating \
+             them, and writes a \
+             revision-bound reverse manifest beside the DSN for later SES import.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": {
+                        "type": "string",
+                        "description": "Path to the .kicad_pcb file currently open in KiCad PCB Editor"
+                    },
+                    "output": {
+                        "type": "string",
+                        "description": "New .dsn file path. Existing files are never replaced."
+                    },
+                    "manifest_output_path": {
+                        "type": "string",
+                        "description": "Optional new reverse-manifest JSON path. Defaults to <output>.konnect.json. Existing files are never replaced."
+                    }
+                },
+                "required": ["board", "output"]
+            }),
+            |args, ctx| async move { handle_export_specctra_dsn(args, ctx).await }
         ),
         tool!(
             "export_position_file",
@@ -605,6 +637,192 @@ async fn handle_export_netlist(
     ))
 }
 
+fn extension_is(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+}
+
+fn default_specctra_manifest_path(output_path: &Path) -> PathBuf {
+    let mut name = output_path.as_os_str().to_os_string();
+    name.push(".konnect.json");
+    PathBuf::from(name)
+}
+
+fn existing_export_targets(paths: &[&Path]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| path.exists())
+        .map(|path| path.display().to_string())
+        .collect()
+}
+
+fn write_specctra_export_pair(
+    output_path: &Path,
+    dsn: &str,
+    manifest_output_path: &Path,
+    manifest: &str,
+) -> anyhow::Result<()> {
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create DSN output directory {}", parent.display()))?;
+    }
+    if let Some(parent) = manifest_output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create manifest output directory {}", parent.display()))?;
+    }
+
+    // Both writes are create-new and individually atomic. If the second write
+    // loses a race, remove only the exact DSN this call just created so callers
+    // never receive half of a routing job.
+    konnect_sexp::write_new_atomic(output_path, dsn)
+        .with_context(|| format!("create DSN {}", output_path.display()))?;
+    if let Err(error) = konnect_sexp::write_new_atomic(manifest_output_path, manifest) {
+        let cleanup = std::fs::remove_file(output_path);
+        if let Err(cleanup_error) = cleanup {
+            return Err(anyhow::anyhow!(error)).context(format!(
+                "create manifest {} failed and cleanup of newly-created DSN {} also failed: {cleanup_error}",
+                manifest_output_path.display(),
+                output_path.display()
+            ));
+        }
+        return Err(anyhow::anyhow!(error))
+            .with_context(|| format!("create manifest {}", manifest_output_path.display()));
+    }
+    Ok(())
+}
+
+async fn handle_export_specctra_dsn(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let output_path = get_path(args, "output")?;
+    let manifest_output_path = args["manifest_output_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_specctra_manifest_path(&output_path));
+
+    if !extension_is(&board_path, "kicad_pcb") {
+        return Ok(invalid_export_argument(
+            "board",
+            "must have the .kicad_pcb extension",
+        ));
+    }
+    if !extension_is(&output_path, "dsn") {
+        return Ok(invalid_export_argument(
+            "output",
+            "must have the .dsn extension",
+        ));
+    }
+    if output_path == manifest_output_path {
+        return Ok(invalid_export_argument(
+            "manifest_output_path",
+            "must not name the DSN output path",
+        ));
+    }
+    let conflicts = existing_export_targets(&[&output_path, &manifest_output_path]);
+    if !conflicts.is_empty() {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::Conflict {
+                paths: conflicts.clone(),
+            },
+            format!(
+                "Specctra export is non-destructive; remove or choose new output paths: {}",
+                conflicts.join(", ")
+            ),
+        ));
+    }
+    let board_path = board_path
+        .canonicalize()
+        .with_context(|| format!("resolve board {}", board_path.display()))?;
+    let custom_rules_path = board_path.with_extension("kicad_dru");
+    if custom_rules_path.is_file() {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: format!(
+                    "custom DRC rules are outside the first supported routing profile: {}",
+                    custom_rules_path.display()
+                ),
+            },
+            format!(
+                "Specctra export refused: custom DRC rules are outside the first supported routing profile ({})",
+                custom_rules_path.display()
+            ),
+        ));
+    }
+    let board_for_ipc = board_path.clone();
+    let addr = ctx.config.ipc_address.clone();
+    let export = with_ipc(addr, move |client| {
+        let document = client.find_open_board(&board_for_ipc)?;
+        let before = client.save_document_to_string_in(document.clone())?;
+        let rules = client.get_effective_routing_rules_in(document.clone())?;
+        let after = client.save_document_to_string_in(document)?;
+        if before != after {
+            anyhow::bail!(
+                "KiCad board changed while routing rules were captured; retry from a stable editor revision"
+            );
+        }
+        crate::specctra::export_dsn(&board_for_ipc, &before, &rules)
+    })
+    .await?;
+    let export = match export {
+        Ok(export) => export,
+        Err(reason) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: reason.clone(),
+                },
+                format!("Specctra export refused: {reason}"),
+            ));
+        }
+    };
+
+    let output_for_write = output_path.clone();
+    let manifest_for_write = manifest_output_path.clone();
+    let dsn_for_write = export.dsn.clone();
+    let manifest_text_for_write = export.manifest.clone();
+    task::spawn_blocking(move || {
+        write_specctra_export_pair(
+            &output_for_write,
+            &dsn_for_write,
+            &manifest_for_write,
+            &manifest_text_for_write,
+        )
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("Specctra output writer panicked: {error}"))??;
+
+    Ok(CallToolResult::text(
+        json!({
+            "success": true,
+            "method": "kicad_ipc_snapshot",
+            "board": board_path,
+            "output": output_path,
+            "manifest_output_path": manifest_output_path,
+            "source_sha256": export.source_sha256,
+            "component_count": export.component_count,
+            "pad_count": export.pad_count,
+            "net_count": export.net_count,
+            "routing_class_count": export.class_count,
+            "capabilities": {
+                "dsn_export_available": true,
+                "ses_import_available": false,
+                "freerouting_bridge_available": false,
+                "source_revision_bound": true,
+                "supported_profile": "two_layer_front_side_circle_rect_no_existing_routing_or_zones"
+            }
+        })
+        .to_string(),
+    ))
+}
+
 async fn handle_export_position_file(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -870,6 +1088,76 @@ mod new_export_format_tests {
             },
             Arc::new(ToolRouter::new()),
         )
+    }
+
+    #[test]
+    fn specctra_manifest_defaults_beside_dsn() {
+        assert_eq!(
+            default_specctra_manifest_path(Path::new("build/clock.dsn")),
+            PathBuf::from("build/clock.dsn.konnect.json")
+        );
+    }
+
+    #[test]
+    fn specctra_pair_writer_removes_partial_dsn_if_manifest_creation_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dsn = dir.path().join("board.dsn");
+        let manifest = dir.path().join("board.dsn.konnect.json");
+        std::fs::write(&manifest, "owned by another process").expect("seed conflict");
+
+        let error = write_specctra_export_pair(&dsn, "(pcb board)", &manifest, "{}")
+            .expect_err("existing manifest must be preserved");
+
+        assert!(error.to_string().contains("create manifest"));
+        assert!(!dsn.exists(), "a failed pair must not leave a DSN behind");
+        assert_eq!(
+            std::fs::read_to_string(manifest).unwrap(),
+            "owned by another process"
+        );
+    }
+
+    #[tokio::test]
+    async fn specctra_export_reports_existing_output_as_structured_conflict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board = dir.path().join("board.kicad_pcb");
+        let output = dir.path().join("board.dsn");
+        std::fs::write(&board, "(kicad_pcb)").expect("board fixture");
+        std::fs::write(&output, "do not replace").expect("seed conflict");
+
+        let result =
+            handle_export_specctra_dsn(&json!({ "board": board, "output": output }), &test_ctx())
+                .await
+                .expect("conflict is an MCP result");
+
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("conflict")
+        );
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "do not replace");
+    }
+
+    #[tokio::test]
+    async fn specctra_export_refuses_custom_rule_file_before_ipc() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board = dir.path().join("board.kicad_pcb");
+        let rules = dir.path().join("board.kicad_dru");
+        let output = dir.path().join("board.dsn");
+        std::fs::write(&board, "(kicad_pcb)").expect("board fixture");
+        std::fs::write(&rules, "(rule custom)").expect("custom rules fixture");
+
+        let result =
+            handle_export_specctra_dsn(&json!({ "board": board, "output": output }), &test_ctx())
+                .await
+                .expect("unsupported profile is an MCP result");
+
+        assert!(result.is_error);
+        assert!(!output.exists());
+        let text = match result.content.first().unwrap() {
+            crate::mcp::protocol::ToolContent::Text { text } => text,
+            _ => panic!("expected text result"),
+        };
+        assert!(text.contains("custom DRC rules"), "{text}");
     }
 
     #[tokio::test]
