@@ -9,235 +9,160 @@ argument-hint: "[fab house or export task]"
 
 # KiCAD Manufacturing & Fabrication Workflow
 
-This skill guides Claude through preparing a KiCAD design for manufacturing using Konnect MCP tools.
-ALL modifications go through MCP tools — never edit project files directly.
+Prepare manufacturing outputs through Konnect MCP tools. Treat each tool result
+as evidence with a named scope: a successful request is not by itself proof of a
+complete, current, upload-ready package. A required check or artifact that cannot
+be established makes the manufacturing verdict `INCOMPLETE`.
 
----
+## Toolset loading
 
-## Toolset Loading
-
-Before any manufacturing work, load the required toolsets:
-
-```
-load_toolset('pcb_export')       # export_gerber, export_bom, export_position_file, get_drc_violations
-load_toolset('manufacturing')    # export_manufacturing_package, validate_for_manufacturing, estimate_cost
-```
-
-Load additional toolsets as needed:
+Load the required toolsets:
 
 ```
-load_toolset('sch_analysis')     # inspect nets, verify footprints assigned
-load_toolset('integration')      # search_jlcpcb_parts, suggest_jlcpcb_alternatives
-load_toolset('pcb_export')       # export_3d for visual verification
+load_toolset('pcb_export')       # Gerber, drill, BOM, position, 3D, and direct DRC evidence
+load_toolset('manufacturing')    # Package export, manufacturing preflight, and rough cost estimate
 ```
 
-Always call `get_active_toolsets()` first to see what is already loaded.
+Load additional toolsets only for the branch that needs them:
+
+```
+load_toolset('sch_analysis')     # schematic inventory and footprint assignment
+load_toolset('integration')      # local JLCPCB catalogue and alternatives
+```
+
+Call `get_active_toolsets()` before loading more.
 
 ### References by manufacturing branch
 
 - Read [`references/gerber-layers.md`](references/gerber-layers.md) when
-  selecting manual plot layers or checking the generated artifact inventory.
+  selecting plot layers or accepting a generated artifact inventory.
 - Read [`references/jlcpcb-rules.md`](references/jlcpcb-rules.md) only when
-  JLCPCB is the selected fabricator or assembler. Verify time-sensitive limits,
-  field names, pricing, and part categories against the current order contract.
+  JLCPCB is the selected fabricator or assembler. It defines how to capture the
+  current order contract without caching volatile limits, prices, categories,
+  or field names in this skill.
 
----
+## 1. Capture the order contract
 
-## Pre-Flight Checklist
+Before checking or exporting, record the selected fabricator, service tier,
+stackup, copper weight, finish, assembly sides, stencil requirement, quantity,
+and any controlled-impedance service. Record the source and retrieval date for
+every vendor-controlled requirement. Project rules and output acceptance are
+judged against that record.
 
-Run these checks BEFORE generating any manufacturing outputs. Stop and fix issues at each stage.
+Completion criterion: every applicable fabrication and assembly constraint has
+one current authority, and no decision rests on an undated table in this skill.
 
-### 1. DRC — Zero Errors Required
+## 2. Establish direct design evidence
+
+Run direct KiCad DRC against the saved target board and resolve every error or
+record a deliberate, reviewable waiver. Then run:
 
 ```
-get_drc_violations()
+validate_for_manufacturing(board, fab_house?)
 ```
 
-- All errors must be resolved. Warnings should be reviewed but may be waived.
-- Common blockers: unrouted nets, clearance violations, minimum width violations.
-- Do NOT proceed to export if any DRC errors remain.
+The current handler checks only:
 
-### 2. Manufacturing Validation
+- presence of at least one `Edge.Cuts` item;
+- presence of footprints;
+- the configured minimum trace width against its built-in fab profile;
+- the coarse case where several nets exist but no routed tracks exist; and
+- direct `kicad-cli` DRC evidence, which must be available and complete for a
+  `READY` verdict.
 
-```
-validate_for_manufacturing()
-```
+Read `verdict`, `issues`, and `drc` together. A null or incomplete `drc`, a
+`NOT READY` verdict, or an unadjudicated issue blocks release.
 
-- Checks board outline is closed
-- Checks all pads have copper
-- Checks drill sizes are within fabrication limits
-- Checks silkscreen does not overlap pads
+This preflight does not prove outline closure, copper on every pad, drill-size
+acceptance, silkscreen clearance, stackup compatibility, or assembly readiness.
+Establish those separately with direct DRC, the selected fabricator's current
+contract, Gerber/drill inspection, BOM/CPL review, and the order preview.
 
-### 3. Verify Footprints Assigned
+Completion criterion: direct DRC is complete, every reported issue is resolved
+or waived, and every check outside the handler's stated scope has named evidence.
 
-Every schematic symbol must have a footprint assigned. Check for:
-- Missing footprint assignments (shows as empty Footprint field)
-- Mismatched footprints (wrong pad count for the symbol)
-- Non-existent footprint references (library not found)
+## 3. Export into a fresh destination
 
----
+Prefer a new, empty output directory for each invocation. This makes stale files
+structurally unable to impersonate output from the current invocation.
 
-## Export Workflow
-
-### One-Shot Export (Recommended)
+For a package attempt:
 
 ```
 export_manufacturing_package(board, output_dir, fab_house?, schematic?)
 ```
 
-`fab_house` selects the house profile (there is no `format` argument). Pass
-`schematic` when you want the BOM generated as part of the package.
+Pass `schematic` when assembly output requires a BOM. The tool attempts Gerber,
+drill, position, and BOM exports according to the request; individual failures
+can still leave a partial directory.
 
-Generates all manufacturing files in one call:
-- Gerbers (all copper layers + mask + silkscreen + edge cuts)
-- Drill files (Excellon format)
-- BOM (CSV)
-- Pick-and-place / component position file (CPL)
-- Job file (optional, fab-house specific)
+### Artifact acceptance gate
 
-### Manual Export (When You Need Control)
+1. Inspect `warnings` and `files_generated`. Any warning or missing requested
+   artifact type keeps the result `INCOMPLETE`.
+2. Reconcile the requested copper, mask, silkscreen, paste, and `Edge.Cuts`
+   layers against the actual files in the fresh output directory.
+3. Confirm every required artifact is a regular, non-empty file produced by the
+   current invocation. A directory entry, reported path, or zero exit status is
+   not enough.
+4. Confirm the required plated and non-plated drill outputs for the actual board
+   hole inventory. Absence is acceptable only when the design proves that output
+   is inapplicable.
+5. Open the Gerbers and drills in a viewer. Inspect layer registration, outline,
+   apertures, holes/slots, mask, paste, and silkscreen.
+6. For assembly, inspect BOM contents, DNP handling, designator coverage, CPL
+   side/units/origin/rotation, and the fabricator's export preview.
 
-Use individual tools when you need specific settings per file:
+The current `files` field is a directory listing and can include pre-existing
+entries; `files_generated` records successful export calls but does not prove
+that every reported output is fresh and non-empty. If a later tool response
+provides an explicit verified artifact manifest, accept that stronger evidence
+only for the artifacts and postconditions it names. Preserve the viewer and
+order-preview checks.
 
-#### Step 1: Gerbers
+Completion criterion: an accepted manifest accounts for every required output,
+every accepted path is fresh and non-empty, and visual/order previews agree with
+the saved design.
+
+## 4. Use manual exports when control is required
+
+Use the individual tools when a package needs explicit layer, BOM, side, unit,
+or filename choices:
 
 ```
 export_gerber(board, output_dir, layers?, drill_file?)
-```
-
-Standard layers to export:
-- F.Cu, B.Cu (and inner layers if present)
-- F.Mask, B.Mask
-- F.SilkS, B.SilkS
-- F.Paste, B.Paste (for stencils)
-- Edge.Cuts (board outline)
-
-#### Step 2: Bill of Materials
-
-```
 export_bom(schematic, output, format?, fields?, group_by?, labels?, exclude_dnp?)
-```
-
-Include fields: Reference, Value, Footprint, LCSC (if targeting JLCPCB).
-
-#### Step 3: Component Position File
-
-```
 export_position_file(board, output, format?, side?, units?)
 ```
 
-Required for SMT assembly. Contains X/Y/Rotation for each component.
-Export separately for top and bottom if double-sided assembly.
+Apply the same fresh-destination and artifact acceptance gate. A manual sequence
+does not lower the evidence requirement.
 
----
-
-## JLCPCB-Specific Guidance
-
-### Part Sourcing
-
-```
-search_jlcpcb_parts(query)                     # Find LCSC part numbers
-suggest_jlcpcb_alternatives(value, footprint)  # Find alternatives for OOS parts
-```
-
-### Part Categories
-
-| Category           | Description                              | Extra Cost             |
-|--------------------|------------------------------------------|------------------------|
-| **Basic**          | ~700 common parts, pre-loaded on machine | None                   |
-| **Preferred Ext.** | Popular extended parts                   | No feeder loading fee  |
-| **Extended**       | 300k+ parts, loaded on demand            | $3 per unique part     |
-
-**Strategy**: Use basic parts wherever possible. Every extended part adds $3 to assembly cost.
-Search with `search_jlcpcb_parts` and filter by `basic: true` when looking for alternatives.
-
-### Minimum Design Rules (JLCPCB Standard Process)
-
-| Parameter              | Minimum Value |
-|------------------------|---------------|
-| Trace width            | 0.127mm (5mil)  |
-| Trace spacing          | 0.127mm (5mil)  |
-| Via drill              | 0.3mm          |
-| Via annular ring       | 0.15mm (6mil)   |
-| Min hole size          | 0.3mm          |
-| Pad-to-pad clearance   | 0.254mm (10mil) |
-| Silkscreen line width  | 0.15mm         |
-| Board thickness        | 0.8-2.0mm (1.6 default) |
-| Min board size         | 10x10mm        |
-
-Use `add_design_rule` or `list_design_rules` to configure project rules to match.
-
-### JLCPCB BOM Requirements
-
-- Column headers must be exactly: `Designator`, `Comment`, `Footprint`, `LCSC Part #`
-- LCSC Part # format: `Cxxxxxx` (e.g., C14663)
-- Group identical parts on one row with comma-separated designators
-
-### JLCPCB CPL (Position File) Requirements
-
-- Columns: `Designator`, `Mid X`, `Mid Y`, `Layer`, `Rotation`
-- Coordinates in millimeters
-- Rotation in degrees (0-360)
-- Layer values: `Top` or `Bottom`
-
----
-
-## Cost Estimation
+## 5. Treat cost output as a heuristic
 
 ```
 estimate_cost(board, quantity?, layers?, fab_house?)
 ```
 
-Factors that increase cost:
-- Layer count (2 vs 4 vs 6+)
-- Board size
-- Number of unique extended parts
-- Double-sided assembly
-- Special finishes (ENIG vs HASL)
-- Tight tolerances below standard minimums
-- Expedited turnaround
+`estimate_cost` is an indicative heuristic built from fixed assumptions and
+rough average component costs. Use it only for coarse comparisons. It is not a
+vendor quote and does not know the selected finish, service, complete BOM,
+shipping, taxes, coupons, or current pricing. Budget and purchasing decisions
+require a current quote from the selected fabricator.
 
----
+## 6. Record manufacturing acceptance
 
-## 3D Verification
+The final report must include:
 
-Before submitting to fab, always generate a 3D view:
+- saved design revision or hash;
+- direct DRC status and any explicit waivers;
+- `validate_for_manufacturing` verdict, issues, and DRC coverage;
+- selected fabricator/order contract with source and retrieval date;
+- accepted artifact manifest with file type, path, and non-empty evidence;
+- Gerber/drill viewer result;
+- BOM/CPL and order-preview result when assembly is in scope;
+- 3D/enclosure inspection status when mechanically relevant; and
+- final `READY`, `NOT READY`, or `INCOMPLETE` verdict.
 
-```
-export_3d(board, output, format?, include_unspecified?)
-```
-
-Visual checks:
-- Component clearance (tall parts near board edges)
-- Connector accessibility and orientation
-- Mounting hole alignment
-- Heatsink/thermal pad clearance
-- Enclosure fit (if applicable)
-
----
-
-## Common Mistakes
-
-1. **Exporting with DRC errors** — Always run DRC first. A clearance violation can short traces on the fab board.
-2. **Wrong drill file format** — JLCPCB expects Excellon format. PTH and NPTH in separate files.
-3. **Missing board outline** — Edge.Cuts layer must be a closed polygon. Open outlines cause fab rejection.
-4. **Silkscreen on pads** — Silkscreen ink on exposed copper pads prevents soldering. Remove overlaps.
-5. **Wrong position file origin** — CPL origin must match board origin. Use board center or bottom-left corner consistently.
-6. **Forgetting paste layer** — If ordering stencils, F.Paste/B.Paste must be exported.
-7. **Out-of-stock parts in BOM** — Always verify availability with `search_jlcpcb_parts` before ordering.
-8. **Rotation offsets** — JLCPCB may apply rotation corrections. Review their orientation guide for ICs and polarized components.
-9. **Panelization not accounted for** — If panelizing, export from the panel file, not the individual board.
-10. **Missing fiducials** — SMT assembly with fine-pitch parts requires at least 2 fiducial marks on each assembly side.
-
----
-
-## Rules
-
-1. **Never export without passing DRC** — zero errors required
-2. **Never skip validate_for_manufacturing** — catches issues DRC misses
-3. **Always verify part availability** before finalizing BOM for assembly
-4. **Export 3D model** before submitting order — visual sanity check
-5. **Save project before export** — ensures exported files match current state
-6. **Load toolsets first** — check `get_active_toolsets()` and load what you need
-7. **Use one-shot export when possible** — `export_manufacturing_package` ensures consistency
-8. **Double-check fab house requirements** — each house has slightly different file format expectations
+Only `READY` permits upload. Preserve the accepted manifest rather than telling
+the user to upload every entry found in a reused directory.

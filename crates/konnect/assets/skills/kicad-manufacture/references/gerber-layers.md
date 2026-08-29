@@ -1,6 +1,9 @@
 # Gerber Layer Mapping
 
-## Standard Gerber File Extensions
+## Common Gerber File Extensions
+
+Filenames and extensions vary with KiCad and exporter options. Accept files by
+their plotted layer and content, not by suffix alone.
 
 | KiCAD Layer | Gerber Extension | Purpose |
 |-------------|-----------------|---------|
@@ -24,35 +27,30 @@
 | Non-plated holes | `-NPTH.drl` | Mounting holes, slots |
 | Drill map | `.drl.map` | Visual drill reference |
 
-## What `export_gerber` Produces
+## What `export_gerber` Attempts
 
-The `export_gerber` tool generates all required files in one call:
-- All copper layers present in the design
-- Both mask layers
-- Both silkscreen layers
-- Both paste layers
-- Edge.Cuts (board outline)
-- Drill file(s)
+With no explicit layer list, `export_gerber` selects enabled copper layers,
+front/back mask and silkscreen, and `Edge.Cuts`. Paste is not in that default
+selection. With `drill_file` enabled, drill export is a separate best-effort
+step. The returned directory listing may contain older entries and does not
+prove that the current invocation created a complete, non-empty set.
 
-## What Fab Houses Expect
-
-### JLCPCB Upload
-Upload a single `.zip` containing all Gerber + drill files.
-JLCPCB auto-detects layers by extension or content.
-
-### PCBWay Upload
-Same as JLCPCB — single zip with all Gerbers.
-
-### OSH Park Upload
-Upload the `.kicad_pcb` file directly (they parse it themselves).
-Or upload Gerber zip.
+Choose layers from the saved board and the selected fabricator's current order
+contract. Use a fresh output directory and apply the manufacturing skill's
+artifact acceptance gate.
 
 ## Verification Checklist
 
 Before uploading Gerbers:
-1. `get_drc_violations` — zero errors
-2. `export_3d` — visual check of the 3D model
-3. Open Gerbers in a viewer (KiCAD's built-in, or gerbv)
-4. Verify board outline is closed (no gaps in Edge.Cuts)
-5. Verify drill file has correct hole count
-6. Verify silkscreen doesn't overlap pads
+
+1. Re-run direct DRC against the saved board and adjudicate every result.
+2. Confirm each requested artifact is a regular, non-empty file from the fresh
+   invocation.
+3. Reconcile every expected copper, mask, silkscreen, paste, and outline layer
+   with the accepted manifest.
+4. Open Gerbers and drills in a viewer and inspect registration, outline,
+   apertures, mask, paste, silkscreen, holes, and slots.
+5. Compare the viewer and upload preview with the selected fabricator's current
+   order contract.
+
+Any missing, stale, empty, or unexplained artifact makes the package `INCOMPLETE`.
