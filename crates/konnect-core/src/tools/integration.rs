@@ -140,6 +140,24 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_check_freerouting(args, ctx).await }
         ),
+        tool!(
+            "route_specctra_dsn",
+            "Route an existing Specctra DSN through the local Freerouting JAR's native headless MCP server and create a new SES file. Uses the documented session/job state machine, never sends board data to a cloud service, and never replaces an existing output.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "dsn_path": { "type": "string", "description": "Existing Specctra .dsn input" },
+                    "ses_output_path": { "type": "string", "description": "New .ses output path; existing files are never replaced" },
+                    "jar_path": { "type": "string", "description": "Optional Freerouting JAR path; otherwise uses installation discovery" },
+                    "max_passes": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "optimizer_enabled": { "type": "boolean" },
+                    "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+                    "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900 }
+                },
+                "required": ["dsn_path", "ses_output_path"]
+            }),
+            |args, ctx| async move { handle_route_specctra_dsn(args, ctx).await }
+        ),
     ]
 }
 
@@ -1223,6 +1241,64 @@ async fn handle_check_freerouting(
             })))
         }
     }
+}
+
+async fn handle_route_specctra_dsn(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let dsn = get_path(args, "dsn_path")?;
+    let ses_output = get_path(args, "ses_output_path")?;
+    let Some(jar) = find_freerouting_jar(args) else {
+        return Ok(CallToolResult::error(
+            "Freerouting JAR not found; install Freerouting or pass jar_path",
+        ));
+    };
+    let max_passes = args["max_passes"]
+        .as_u64()
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("max_passes is too large"))?;
+    let job_timeout_seconds = args["job_timeout_seconds"].as_u64();
+    let overall_timeout_seconds = args["overall_timeout_seconds"].as_u64().unwrap_or(900);
+    let settings = crate::freerouting_mcp::RouteSettings {
+        max_passes,
+        optimizer_enabled: args["optimizer_enabled"].as_bool(),
+        job_timeout_seconds,
+        poll_interval: std::time::Duration::from_secs(3),
+        overall_timeout: std::time::Duration::from_secs(overall_timeout_seconds),
+    };
+    let evidence = crate::freerouting_mcp::route_local(&jar, &dsn, &ses_output, &settings)
+        .await
+        .map_err(|error| anyhow::anyhow!("Freerouting MCP routing failed: {error:#}"))?;
+    Ok(CallToolResult::json(&json!({
+        "success": true,
+        "method": "local_freerouting_native_mcp",
+        "engine": {
+            "name": "Freerouting",
+            "jar_path": jar,
+            "execution": "local"
+        },
+        "native_mcp": {
+            "used": true,
+            "server_protocol_version": evidence.server_protocol_version
+        },
+        "bridge": {
+            "mode": "dsn_ses_file_round_trip",
+            "cloud_used": false
+        },
+        "artifacts": {
+            "dsn_path": dsn,
+            "ses_output_path": ses_output,
+            "diagnostics_path": evidence.diagnostics_path
+        },
+        "session_id": evidence.session_id,
+        "job_id": evidence.job_id,
+        "final_state": evidence.final_state,
+        "poll_count": evidence.poll_count,
+        "elapsed_seconds": evidence.elapsed_seconds,
+        "ses_bytes": evidence.ses_bytes
+    })))
 }
 
 #[cfg(test)]
