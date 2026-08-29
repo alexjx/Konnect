@@ -28,7 +28,14 @@ enum Cli<'a> {
 }
 
 /// Subcommands that take `--client`/`--help` rather than being server flags.
-const SUBCOMMANDS: &[&str] = &["init", "uninstall", "status", "skill", "transaction"];
+const SUBCOMMANDS: &[&str] = &[
+    "init",
+    "uninstall",
+    "status",
+    "skill",
+    "hook",
+    "transaction",
+];
 
 fn classify(args: &[String]) -> Cli<'_> {
     let subcommand = args
@@ -86,6 +93,10 @@ async fn main() -> Result<()> {
         Cli::Subcommand("skill") => {
             let name = args.get(2).map(String::as_str).unwrap_or("");
             return install::print_skill_content(name);
+        }
+        Cli::Subcommand("hook") => {
+            let name = args.get(2).map(String::as_str).unwrap_or("");
+            return install::print_hook_output(name);
         }
         Cli::Subcommand("transaction") => return transaction_cli::run(&args[2..]),
         Cli::Subcommand(_) | Cli::Server => {}
@@ -198,7 +209,11 @@ fn print_help_for(subcommand: Option<&str>) {
         }
         Some("skill") => {
             println!("konnect skill <name>\n");
-            println!("Print a bundled skill's content to stdout, for hooks. Writes nothing.");
+            println!("Print bundled guidance as human-readable text. Writes nothing.");
+        }
+        Some("hook") => {
+            println!("konnect hook <name>\n");
+            println!("Print one structured Claude hook response as JSON. Writes nothing.");
         }
         Some("transaction") => {
             println!("konnect transaction status <project-dir>");
@@ -221,6 +236,7 @@ fn print_help() {
     println!("  konnect uninstall [--client <client>]");
     println!("  konnect status [--client <client>]");
     println!("  konnect skill <name>     Print skill content (for hooks)");
+    println!("  konnect hook <name>      Print structured Claude hook JSON");
     println!("  konnect transaction status <project-dir>");
     println!("  konnect transaction recover <project-dir>");
     println!("  konnect transaction abandon <project-dir> <id> --force");
@@ -249,7 +265,14 @@ mod cli_dispatch_tests {
     /// `uninstall --help` was the same code path. The reporter did not run it.
     #[test]
     fn subcommand_help_is_help_and_never_the_subcommand() {
-        for name in ["init", "uninstall", "status", "skill", "transaction"] {
+        for name in [
+            "init",
+            "uninstall",
+            "status",
+            "skill",
+            "hook",
+            "transaction",
+        ] {
             for flag in ["--help", "-h"] {
                 assert_eq!(
                     classify(&cli(&[name, flag])),
@@ -295,6 +318,10 @@ mod cli_dispatch_tests {
         assert_eq!(
             classify(&cli(&["skill", "konnect"])),
             Cli::Subcommand("skill")
+        );
+        assert_eq!(
+            classify(&cli(&["hook", "pre-pcb-ipc"])),
+            Cli::Subcommand("hook")
         );
         assert_eq!(
             classify(&cli(&["transaction", "status", "dir"])),

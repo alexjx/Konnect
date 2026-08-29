@@ -62,7 +62,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_name", "layer", "x1", "y1", "x2", "y2"]
             }),
             |args, ctx| async move { handle_route_trace(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "route_pad_to_pad",
             "Route a direct trace between two pads of named components (L-bend routing) via KiCAD IPC.",
@@ -81,7 +82,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_name", "ref1", "pad1", "ref2", "pad2"]
             }),
             |args, ctx| async move { handle_route_pad_to_pad(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "add_via",
             "Add a through-hole via at a given position and assign it to a net via KiCAD IPC.",
@@ -98,7 +100,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_name", "x", "y"]
             }),
             |args, ctx| async move { handle_add_via(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "add_copper_pour",
             "Alias of pcb_board's add_zone, kept for compatibility: identical arguments, \
@@ -107,7 +110,8 @@ pub fn tools() -> Vec<ToolDef> {
              only when no live KiCAD answers.",
             crate::tools::pcb_board::zone_schema(),
             |args, ctx| async move { handle_add_copper_pour(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "delete_trace",
             "Delete a trace segment identified by its UUID via KiCAD IPC.",
@@ -120,7 +124,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "uuid"]
             }),
             |args, ctx| async move { handle_delete_trace(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "query_traces",
             "List trace segments on the board, optionally filtered by net and/or layer. \
@@ -135,7 +140,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_query_traces(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "get_nets_list",
             "Return all nets defined on the PCB via KiCAD IPC.",
@@ -147,7 +153,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_nets_list(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "modify_trace",
             "Modify a trace segment by deleting and re-adding it with new parameters.",
@@ -165,7 +172,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "uuid", "net_name", "layer", "x1", "y1", "x2", "y2"]
             }),
             |args, ctx| async move { handle_modify_trace(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "create_netclass",
             "Create or update a netclass in the project's design rules. Writes \
@@ -250,7 +258,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_pos", "net_neg", "x1", "y1", "x2", "y2"]
             }),
             |args, ctx| async move { handle_route_diff_pair(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
     ]
 }
 

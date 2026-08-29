@@ -196,7 +196,8 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move {
                 super::pcb_sync::handle_update_pcb_from_schematic(args, ctx).await
             }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
     ]
 }
 
