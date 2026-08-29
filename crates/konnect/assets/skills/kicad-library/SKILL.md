@@ -120,6 +120,54 @@ Before creating or wiring a package-sensitive part:
 7. **Refuse to use the part in a real schematic** while any mirror,
    reversal, duplicate, missing lead or view ambiguity is unresolved.
 
+### Physical pin-map acceptance contract
+
+For every custom or package-sensitive part, complete this record before the
+symbol and footprint are accepted. "Looks sequential" and a matching pin
+count are not evidence.
+
+Record the manufacturer, exact MPN and package suffix, datasheet document
+number/revision, source URL, relevant page numbers, symbol library ID, and
+footprint library ID. Then add one row for **every physical lead**:
+
+| Datasheet lead | Function | Symbol pin / name / type | Footprint pad | X/Y (mm) | Drawing view / direction | Evidence |
+|---|---|---|---|---|---|---|
+| 1 | Example only | 1 / NAME / passive | 1 | 0.00 / 0.00 | bottom view, clockwise from key | datasheet p. N, figure M |
+
+Apply these rules to the table:
+
+- Walk from the datasheet's documented key, notch, dot, flat, bevel, or other
+  datum in the stated direction. State top, bottom, component, solder, pin, or
+  mating view in every row; never silently translate between views.
+- Give repeated physical leads separate rows even when they share one
+  electrical function. List exposed pads, shields, mounting tabs, and
+  mechanical holes separately and state whether each is an electrical pad,
+  a duplicated connection, or intentionally absent from the symbol.
+- Reconcile and record the datasheet physical-lead count, symbol electrical-pin
+  count, footprint electrical-pad count, duplicate-pad count, and
+  mechanical-only feature count. Explain every difference.
+- Treat a symbol pin number and footprint pad number as the same physical lead
+  only when the evidence row proves it. Names such as A/K, G/D/S, B/C/E, COM,
+  or VCC do not establish the physical number.
+
+Acceptance procedure:
+
+1. Create or select the exact symbol and footprint only after completing the
+   source columns above.
+2. Query the symbol back with `get_symbol_info` and the footprint with
+   `get_footprint_info`. Compare every returned pin/pad number, name, type,
+   coordinate, drill, size, and layer set to the table and datasheet.
+3. Place a **disposable** symbol and footprint in a scratch project. Render the
+   schematic and board, then inspect the pin-1/key marker, numbering direction,
+   top/bottom orientation, pad geometry, drill/slot geometry, courtyard, fab,
+   and silkscreen. For mating parts, inspect the mating view as well.
+4. Read the disposable instances back; do not accept only the values requested
+   during creation as proof they were written.
+5. **Refuse acceptance** and keep the part out of a real schematic or PCB if
+   any lead is missing, duplicated without explanation, mirrored, reversed,
+   assigned to a different function, or ambiguous in view/direction. Record an
+   unavailable datasheet figure, query, or render as `BLOCKED`, never as pass.
+
 The rows below are *starting hypotheses for generic parts only*. Verify each
 against the actual symbol with `get_symbol_info` before relying on it.
 

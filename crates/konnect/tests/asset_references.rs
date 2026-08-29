@@ -431,6 +431,32 @@ fn snake_words(line: &str) -> Vec<String> {
 
 // ─── Library identifiers in guidance (skips without KiCad) ───────────────────
 
+/// Package-sensitive parts need a lead-by-lead electrical acceptance record,
+/// not only prose telling the agent to "check the datasheet". This pins the
+/// minimum evidence an agent must collect before using a custom symbol and
+/// footprint in a real design.
+#[test]
+fn package_sensitive_parts_require_a_physical_pin_map_and_visible_acceptance() {
+    let library_skill = include_str!("../assets/skills/kicad-library/SKILL.md");
+    let schematic_skill = include_str!("../assets/skills/kicad-schematic/SKILL.md");
+    let common_ids = include_str!("../assets/skills/kicad-schematic/references/common-lib-ids.md");
+
+    for marker in [
+        "Physical pin-map acceptance contract",
+        "Datasheet lead",
+        "Symbol pin / name / type",
+        "Footprint pad",
+        "Drawing view / direction",
+        "disposable",
+        "Refuse acceptance",
+    ] {
+        assert!(library_skill.contains(marker), "missing marker: {marker}");
+    }
+    assert!(schematic_skill.contains("accepted physical pin map"));
+    assert!(common_ids.contains("not an allowlist"));
+    assert!(common_ids.contains("personal or project favorites"));
+}
+
 /// Every `Lib:Symbol` identifier the bundled guidance quotes must resolve to a
 /// symbol in the installed KiCad libraries.
 ///
