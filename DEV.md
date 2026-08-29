@@ -146,6 +146,7 @@ Konnect/
 ├── plugin/                           # Python thin launcher (runs inside KiCAD)
 │   ├── __init__.py                   # pcbnew.ActionPlugin — settings dialog (PCB Editor only)
 │   ├── settings_dialog.py            # wxPython settings UI (paths, server control)
+│   ├── native_bridge.py              # authenticated KiCad 10 native Specctra export bridge
 │   └── plugin.json                   # KiCAD 10 IPC plugin manifest
 │
 ├── packaging/
@@ -220,6 +221,11 @@ transaction abandon` escape hatch documented in
 - **PCM zip** is the correct install method
 - KiCAD installs to: `C:\Users\<YOU>\Documents\KiCad\10.0\3rdparty\plugins\com_github_mixelpixx_konnect\`
 - Both `__init__.py` (SWIG ActionPlugin for PCB editor settings dialog) and `plugin.json` (IPC exec plugin) are included
+- `native_bridge.py` is a KiCAD-10-only, opt-in compatibility bridge. It exposes
+  only authenticated status and native Specctra export over an ephemeral
+  loopback port. The caller cannot choose an output path; the plugin owns and
+  removes the temporary artifact. Do not grow it into a general Python RPC
+  surface or use it as the KiCAD 11 architecture.
 
 ## Structured Errors
 

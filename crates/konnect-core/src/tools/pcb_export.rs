@@ -267,7 +267,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "export_specctra_dsn",
             "Export a deterministic Specctra DSN routing job from the exact live KiCad PCB \
-             editor revision. Requires the named board to be open with IPC enabled. The first \
+             editor revision. Requires the named board to be open with IPC enabled. On KiCad 10, \
+             an enabled authenticated ActionPlugin bridge supplies KiCad's native DSN while the \
+             IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
+             is used. The first \
              supported profile is deliberately narrow: two copper layers, front-side SMD or \
              through-hole footprints, circle/rectangle pads, one straight-line closed outline, \
              and no existing tracks, vias, or zones. Konnect refuses unsupported geometry or \
@@ -288,6 +291,12 @@ pub fn tools() -> Vec<ToolDef> {
                     "manifest_output_path": {
                         "type": "string",
                         "description": "Optional new reverse-manifest JSON path. Defaults to <output>.konnect.json. Existing files are never replaced."
+                    },
+                    "native_bridge_mode": {
+                        "type": "string",
+                        "enum": ["prefer", "require", "disable"],
+                        "default": "prefer",
+                        "description": "KiCad 10 native-export policy. 'prefer' uses the enabled authenticated ActionPlugin bridge with the Rust exporter as fallback; 'require' refuses fallback; 'disable' uses Rust only."
                     }
                 },
                 "required": ["board", "output"]
@@ -708,6 +717,7 @@ async fn handle_export_specctra_dsn(
         .as_str()
         .map(PathBuf::from)
         .unwrap_or_else(|| default_specctra_manifest_path(&output_path));
+    let native_bridge_mode = args["native_bridge_mode"].as_str().unwrap_or("prefer");
 
     if !extension_is(&board_path, "kicad_pcb") {
         return Ok(invalid_export_argument(
@@ -725,6 +735,12 @@ async fn handle_export_specctra_dsn(
         return Ok(invalid_export_argument(
             "manifest_output_path",
             "must not name the DSN output path",
+        ));
+    }
+    if !matches!(native_bridge_mode, "prefer" | "require" | "disable") {
+        return Ok(invalid_export_argument(
+            "native_bridge_mode",
+            "must be 'prefer', 'require', or 'disable'",
         ));
     }
     let conflicts = existing_export_targets(&[&output_path, &manifest_output_path]);
@@ -769,10 +785,11 @@ async fn handle_export_specctra_dsn(
                 "KiCad board changed while routing rules were captured; retry from a stable editor revision"
             );
         }
-        crate::specctra::export_dsn(&board_for_ipc, &before, &rules)
+        let export = crate::specctra::export_dsn(&board_for_ipc, &before, &rules)?;
+        Ok((export, before))
     })
     .await?;
-    let export = match export {
+    let (baseline, source_snapshot) = match export {
         Ok(export) => export,
         Err(reason) => {
             return Ok(CallToolResult::error_kind(
@@ -781,6 +798,72 @@ async fn handle_export_specctra_dsn(
                 },
                 format!("Specctra export refused: {reason}"),
             ));
+        }
+    };
+    // Preserve the method string shipped with the Rust exporter so existing
+    // callers do not break when the optional native path is introduced.
+    let mut method = "kicad_ipc_snapshot";
+    let mut bridge_pid = None;
+    let mut bridge_protocol_version = None;
+    let mut bridge_diagnostics = Vec::new();
+    let export = if native_bridge_mode == "disable" {
+        baseline
+    } else {
+        let attempt = crate::native_specctra_bridge::try_export(&board_path).await;
+        bridge_diagnostics = attempt.diagnostics;
+        if let Some(native) = attempt.export {
+            let board_for_stability = board_path.clone();
+            let addr = ctx.config.ipc_address.clone();
+            let stable = with_ipc(addr, move |client| {
+                let document = client.find_open_board(&board_for_stability)?;
+                client.save_document_to_string_in(document)
+            })
+            .await?;
+            let stable = match stable {
+                Ok(stable) => stable,
+                Err(reason) => {
+                    return Ok(CallToolResult::error_kind(
+                        ToolErrorKind::HandlerError {
+                            reason: reason.clone(),
+                        },
+                        format!("Specctra export refused after native bridge call: {reason}"),
+                    ));
+                }
+            };
+            if stable != source_snapshot {
+                return Ok(CallToolResult::error_kind(
+                    ToolErrorKind::Conflict {
+                        paths: vec![board_path.display().to_string()],
+                    },
+                    "KiCad board changed during native Specctra export; retry from a stable editor revision",
+                ));
+            }
+            match crate::specctra::adopt_native_dsn(baseline.clone(), native.dsn) {
+                Ok(adopted) => {
+                    method = "kicad10_native_actionplugin";
+                    bridge_pid = Some(native.plugin_pid);
+                    bridge_protocol_version = Some(native.protocol_version);
+                    adopted
+                }
+                Err(error) if native_bridge_mode == "prefer" => {
+                    bridge_diagnostics.push(format!(
+                        "native DSN semantic validation failed; used Rust fallback: {error:#}"
+                    ));
+                    baseline
+                }
+                Err(error) => {
+                    return Ok(CallToolResult::error(format!(
+                        "KiCad native Specctra export was required but its semantic validation failed: {error:#}"
+                    )));
+                }
+            }
+        } else if native_bridge_mode == "require" {
+            return Ok(CallToolResult::error(format!(
+                "KiCad 10 native Specctra bridge was required but unavailable: {}",
+                bridge_diagnostics.join("; ")
+            )));
+        } else {
+            baseline
         }
     };
 
@@ -802,7 +885,11 @@ async fn handle_export_specctra_dsn(
     Ok(CallToolResult::text(
         json!({
             "success": true,
-            "method": "kicad_ipc_snapshot",
+            "method": method,
+            "native_bridge_mode": native_bridge_mode,
+            "native_bridge_pid": bridge_pid,
+            "native_bridge_protocol_version": bridge_protocol_version,
+            "native_bridge_diagnostics": bridge_diagnostics,
             "board": board_path,
             "output": output_path,
             "manifest_output_path": manifest_output_path,

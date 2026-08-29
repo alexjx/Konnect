@@ -106,6 +106,7 @@ The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 |-------|-----------|
 | Schematic editing | Direct `.kicad_sch` S-expression editing with atomic writes (no KiCAD required) |
 | PCB editing | KiCAD 10 IPC API (NNG + protobuf) — real-time and undo-aware; single-footprint placement has a safe headless fallback |
+| Specctra export | Revision-bound Rust export, with an optional authenticated KiCAD 10 ActionPlugin bridge for KiCAD-native DSN output |
 | Exports & checks | `kicad-cli` subprocess (Gerber, PDF, ERC, DRC, …) |
 | Transport | MCP JSON-RPC over stdio (default), or Streamable HTTP (`transport = "http"` / `"both"`) |
 
@@ -125,6 +126,14 @@ The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 
 Verify: open the **PCB Editor** → **Tools → External Plugins** → you should see
 **Konnect**.
+
+For KiCAD 10, the Konnect settings dialog also offers an optional **native
+Specctra bridge**. When enabled, `export_specctra_dsn` can ask the active PCB
+Editor to generate its native DSN while Konnect still binds the export to the
+exact IPC snapshot and creates the strict reverse manifest used during SES
+import. The bridge is local-only, authenticated, disabled by default, and not
+the KiCAD 11 integration path. If it is disabled or unavailable, the default
+`prefer` policy falls back to Konnect's Rust exporter.
 
 ### Build from source
 

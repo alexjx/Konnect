@@ -23,6 +23,7 @@ DEFAULT_SETTINGS = {
     "jlcpcb_db_path": "",
     "log_level": "info",
     "transport": "stdio",
+    "native_specctra_bridge": False,
 }
 
 LOG_LEVELS = ["error", "warn", "info", "debug", "trace"]
@@ -149,7 +150,15 @@ def detect_kicad_cli():
 class KonnectSettingsDialog(wx.Dialog):
     """Settings dialog for the Konnect plugin."""
 
-    def __init__(self, parent, plugin_dir, binary_path, server_running=False):
+    def __init__(
+        self,
+        parent,
+        plugin_dir,
+        binary_path,
+        server_running=False,
+        native_bridge_available=False,
+        native_bridge_running=False,
+    ):
         # No fixed pixel size: on high-DPI/scaled Windows displays a fixed
         # (520, 480) clipped the Save/Close buttons off-screen (issue #18).
         # The dialog is sized to fit its content after _build_ui instead.
@@ -163,6 +172,8 @@ class KonnectSettingsDialog(wx.Dialog):
         self.settings_path = os.path.join(plugin_dir, "settings.json")
         self.settings = load_settings(self.settings_path)
         self._server_running = server_running
+        self._native_bridge_available = native_bridge_available
+        self._native_bridge_running = native_bridge_running
 
         self._build_ui()
         self._populate_fields()
@@ -217,6 +228,21 @@ class KonnectSettingsDialog(wx.Dialog):
         agrid.Add(self.transport_ctrl, 1, wx.EXPAND)
 
         adv_box.Add(agrid, 0, wx.EXPAND | wx.ALL, 5)
+
+        self.native_bridge_ctrl = wx.CheckBox(
+            panel,
+            label="Enable KiCad 10 native Specctra bridge",
+        )
+        self.native_bridge_ctrl.Enable(self._native_bridge_available)
+        adv_box.Add(self.native_bridge_ctrl, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        bridge_state = "Running" if self._native_bridge_running else (
+            "Available after Save/Close" if self._native_bridge_available else "Unavailable"
+        )
+        self.native_bridge_status = wx.StaticText(
+            panel,
+            label=f"Native bridge: {bridge_state}",
+        )
+        adv_box.Add(self.native_bridge_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         main_sizer.Add(adv_box, 0, wx.EXPAND | wx.ALL, 8)
 
         # ── Server status section ────────────────────────────────────
@@ -275,6 +301,11 @@ class KonnectSettingsDialog(wx.Dialog):
         else:
             self.transport_ctrl.SetSelection(0)  # "stdio"
 
+        self.native_bridge_ctrl.SetValue(
+            self._native_bridge_available
+            and bool(self.settings.get("native_specctra_bridge", False))
+        )
+
     def _collect_settings(self):
         """Read current field values into a settings dict."""
         return {
@@ -283,6 +314,7 @@ class KonnectSettingsDialog(wx.Dialog):
             "jlcpcb_db_path": self.jlcpcb_ctrl.GetValue().strip(),
             "log_level": LOG_LEVELS[self.log_level_ctrl.GetSelection()],
             "transport": TRANSPORTS[self.transport_ctrl.GetSelection()],
+            "native_specctra_bridge": self.native_bridge_ctrl.GetValue(),
         }
 
     def _update_server_status(self):

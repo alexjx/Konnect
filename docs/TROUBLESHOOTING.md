@@ -129,6 +129,32 @@ Common install paths are auto-detected (including the Windows registry). If
 your install is somewhere unusual, set the path in the plugin settings dialog
 in a `settings.json` beside the binary, or in a `konnect.toml` in the working directory (`kicad_cli`). Discovery order is `konnect.toml` and `settings.json` in the CWD, then `settings.json` next to the binary and one level up, then the platform config dir. A file under any other name is only read when passed with `--config`.
 
+## Native Specctra export used the Rust fallback
+
+The KiCad-native exporter is an optional KiCad 10 compatibility path. Open the
+PCB Editor, choose **Tools → External Plugins → Konnect**, enable **KiCad 10
+native Specctra bridge**, save, and close the dialog. The status changes to
+running after the setting is applied. The requested board must be saved and be
+the active PCB Editor document.
+
+`export_specctra_dsn` defaults to `native_bridge_mode: "prefer"`. Its response says
+whether `method` was `kicad10_native_actionplugin` or `kicad_ipc_snapshot` and
+includes bounded `native_bridge_diagnostics`. Use `native_bridge_mode: "require"`
+when testing the native path so an unavailable bridge is an error instead of a
+fallback. Use `disable` to force Rust output.
+
+The bridge listens only on an ephemeral IPv4 loopback port and requires a
+per-session bearer token. Registration and temporary DSN files live under the
+per-user local-data directory (`%LOCALAPPDATA%\konnect\native-bridge` on
+Windows); `KONNECT_BRIDGE_DIR` overrides it for diagnostics and tests. A clean
+plugin shutdown removes its own registration and temporary files. Stale
+registrations left by a hard KiCad crash are ignored because Konnect probes and
+authenticates each candidate before use.
+
+This option is unavailable on KiCad 11 after removal of the legacy SWIG Python
+API. Konnect then uses its Rust exporter unless KiCad gains an equivalent
+supported IPC operation.
+
 ## Transaction recovery is blocked by divergent content
 
 Multi-file schematic changes persist a `.konnect-transaction-<id>.json`
