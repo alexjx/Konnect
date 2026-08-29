@@ -167,6 +167,101 @@ fn yaml_list(frontmatter: &str, key: &str) -> Vec<String> {
     values
 }
 
+/// Agent reports may only claim evidence that their prescribed setup can
+/// collect. v0.10.0 asked both agents to report ERC without loading
+/// `sch_export`, and the schematic builder never ran ERC, short detection, or
+/// rendered inspection at all (#357).
+#[test]
+fn agents_make_claimed_evidence_executable() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+    let cases = [
+        (
+            "kicad-schematic-build-agent.md",
+            &["sch_analysis", "sch_export"][..],
+            &[
+                "find_shorted_nets",
+                "run_erc",
+                "render_schematic_png",
+                "INCOMPLETE",
+            ][..],
+        ),
+        (
+            "kicad-design-review-agent.md",
+            &["sch_export", "pcb_export"][..],
+            &["run_erc", "get_drc_violations", "INCOMPLETE"][..],
+        ),
+    ];
+    let mut missing = Vec::new();
+
+    for (filename, required_toolsets, required_markers) in cases {
+        let path = root.join(filename);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded: BTreeSet<String> = text.lines().flat_map(toolset_names_in).collect();
+        for toolset in required_toolsets {
+            if !loaded.contains(*toolset) {
+                missing.push(format!("agents/{filename} does not load `{toolset}`"));
+            }
+        }
+        for marker in required_markers {
+            if !text.contains(*marker) {
+                missing.push(format!("agents/{filename} does not prescribe `{marker}`"));
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "agent output claims outrun their executable workflow:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
+/// The skill and its agent share the same completion boundary. These markers
+/// are the parts v0.10.0 omitted while still promising a production-quality
+/// result: direct checks, rendered readability, and a fail-closed verdict.
+#[test]
+fn skills_define_the_same_evidence_boundary_as_their_agents() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/skills");
+    let cases = [
+        (
+            "kicad-schematic/SKILL.md",
+            &[
+                "find_shorted_nets",
+                "run_erc",
+                "render_schematic_png",
+                "label-inclusive",
+                "page-boundary",
+                "INCOMPLETE",
+            ][..],
+        ),
+        (
+            "kicad-review/SKILL.md",
+            &[
+                "Evidence hierarchy",
+                "run_erc",
+                "get_drc_violations",
+                "INCOMPLETE",
+            ][..],
+        ),
+    ];
+    let mut missing = Vec::new();
+
+    for (relative, required_markers) in cases {
+        let text = std::fs::read_to_string(root.join(relative)).unwrap();
+        for marker in required_markers {
+            if !text.contains(*marker) {
+                missing.push(format!("skills/{relative} does not define `{marker}`"));
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "skill completion criteria omit required evidence:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
 /// Every `load_toolset('name')` in the shipped prose names a real toolset.
 #[test]
 fn documented_toolsets_exist_in_the_registry() {
