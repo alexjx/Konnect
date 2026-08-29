@@ -1178,6 +1178,7 @@ fn command_output(output: &std::process::Output) -> String {
 async fn run_java_command(
     command: &mut tokio::process::Command,
 ) -> Result<std::process::Output, String> {
+    command.kill_on_drop(true);
     match tokio::time::timeout(std::time::Duration::from_secs(10), command.output()).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(error)) => Err(error.to_string()),
@@ -1195,6 +1196,9 @@ async fn handle_check_freerouting(
         None => Ok(CallToolResult::text(
             serde_json::to_string(&json!({
                 "available": false,
+                "engine_found": false,
+                "native_mcp_available": false,
+                "bridge_available": false,
                 "note": "freerouting.jar not found. Download from https://github.com/freerouting/freerouting/releases"
             }))
             .unwrap(),
@@ -1207,6 +1211,9 @@ async fn handle_check_freerouting(
                 Err(error) => {
                     return Ok(CallToolResult::json(&json!({
                         "available": false,
+                        "engine_found": true,
+                        "native_mcp_available": false,
+                        "bridge_available": false,
                         "jar_path": jar_path,
                         "java_available": false,
                         "note": error
@@ -1216,6 +1223,9 @@ async fn handle_check_freerouting(
             if !java.status.success() {
                 return Ok(CallToolResult::json(&json!({
                     "available": false,
+                    "engine_found": true,
+                    "native_mcp_available": false,
+                    "bridge_available": false,
                     "jar_path": jar_path,
                     "java_available": false,
                     "java_output": command_output(&java),
@@ -1231,13 +1241,21 @@ async fn handle_check_freerouting(
                 Err(error) => (false, error),
             };
 
+            let bridge = crate::freerouting_mcp::probe_local(&jar_path).await;
             Ok(CallToolResult::json(&json!({
                 "available": true,
+                "engine_found": true,
+                "native_mcp_available": bridge.native_mcp_available,
+                "bridge_available": bridge.bridge_available,
                 "jar_path": jar_path,
                 "java_available": true,
                 "java_output": command_output(&java),
                 "version_checked": version_checked,
-                "version_output": version_output
+                "version_output": version_output,
+                "server_protocol_version": bridge.server_protocol_version,
+                "native_mcp_tool_count": bridge.tool_count,
+                "native_mcp_diagnostics": bridge.diagnostics,
+                "bridge_error": bridge.error
             })))
         }
     }
@@ -1304,6 +1322,31 @@ async fn handle_route_specctra_dsn(
 #[cfg(test)]
 mod freerouting_tests {
     use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn response_json(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            _ => panic!("expected text content"),
+        }
+    }
 
     #[test]
     fn finds_versioned_jar_inside_pcm_plugin_tree() {
@@ -1316,11 +1359,20 @@ mod freerouting_tests {
         assert_eq!(find_freerouting_jar_below(temp.path(), 5), Some(jar));
     }
 
-    #[test]
-    fn explicit_missing_jar_does_not_claim_availability() {
+    #[tokio::test]
+    async fn explicit_missing_jar_reports_each_readiness_boundary() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing.jar");
         assert_eq!(find_freerouting_jar(&json!({ "jar_path": missing })), None);
+
+        let result = handle_check_freerouting(&json!({ "jar_path": missing }), &test_ctx())
+            .await
+            .unwrap();
+        let body = response_json(&result);
+        assert_eq!(body["available"], false);
+        assert_eq!(body["engine_found"], false);
+        assert_eq!(body["native_mcp_available"], false);
+        assert_eq!(body["bridge_available"], false);
     }
 
     #[test]
@@ -1328,6 +1380,22 @@ mod freerouting_tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("other.jar"), b"fixture").unwrap();
         assert_eq!(find_freerouting_jar_below(temp.path(), 5), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Java and FREEROUTING_JAR"]
+    async fn installed_engine_reports_each_observed_readiness_boundary() {
+        let jar = PathBuf::from(std::env::var_os("FREEROUTING_JAR").expect("set FREEROUTING_JAR"));
+        let result = handle_check_freerouting(&json!({ "jar_path": jar }), &test_ctx())
+            .await
+            .unwrap();
+        let body = response_json(&result);
+        assert_eq!(body["available"], true);
+        assert_eq!(body["engine_found"], true);
+        assert_eq!(body["native_mcp_available"], true);
+        assert_eq!(body["bridge_available"], true);
+        assert!(body["native_mcp_tool_count"].as_u64().unwrap() >= 6);
+        assert!(body["server_protocol_version"].as_str().is_some());
     }
 }
 

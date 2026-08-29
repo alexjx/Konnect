@@ -105,8 +105,8 @@ The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 | Layer | Mechanism |
 |-------|-----------|
 | Schematic editing | Direct `.kicad_sch` S-expression editing with atomic writes (no KiCAD required) |
-| PCB editing | KiCAD 10 IPC API (NNG + protobuf) — real-time and undo-aware; single-footprint placement has a safe headless fallback |
-| Specctra export | Revision-bound Rust export, with an optional authenticated KiCAD 10 ActionPlugin bridge for KiCAD-native DSN output |
+| PCB editing | KiCad 10 IPC API (NNG + protobuf) — real-time and undo-aware; single-footprint placement has a safe headless fallback |
+| Specctra routing | Revision-bound Rust DSN export, local Freerouting MCP routing, and strict one-transaction SES import; an authenticated KiCad 10 native-export bridge is explicit opt-in |
 | Exports & checks | `kicad-cli` subprocess (Gerber, PDF, ERC, DRC, …) |
 | Transport | MCP JSON-RPC over stdio (default), or Streamable HTTP (`transport = "http"` / `"both"`) |
 
@@ -127,13 +127,23 @@ The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 Verify: open the **PCB Editor** → **Tools → External Plugins** → you should see
 **Konnect**.
 
-For KiCAD 10, the Konnect settings dialog also offers an optional **native
+For KiCad 10, the Konnect settings dialog also offers an optional **native
 Specctra bridge**. When enabled, `export_specctra_dsn` can ask the active PCB
 Editor to generate its native DSN while Konnect still binds the export to the
 exact IPC snapshot and creates the strict reverse manifest used during SES
 import. The bridge is local-only, authenticated, disabled by default, and not
-the KiCAD 11 integration path. If it is disabled or unavailable, the default
-`prefer` policy falls back to Konnect's Rust exporter.
+the KiCad 11 integration path. Konnect uses its Rust exporter by default;
+`native_bridge_mode: "prefer"` enables fallback to Rust when the bridge is
+unavailable, while `"require"` refuses instead.
+
+For end-to-end autorouting, run `check_freerouting`, then
+`export_specctra_dsn` → `route_specctra_dsn` →
+`plan_specctra_ses_import` / `apply_specctra_ses`. Readiness reports engine
+discovery, native-MCP compatibility, and complete bridge availability
+separately. The owned Java child is loopback-only and is reaped on success,
+failure, timeout, or cancellation. The first supported profile preserves fixed
+straight tracks and through vias; unlocked routing, arcs, zones, and unsupported
+geometry are rejected before mutation.
 
 ### Build from source
 
