@@ -5,40 +5,21 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, opt_f64, require_f64, require_str, ToolContext, ToolDef};
-use konnect_ipc::client::KiCadIpcClient;
+use crate::tools::{
+    get_path, opt_f64, require_f64, require_str, with_board_ipc_classified, ToolContext, ToolDef,
+};
 use konnect_sexp::writer::{apply_edits, write_atomic, SexpEdit};
 use serde_json::json;
 
-// ─── IPC helper ───────────────────────────────────────────────────────────────
-
-async fn with_ipc<T, F>(addr: String, f: F) -> anyhow::Result<Result<T, String>>
-where
-    T: Send + 'static,
-    F: FnOnce(&KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
-{
-    match tokio::task::spawn_blocking(move || f(&KiCadIpcClient::new(&addr))).await {
-        Ok(Ok(r)) => Ok(Ok(r)),
-        Ok(Err(e)) => Ok(Err(e.to_string())),
-        Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
-    }
-}
-
 macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
-        let addr = $ctx.config.ipc_address.clone();
         let requested_board = get_path($args, "board")?;
-        match with_ipc(addr, move |$c| {
-            $c.ensure_board_is_active(&requested_board)?;
-            $body
-        })
-        .await?
-        {
+        match with_board_ipc_classified($ctx, &requested_board, move |$c| $body).await? {
             Ok(v) => v,
-            Err(msg) => {
+            Err(error) => {
                 return Ok(CallToolResult::error(format!(
                     "KiCAD must be running with the board loaded (IPC error: {})",
-                    msg
+                    error.message()
                 )))
             }
         }
@@ -2146,7 +2127,7 @@ mod zone_net_format_tests {
         assert_eq!(body["source"], json!("file"));
         assert!(body["warning"]
             .as_str()
-            .is_some_and(|w| w.contains("File → Revert")));
+            .is_some_and(|w| w.contains("current Konnect server session")));
     }
 
     /// The new arguments reach the alias too — it is the same handler, and a

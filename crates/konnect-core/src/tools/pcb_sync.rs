@@ -245,7 +245,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     let ipc_board = board.clone();
     let library_board = board.clone();
     let result = attempt_ipc_write(
-        ctx.config.ipc_address.clone(),
+        ctx,
         &board,
         what,
         move |client| {
