@@ -50,6 +50,21 @@ search the active libraries when the required part is absent or package-specific
 3. Place on the 1.27mm grid (KiCAD default schematic grid)
 4. Verify placement with `list_schematic_components`
 
+### Package-sensitive and custom parts
+
+Before placing or wiring a custom symbol, a manufacturer-specific discrete,
+or any package whose view can be mirrored, require the `kicad-library` skill's
+**accepted physical pin map** for the exact MPN and package suffix. The map must
+join each datasheet lead to the symbol pin and footprint pad, identify the
+drawing view/direction, reconcile duplicate and mechanical pads, and include
+query-back plus disposable rendered inspection. `get_symbol_info` proves the
+library data that exists; it does not prove that data matches the package.
+
+If the accepted physical pin map is missing, incomplete, based on a different
+suffix, or ambiguous about top/bottom/mating view, stop before real schematic
+placement. Do not infer physical numbering from a generic symbol name or from
+the order pins appear on screen.
+
 ### Common Library IDs
 
 | Component       | lib_id                         |
