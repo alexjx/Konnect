@@ -2328,6 +2328,27 @@ mod tests {
     }
 
     #[test]
+    fn stock_kicad_generator_property_is_preserved_as_a_typed_field() {
+        // Unmodified KiCad 10.0.5 standard-library output from
+        // Capacitor_SMD.pretty/C_0603_1608Metric.kicad_mod. This is the stock
+        // footprint that exposed #373; keeping its real generator-authored
+        // shape prevents a synthetic fixture from agreeing with this parser.
+        let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+        let library = parse_library_footprint("Capacitor_SMD:C_0603_1608Metric", source)
+            .expect("the stock KiCad generator footprint must parse losslessly");
+
+        assert_eq!(library.pads.len(), 2);
+        let generator = library
+            .properties
+            .iter()
+            .find(|property| property.name == "KiLib_Generator")
+            .expect("KiCad's generator property must remain a typed Field");
+        assert_eq!(field_text_value(generator), "SMD_2terminal_chip_molded");
+        assert!(!generator.visible);
+        assert_eq!(library.models.len(), 1);
+    }
+
+    #[test]
     fn visible_property_is_a_field_only_and_clause_order_does_not_change_its_angle() {
         let source = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t\t(at 0.5 0.75 15)\n\t\t(layer \"F.Fab\")\n\t\t(hide yes)",
