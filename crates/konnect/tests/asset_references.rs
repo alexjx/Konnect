@@ -262,6 +262,121 @@ fn skills_define_the_same_evidence_boundary_as_their_agents() {
     );
 }
 
+/// Manufacturing guidance must describe evidence the released tools actually
+/// return, and it must remain safe while artifact verification is implemented
+/// independently in #270. v0.10.0 claimed four validations the handler did not
+/// perform, treated a partial export as a complete package, and duplicated
+/// volatile vendor and impedance tables as if they were design authority
+/// (#357).
+#[test]
+fn manufacturing_guidance_is_contract_bound_and_fail_closed() {
+    let manufacture = include_str!("../assets/skills/kicad-manufacture/SKILL.md");
+    let jlcpcb = include_str!("../assets/skills/kicad-manufacture/references/jlcpcb-rules.md");
+    let design_rules = include_str!("../assets/skills/kicad-pcb/references/design-rules.md");
+    let trace_width = include_str!("../assets/skills/kicad-pcb/references/trace-width-table.md");
+
+    for marker in [
+        "presence of at least one `Edge.Cuts` item",
+        "`verdict`, `issues`, and `drc`",
+        "does not prove outline closure",
+        "`warnings` and `files_generated`",
+        "current invocation",
+        "regular, non-empty file",
+        "INCOMPLETE",
+        "indicative heuristic",
+        "current quote",
+    ] {
+        assert!(
+            manufacture.contains(marker),
+            "manufacturing skill is missing contract marker: {marker}"
+        );
+    }
+
+    for stale_claim in [
+        "Checks board outline is closed",
+        "Checks all pads have copper",
+        "Checks drill sizes are within fabrication limits",
+        "Checks silkscreen does not overlap pads",
+        "ensures consistency",
+        "~700 common parts",
+        "Every extended part adds $3",
+    ] {
+        assert!(
+            !manufacture.contains(stale_claim),
+            "manufacturing skill still claims `{stale_claim}`"
+        );
+    }
+
+    for marker in [
+        "current order contract",
+        "selected service",
+        "export preview",
+        "source and retrieval date",
+    ] {
+        assert!(
+            jlcpcb.contains(marker),
+            "JLCPCB reference is missing current-contract marker: {marker}"
+        );
+    }
+    for stale_value in [
+        "~350 common parts",
+        "+$3 per unique part",
+        "0.127mm",
+        "0.35mm",
+    ] {
+        assert!(
+            !jlcpcb.contains(stale_value),
+            "JLCPCB reference still caches volatile value `{stale_value}`"
+        );
+    }
+
+    for marker in [
+        "selected fabricator's current contract",
+        "project netclasses",
+        "re-run DRC",
+    ] {
+        assert!(
+            design_rules.contains(marker),
+            "design-rule reference is missing authority marker: {marker}"
+        );
+    }
+    for stale_heading in [
+        "JLCPCB (Standard Process)",
+        "PCBWay (Standard Process)",
+        "OSH Park (2-layer)",
+    ] {
+        assert!(
+            !design_rules.contains(stale_heading),
+            "design-rule reference still duplicates vendor table `{stale_heading}`"
+        );
+    }
+
+    for marker in [
+        "copper thickness",
+        "temperature-rise budget",
+        "voltage-drop budget",
+        "external microstrip",
+        "internal stripline",
+        "field solver",
+    ] {
+        assert!(
+            trace_width.contains(marker),
+            "trace-width reference is missing calculation input: {marker}"
+        );
+    }
+    for stale_value in [
+        "divide width by ~0.7x",
+        "50Ω single-ended | 0.30mm",
+        "90Ω differential (USB 2.0) | 0.15mm",
+        "50Ω microstrip (internal)",
+    ] {
+        assert!(
+            !trace_width.contains(stale_value),
+            "trace-width reference still presents unsafe fixed advice `{stale_value}`"
+        );
+    }
+}
+
 /// Every `load_toolset('name')` in the shipped prose names a real toolset.
 #[test]
 fn documented_toolsets_exist_in_the_registry() {
@@ -580,6 +695,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "roundrect_rratio",
         // Structured MCP error discriminant, not a callable tool.
         "unsafe_file_fallback",
+        // Structured manufacturing response field, not a callable tool.
+        "files_generated",
     ];
 
     let mut phantom = Vec::new();
