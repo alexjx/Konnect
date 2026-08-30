@@ -18,10 +18,14 @@
 //!   extend past the gr_line hull.
 //! - `pic_programmer.kicad_pcb` — KiCad 10 format (20260206): no net table,
 //!   `(net "NAME")` in place on segments, vias and zones.
+//! - `zone_outline_elements.kicad_pcb` — KiCad 10.0.5-saved reduced board
+//!   containing two exact arc-only demo zones and one API-authored mixed path;
+//!   see `zone_outline_elements.README.md` for hashes and zone UUIDs.
 
 use konnect_sexp::board::{
-    board_outline_bbox, count_pads, footprint_courtyards, footprints, tracks, vias, zones,
-    CourtyardSource, FootprintCourtyard, PcbConnectivityIndex, Side,
+    board_outline_bbox, count_pads, footprint_courtyards, footprints, lossless_zone_outlines,
+    tracks, vias, zones, CourtyardSource, FootprintCourtyard, PcbConnectivityIndex, Side,
+    ZoneOutlineElement,
 };
 use konnect_sexp::parse_sexp;
 use std::collections::HashSet;
@@ -157,6 +161,134 @@ fn pic_programmer_kicad10_board_geometry() {
     );
 }
 
+#[test]
+fn zone_outline_elements_are_complete_and_ordered() {
+    let tree = fixture("zone_outline_elements.kicad_pcb");
+    let scan = lossless_zone_outlines(&tree);
+    assert_eq!((scan.items.len(), scan.skipped), (3, 0));
+
+    let mixed = &scan.items[0];
+    assert_eq!(mixed.net, None);
+    assert_eq!(mixed.layers, vec!["F.Cu"]);
+    assert_eq!(
+        mixed.elements,
+        vec![
+            ZoneOutlineElement::Point((145.0, 100.0)),
+            ZoneOutlineElement::Point((150.0, 100.0)),
+            ZoneOutlineElement::Arc {
+                start: (149.28, 105.91),
+                mid: (149.206777, 106.086777),
+                end: (149.03, 106.16),
+            },
+            ZoneOutlineElement::Point((145.0, 107.0)),
+        ]
+    );
+
+    let vsys = &scan.items[1];
+    assert_eq!(vsys.net.as_deref(), Some("VSYS"));
+    assert_eq!(vsys.layers, vec!["B.Cu"]);
+    assert_eq!(
+        vsys.elements,
+        vec![
+            ZoneOutlineElement::Arc {
+                start: (149.28, 105.91),
+                mid: (149.206777, 106.086777),
+                end: (149.03, 106.16),
+            },
+            ZoneOutlineElement::Arc {
+                start: (147.13, 106.16),
+                mid: (146.953223, 106.233223),
+                end: (146.88, 106.41),
+            },
+            ZoneOutlineElement::Arc {
+                start: (146.88, 108.81),
+                mid: (146.953223, 108.986777),
+                end: (147.13, 109.06),
+            },
+            ZoneOutlineElement::Arc {
+                start: (149.93, 109.06),
+                mid: (150.106777, 108.986777),
+                end: (150.18, 108.81),
+            },
+            ZoneOutlineElement::Arc {
+                start: (150.18, 99.41),
+                mid: (150.106777, 99.233223),
+                end: (149.93, 99.16),
+            },
+            ZoneOutlineElement::Arc {
+                start: (147.83, 99.16),
+                mid: (147.653223, 99.233223),
+                end: (147.58, 99.41),
+            },
+            ZoneOutlineElement::Arc {
+                start: (147.58, 102.61),
+                mid: (147.653223, 102.786777),
+                end: (147.83, 102.86),
+            },
+            ZoneOutlineElement::Arc {
+                start: (149.03, 102.86),
+                mid: (149.206777, 102.933223),
+                end: (149.28, 103.11),
+            },
+        ]
+    );
+
+    let batt = &scan.items[2];
+    assert_eq!(batt.net.as_deref(), Some("+BATT"));
+    assert_eq!(batt.layers, vec!["In2.Cu"]);
+    assert_eq!(
+        batt.elements,
+        vec![
+            ZoneOutlineElement::Arc {
+                start: (144.26, 95.23),
+                mid: (144.552893, 95.937107),
+                end: (145.26, 96.23),
+            },
+            ZoneOutlineElement::Arc {
+                start: (148.545786, 96.23),
+                mid: (148.928469, 96.30612),
+                end: (149.252893, 96.522893),
+            },
+            ZoneOutlineElement::Arc {
+                start: (150.167107, 97.437107),
+                mid: (150.38388, 97.76153),
+                end: (150.46, 98.144214),
+            },
+            ZoneOutlineElement::Arc {
+                start: (150.46, 102.13),
+                mid: (150.167107, 102.837107),
+                end: (149.46, 103.13),
+            },
+            ZoneOutlineElement::Arc {
+                start: (138.36, 103.13),
+                mid: (137.652893, 102.837107),
+                end: (137.36, 102.13),
+            },
+            ZoneOutlineElement::Arc {
+                start: (137.36, 94.73),
+                mid: (137.652893, 94.022893),
+                end: (138.36, 93.73),
+            },
+            ZoneOutlineElement::Arc {
+                start: (143.26, 93.73),
+                mid: (143.967107, 94.022893),
+                end: (144.26, 94.73),
+            },
+        ]
+    );
+
+    // The old point-only scanner retains its exact public shape and projects
+    // only the mixed outline's straight vertices. Arc-only zones still enter
+    // its historical skip bucket; callers needing them opt into the lossless
+    // scanner above.
+    let compatibility = zones(&tree);
+    assert_eq!((compatibility.items.len(), compatibility.skipped), (1, 2));
+    assert_eq!(
+        compatibility.items[0].points,
+        vec![(145.0, 100.0), (150.0, 100.0), (145.0, 107.0)]
+    );
+}
+
 /// Totality over the fixture corpus: every fixture parses and every scan runs
 /// without panicking, whatever else the files contain.
 #[test]
@@ -180,9 +312,10 @@ fn fixture_corpus_scans_are_total() {
         }
         let _ = vias(&tree);
         let _ = zones(&tree);
+        let _ = lossless_zone_outlines(&tree);
         let _ = board_outline_bbox(&tree);
     }
-    assert_eq!(seen, 3, "expected the three committed board fixtures");
+    assert_eq!(seen, 4, "expected the four committed board fixtures");
 }
 
 // ─── Courtyards: hand-computed ground truth ──────────────────────────────────
@@ -598,7 +731,7 @@ fn every_installed_demo_board_scans_losslessly() {
         };
         let t = tracks(&tree);
         let v = vias(&tree);
-        let z = zones(&tree);
+        let z = lossless_zone_outlines(&tree);
         if t.skipped + v.skipped + z.skipped > 0 {
             failures.push(format!(
                 "{}: skipped {} segments / {} vias / {} zones from a pcbnew-authored board",
