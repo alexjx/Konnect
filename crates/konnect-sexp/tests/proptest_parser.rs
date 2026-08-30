@@ -157,6 +157,10 @@ proptest! {
                 prop_assert!(!v.layers.is_empty());
             }
             for z in &konnect_sexp::board::zones(&tree).items {
+                prop_assert!(z.points.len() >= 3);
+                prop_assert!(!z.layers.is_empty());
+            }
+            for z in &konnect_sexp::board::lossless_zone_outlines(&tree).items {
                 let defining_coordinate_count: usize = z
                     .elements
                     .iter()

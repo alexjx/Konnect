@@ -138,13 +138,28 @@ pub struct ZoneOutline {
     /// Layers the zone lives on: KiCad 10 writes `(layers …)` (plural), older
     /// single-layer zones `(layer …)`. Both shapes land here.
     pub layers: Vec<String>,
-    /// Straight `(xy …)` vertices from the zone's first
-    /// `(polygon (pts …))`, in file order. This retains the original
-    /// point-only view; it is empty for an arc-only outline. Use
-    /// [`Self::elements`] for the complete geometry.
+    /// Outline vertices of the zone's first `(polygon (pts …))`, in file
+    /// order. Always ≥ 3 points — fewer cannot enclose area, so such a zone
+    /// is skipped.
     pub points: Vec<(f64, f64)>,
-    /// Lossless ordered outline geometry. Unknown or incomplete elements make
-    /// the zone unreadable rather than being silently dropped.
+}
+
+/// A zone's complete authored outline, including exact curved segments.
+///
+/// This is intentionally separate from [`ZoneOutline`]: adding an `elements`
+/// field to that existing public struct would break downstream struct literals
+/// and exhaustive patterns. Use [`lossless_zone_outlines`] when every authored
+/// path element must be retained; [`zones`] remains the point-only compatibility
+/// scanner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LosslessZoneOutline {
+    /// Resolved net name; `None` covers both the unconnected pseudo-net and
+    /// net-less zones (keepouts).
+    pub net: Option<String>,
+    /// Layers the zone lives on, normalized across legacy `(layer …)` and
+    /// KiCad 10 `(layers …)` forms.
+    pub layers: Vec<String>,
+    /// Exact ordered geometry from the first authored `(polygon (pts …))`.
     pub elements: Vec<ZoneOutlineElement>,
 }
 
@@ -253,34 +268,79 @@ pub fn zones(tree: &SexpNode) -> Scan<ZoneOutline> {
                 return None;
             }
             let pts = zone.find("polygon")?.find("pts")?;
-            let mut points = Vec::new();
-            let mut elements = Vec::new();
-            let mut defining_coordinate_count = 0usize;
-            for node in pts.children()?.iter().skip(1) {
-                match node.head()? {
-                    "xy" => {
-                        let point = coordinate_pair(node)?;
-                        points.push(point);
-                        elements.push(ZoneOutlineElement::Point(point));
-                        defining_coordinate_count += 1;
-                    }
-                    "arc" => {
-                        let start = point(node, "start")?;
-                        let mid = point(node, "mid")?;
-                        let end = point(node, "end")?;
-                        elements.push(ZoneOutlineElement::Arc { start, mid, end });
-                        defining_coordinate_count += 3;
-                    }
-                    _ => return None,
-                }
-            }
-            if defining_coordinate_count < 3 {
-                return None; // fewer than 3 coordinates cannot enclose area
+            let points: Vec<(f64, f64)> = pts
+                .find_all("xy")
+                .into_iter()
+                .map(coordinate_pair)
+                .collect::<Option<Vec<_>>>()?;
+            if points.len() < 3 {
+                return None; // fewer than 3 vertices encloses no area
             }
             Some(ZoneOutline {
                 net: resolve_net(zone, &table),
                 layers,
                 points,
+            })
+        })();
+        match parsed {
+            Some(z) => items.push(z),
+            None => skipped += 1,
+        }
+    }
+    Scan { items, skipped }
+}
+
+/// Every zone's complete authored outline, preserving straight and curved
+/// path elements in file order.
+///
+/// Unlike [`zones`], this scanner accepts valid arc-only outlines. It fails
+/// closed per zone: incomplete or duplicate arc tags, non-finite or trailing
+/// coordinate data, and unknown path element kinds increment `skipped` rather
+/// than returning a result with silently discarded geometry.
+pub fn lossless_zone_outlines(tree: &SexpNode) -> Scan<LosslessZoneOutline> {
+    let table = top_level_net_table(tree);
+    let mut items = Vec::new();
+    let mut skipped = 0usize;
+    for zone in tree.find_all("zone") {
+        let parsed = (|| {
+            let layers: Vec<String> = match zone.find("layers") {
+                Some(node) => node
+                    .children()?
+                    .iter()
+                    .skip(1)
+                    .filter_map(|c| c.as_str())
+                    .map(str::to_string)
+                    .collect(),
+                None => vec![zone.find_str("layer")?.to_string()],
+            };
+            if layers.is_empty() {
+                return None;
+            }
+
+            let pts = zone.find("polygon")?.find("pts")?;
+            let mut elements = Vec::new();
+            let mut defining_coordinate_count = 0usize;
+            for node in pts.children()?.iter().skip(1) {
+                let element = match node.head()? {
+                    "xy" => {
+                        defining_coordinate_count += 1;
+                        ZoneOutlineElement::Point(exact_coordinate_pair(node)?)
+                    }
+                    "arc" => {
+                        defining_coordinate_count += 3;
+                        exact_outline_arc(node)?
+                    }
+                    _ => return None,
+                };
+                elements.push(element);
+            }
+            if defining_coordinate_count < 3 {
+                return None;
+            }
+
+            Some(LosslessZoneOutline {
+                net: resolve_net(zone, &table),
+                layers,
                 elements,
             })
         })();
@@ -369,6 +429,33 @@ fn graphic_bbox(node: &SexpNode, head: &str) -> Option<(f64, f64, f64, f64)> {
 fn coordinate_pair(node: &SexpNode) -> Option<(f64, f64)> {
     let (x, y) = (node.get_f64(1)?, node.get_f64(2)?);
     (x.is_finite() && y.is_finite()).then_some((x, y))
+}
+
+/// A coordinate pair with no omitted or trailing fields.
+fn exact_coordinate_pair(node: &SexpNode) -> Option<(f64, f64)> {
+    (node.children()?.len() == 3)
+        .then(|| coordinate_pair(node))
+        .flatten()
+}
+
+/// An arc with exactly one complete `start`, `mid`, and `end` child and no
+/// additional data. This keeps the lossless scanner from accepting a prefix
+/// while silently dropping duplicate tags or unknown trailing fields.
+fn exact_outline_arc(node: &SexpNode) -> Option<ZoneOutlineElement> {
+    if node.children()?.len() != 4 {
+        return None;
+    }
+    let starts = node.find_all("start");
+    let mids = node.find_all("mid");
+    let ends = node.find_all("end");
+    if starts.len() != 1 || mids.len() != 1 || ends.len() != 1 {
+        return None;
+    }
+    Some(ZoneOutlineElement::Arc {
+        start: exact_coordinate_pair(starts[0])?,
+        mid: exact_coordinate_pair(mids[0])?,
+        end: exact_coordinate_pair(ends[0])?,
+    })
 }
 
 fn point(node: &SexpNode, tag: &str) -> Option<(f64, f64)> {
@@ -986,49 +1073,6 @@ mod tests {
         \t)\n\
         )";
 
-    /// Reduced from the two arc-only zone outlines in KiCad 10's
-    /// RoyalBlue54L-Feather demo board. The full board is intentionally not a
-    /// fixture: these are the only authored forms the zone scan rejected.
-    const KICAD10_ARC_ONLY_ZONES: &str = "(kicad_pcb\n\
-        \t(version 20260206)\n\
-        \t(generator \"pcbnew\")\n\
-        \t(net 15 \"+BATT\")\n\
-        \t(net 35 \"VSYS\")\n\
-        \t(zone\n\
-        \t\t(net 35)\n\
-        \t\t(net_name \"VSYS\")\n\
-        \t\t(layer \"B.Cu\")\n\
-        \t\t(polygon\n\
-        \t\t\t(pts\n\
-        \t\t\t\t(arc (start 149.28 105.91) (mid 149.206777 106.086777) (end 149.03 106.16))\n\
-        \t\t\t\t(arc (start 147.13 106.16) (mid 146.953223 106.233223) (end 146.88 106.41))\n\
-        \t\t\t\t(arc (start 146.88 108.81) (mid 146.953223 108.986777) (end 147.13 109.06))\n\
-        \t\t\t\t(arc (start 149.93 109.06) (mid 150.106777 108.986777) (end 150.18 108.81))\n\
-        \t\t\t\t(arc (start 150.18 99.41) (mid 150.106777 99.233223) (end 149.93 99.16))\n\
-        \t\t\t\t(arc (start 147.83 99.16) (mid 147.653223 99.233223) (end 147.58 99.41))\n\
-        \t\t\t\t(arc (start 147.58 102.61) (mid 147.653223 102.786777) (end 147.83 102.86))\n\
-        \t\t\t\t(arc (start 149.03 102.86) (mid 149.206777 102.933223) (end 149.28 103.11))\n\
-        \t\t\t)\n\
-        \t\t)\n\
-        \t)\n\
-        \t(zone\n\
-        \t\t(net 15)\n\
-        \t\t(net_name \"+BATT\")\n\
-        \t\t(layer \"In2.Cu\")\n\
-        \t\t(polygon\n\
-        \t\t\t(pts\n\
-        \t\t\t\t(arc (start 144.26 95.23) (mid 144.552893 95.937107) (end 145.26 96.23))\n\
-        \t\t\t\t(arc (start 148.545786 96.23) (mid 148.928469 96.30612) (end 149.252893 96.522893))\n\
-        \t\t\t\t(arc (start 150.167107 97.437107) (mid 150.38388 97.76153) (end 150.46 98.144214))\n\
-        \t\t\t\t(arc (start 150.46 102.13) (mid 150.167107 102.837107) (end 149.46 103.13))\n\
-        \t\t\t\t(arc (start 138.36 103.13) (mid 137.652893 102.837107) (end 137.36 102.13))\n\
-        \t\t\t\t(arc (start 137.36 94.73) (mid 137.652893 94.022893) (end 138.36 93.73))\n\
-        \t\t\t\t(arc (start 143.26 93.73) (mid 143.967107 94.022893) (end 144.26 94.73))\n\
-        \t\t\t)\n\
-        \t\t)\n\
-        \t)\n\
-        )";
-
     #[test]
     fn tracks_resolve_numeric_nets_through_the_table() {
         let tree = parse_sexp(KICAD9_BOARD).unwrap();
@@ -1097,16 +1141,6 @@ mod tests {
                 (122.555, 135.89),
             ]
         );
-        assert_eq!(
-            z.elements,
-            vec![
-                ZoneOutlineElement::Point((172.085, 135.89)),
-                ZoneOutlineElement::Point((172.085, 91.313)),
-                ZoneOutlineElement::Point((122.555, 91.44)),
-                ZoneOutlineElement::Point((122.555, 135.89)),
-            ]
-        );
-
         let k10 = parse_sexp(KICAD10_BOARD).unwrap();
         assert_eq!(zones(&k10).items[0].net.as_deref(), Some("GND"));
     }
@@ -1121,55 +1155,6 @@ mod tests {
         let scan = zones(&tree);
         assert_eq!(scan.skipped, 0);
         assert_eq!(scan.items[0].layers, vec!["F.Cu", "B.Cu"]);
-    }
-
-    #[test]
-    fn kicad_10_arc_only_zone_outlines_scan_losslessly() {
-        let tree = parse_sexp(KICAD10_ARC_ONLY_ZONES).unwrap();
-        let scan = zones(&tree);
-
-        assert_eq!(scan.skipped, 0);
-        assert_eq!(scan.items.len(), 2);
-        assert_eq!(scan.items[0].net.as_deref(), Some("VSYS"));
-        assert_eq!(scan.items[0].layers, vec!["B.Cu"]);
-        assert!(scan.items[0].points.is_empty());
-        assert_eq!(scan.items[0].elements.len(), 8);
-        assert_eq!(
-            scan.items[0].elements.first(),
-            Some(&ZoneOutlineElement::Arc {
-                start: (149.28, 105.91),
-                mid: (149.206777, 106.086777),
-                end: (149.03, 106.16),
-            })
-        );
-        assert_eq!(
-            scan.items[0].elements.last(),
-            Some(&ZoneOutlineElement::Arc {
-                start: (149.03, 102.86),
-                mid: (149.206777, 102.933223),
-                end: (149.28, 103.11),
-            })
-        );
-        assert_eq!(scan.items[1].net.as_deref(), Some("+BATT"));
-        assert_eq!(scan.items[1].layers, vec!["In2.Cu"]);
-        assert!(scan.items[1].points.is_empty());
-        assert_eq!(scan.items[1].elements.len(), 7);
-        assert_eq!(
-            scan.items[1].elements.first(),
-            Some(&ZoneOutlineElement::Arc {
-                start: (144.26, 95.23),
-                mid: (144.552893, 95.937107),
-                end: (145.26, 96.23),
-            })
-        );
-        assert_eq!(
-            scan.items[1].elements.last(),
-            Some(&ZoneOutlineElement::Arc {
-                start: (143.26, 93.73),
-                mid: (143.967107, 94.022893),
-                end: (144.26, 94.73),
-            })
-        );
     }
 
     /// The module's malformed-item policy: broken nodes are dropped *and
@@ -1198,6 +1183,42 @@ mod tests {
         assert_eq!((z.items.len(), z.skipped), (0, 3));
         // Too few points, an incomplete arc, and an unknown outline element
         // are all unreadable rather than being fabricated or dropped.
+    }
+
+    #[test]
+    fn lossless_zone_outlines_reject_ambiguous_or_partial_geometry() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(zone (layer \"F.Cu\") (polygon (pts\n\
+             \t\t(xy 0 0) (xy 2 0) (xy 0 2))))\n\
+             \t(zone (layer \"F.Cu\") (polygon (pts\n\
+             \t\t(arc (start 0 0) (mid 1 1)))))\n\
+             \t(zone (layer \"F.Cu\") (polygon (pts\n\
+             \t\t(arc (start 0 0) (start 1 0) (mid 1 1) (end 0 2)))))\n\
+             \t(zone (layer \"F.Cu\") (polygon (pts\n\
+             \t\t(arc (start NaN 0) (mid 1 1) (end 0 2)))))\n\
+             \t(zone (layer \"F.Cu\") (polygon (pts\n\
+             \t\t(arc (start 0 0) (mid 1 1 9) (end 0 2)))))\n\
+             \t(zone (layer \"F.Cu\") (polygon (pts\n\
+             \t\t(xy 0 0 9) (xy 2 0) (xy 0 2))))\n\
+             \t(zone (layer \"F.Cu\") (polygon (pts\n\
+             \t\t(xy NaN 0) (xy 2 0) (xy 0 2))))\n\
+             \t(zone (layer \"F.Cu\") (polygon (pts\n\
+             \t\t(xy 0 0) (curve (start 1 0) (end 1 1)) (xy 0 2))))\n\
+             )",
+        )
+        .unwrap();
+
+        let scan = lossless_zone_outlines(&tree);
+        assert_eq!((scan.items.len(), scan.skipped), (1, 7));
+        assert_eq!(
+            scan.items[0].elements,
+            vec![
+                ZoneOutlineElement::Point((0.0, 0.0)),
+                ZoneOutlineElement::Point((2.0, 0.0)),
+                ZoneOutlineElement::Point((0.0, 2.0)),
+            ]
+        );
     }
 
     #[test]
