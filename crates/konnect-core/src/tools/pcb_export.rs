@@ -295,8 +295,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "native_bridge_mode": {
                         "type": "string",
                         "enum": ["prefer", "require", "disable"],
-                        "default": "prefer",
-                        "description": "KiCad 10 native-export policy. 'prefer' uses the enabled authenticated ActionPlugin bridge with the Rust exporter as fallback; 'require' refuses fallback; 'disable' uses Rust only."
+                        "default": "disable",
+                        "description": "KiCad 10 native-export policy. Rust-only 'disable' is the default; 'prefer' explicitly opts into the enabled authenticated ActionPlugin bridge with the Rust exporter as fallback; 'require' refuses fallback."
                     }
                 },
                 "required": ["board", "output"]
@@ -707,6 +707,10 @@ fn write_specctra_export_pair(
     Ok(())
 }
 
+fn resolve_native_bridge_mode(args: &serde_json::Value) -> &str {
+    args["native_bridge_mode"].as_str().unwrap_or("disable")
+}
+
 async fn handle_export_specctra_dsn(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -717,7 +721,7 @@ async fn handle_export_specctra_dsn(
         .as_str()
         .map(PathBuf::from)
         .unwrap_or_else(|| default_specctra_manifest_path(&output_path));
-    let native_bridge_mode = args["native_bridge_mode"].as_str().unwrap_or("prefer");
+    let native_bridge_mode = resolve_native_bridge_mode(args);
 
     if !extension_is(&board_path, "kicad_pcb") {
         return Ok(invalid_export_argument(
@@ -1182,6 +1186,15 @@ mod new_export_format_tests {
         assert_eq!(
             default_specctra_manifest_path(Path::new("build/clock.dsn")),
             PathBuf::from("build/clock.dsn.konnect.json")
+        );
+    }
+
+    #[test]
+    fn rust_specctra_export_is_the_default_path() {
+        assert_eq!(resolve_native_bridge_mode(&json!({})), "disable");
+        assert_eq!(
+            resolve_native_bridge_mode(&json!({ "native_bridge_mode": "prefer" })),
+            "prefer"
         );
     }
 

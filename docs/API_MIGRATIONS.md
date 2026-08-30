@@ -3,6 +3,17 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: Rust Specctra export is the default
+
+`export_specctra_dsn.native_bridge_mode` now defaults to `disable`, so an
+omitted value always selects the Rust/IPC exporter. This keeps the default path
+free of Python and SWIG and makes its KiCad 11 direction explicit.
+
+KiCad 10 users who deliberately want the authenticated ActionPlugin bridge can
+pass `prefer` (use the native export when available, otherwise Rust) or
+`require` (refuse when the native bridge is unavailable). No tool or argument
+was removed.
+
 ## Unreleased: remove inputs that never affected an operation
 
 The following optional inputs were advertised but never read by their handlers.

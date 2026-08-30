@@ -68,6 +68,32 @@ struct FootprintModel {
     pads: Vec<PadModel>,
 }
 
+#[derive(Debug, Clone)]
+struct LockedTrackModel {
+    start_x_um: i64,
+    start_y_um: i64,
+    end_x_um: i64,
+    end_y_um: i64,
+    width_um: i64,
+    layer: String,
+    net: String,
+}
+
+#[derive(Debug, Clone)]
+struct LockedViaModel {
+    x_um: i64,
+    y_um: i64,
+    diameter_um: i64,
+    drill_um: i64,
+    net: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LockedRouting {
+    tracks: Vec<LockedTrackModel>,
+    vias: Vec<LockedViaModel>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RuleKey {
     track_width_um: i64,
@@ -99,6 +125,10 @@ struct SupportedProfile {
     component_side: String,
     pad_shapes: Vec<String>,
     existing_routing: bool,
+    #[serde(default)]
+    locked_track_count: usize,
+    #[serde(default)]
+    locked_via_count: usize,
     copper_zones: bool,
     custom_rules: bool,
     outline: String,
@@ -159,10 +189,10 @@ pub(crate) fn export_dsn(
         bail!("KiCad IPC snapshot root is not 'kicad_pcb'");
     }
 
-    reject_unsupported_board_items(&tree)?;
     let copper_layers = copper_layers(&tree)?;
     let outline = simple_closed_outline(&tree)?;
     let net_table = top_level_net_table(&tree);
+    let locked_routing = locked_routing(&tree, &net_table, &copper_layers)?;
     let footprints = footprints(&tree, &net_table)?;
     if footprints.is_empty() {
         bail!("supported routing profile requires at least one footprint");
@@ -218,6 +248,7 @@ pub(crate) fn export_dsn(
         &net_classes,
         &padstack_names,
         &via_names,
+        &locked_routing,
     )?;
     let dsn = serialize_and_validate(pcb)?;
     let source_sha256 = sha256_hex(board_source.as_bytes());
@@ -230,6 +261,7 @@ pub(crate) fn export_dsn(
         &net_classes,
         &padstack_names,
         &via_names,
+        &locked_routing,
     )?;
 
     Ok(ExportBundle {
@@ -728,20 +760,138 @@ fn dsn_integer(node: &SexpNode, index: usize, label: &str) -> Result<i64> {
     Ok(value as i64)
 }
 
-fn reject_unsupported_board_items(tree: &SexpNode) -> Result<()> {
-    let unsupported = [
-        ("segment", "existing track segment"),
-        ("arc", "existing routed arc"),
-        ("via", "existing via"),
-        ("zone", "copper zone or rule area"),
-    ];
-    for (tag, label) in unsupported {
-        let count = tree.find_all(tag).len();
-        if count > 0 {
-            bail!("unsupported first routing profile: board contains {count} {label}(s)");
-        }
+fn locked_routing(
+    tree: &SexpNode,
+    net_table: &BTreeMap<String, String>,
+    copper_layers: &[String],
+) -> Result<LockedRouting> {
+    let zone_count = tree.find_all("zone").len();
+    if zone_count > 0 {
+        bail!(
+            "unsupported first routing profile: board contains {zone_count} copper zone or rule area(s)"
+        );
     }
-    Ok(())
+    let arc_count = tree.find_all("arc").len();
+    if arc_count > 0 {
+        let locked = tree
+            .find_all("arc")
+            .iter()
+            .filter(|arc| arc.find_str("locked") == Some("yes"))
+            .count();
+        if locked > 0 {
+            bail!(
+                "unsupported first routing profile: board contains {locked} locked routed arc(s), which cannot be represented without approximation"
+            );
+        }
+        bail!(
+            "unsupported first routing profile: board contains {arc_count} existing routed arc(s)"
+        );
+    }
+
+    let mut routing = LockedRouting::default();
+    for segment in tree.find_all("segment") {
+        if segment.find_str("locked") != Some("yes") {
+            bail!("unsupported first routing profile: board contains an existing track segment that is not locked");
+        }
+        let layer = segment
+            .find_str("layer")
+            .context("locked track segment has no layer")?
+            .to_string();
+        if !copper_layers.contains(&layer) {
+            bail!("locked track segment uses unsupported layer '{layer}'");
+        }
+        let net = segment
+            .find("net")
+            .and_then(|node| resolve_net(node, net_table))
+            .context("locked track segment has no connected net")?;
+        let (start_x_um, start_y_um) = point_um(segment, "start")?;
+        let (end_x_um, end_y_um) = point_um(segment, "end")?;
+        if start_x_um == end_x_um && start_y_um == end_y_um {
+            bail!("locked track segment has zero length");
+        }
+        routing.tracks.push(LockedTrackModel {
+            start_x_um,
+            start_y_um,
+            end_x_um,
+            end_y_um,
+            width_um: positive_um(
+                segment.find("width").and_then(|width| width.get_f64(1)),
+                "locked track width",
+            )?,
+            layer,
+            net,
+        });
+    }
+    for via in tree.find_all("via") {
+        if via.find_str("locked") != Some("yes") {
+            bail!("unsupported first routing profile: board contains an existing via that is not locked");
+        }
+        if let Some(kind) = via.find_str("type") {
+            bail!("unsupported locked via type '{kind}'; only through vias are supported");
+        }
+        let layers = via
+            .find("layers")
+            .and_then(SexpNode::children)
+            .unwrap_or(&[])
+            .iter()
+            .skip(1)
+            .filter_map(SexpNode::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if layers != copper_layers {
+            bail!(
+                "unsupported locked via layer span [{}]; expected [{}]",
+                layers.join(", "),
+                copper_layers.join(", ")
+            );
+        }
+        let net = via
+            .find("net")
+            .and_then(|node| resolve_net(node, net_table))
+            .context("locked via has no connected net")?;
+        let (x_um, y_um) = point_um(via, "at")?;
+        let diameter_um = positive_um(
+            via.find("size").and_then(|size| size.get_f64(1)),
+            "locked via diameter",
+        )?;
+        let drill = via.find("drill").context("locked via has no drill")?;
+        if drill.get(1).and_then(SexpNode::as_str) == Some("oval") {
+            bail!("unsupported locked via with oval drill");
+        }
+        let drill_um = positive_um(drill.get_f64(1), "locked via drill")?;
+        if drill_um >= diameter_um {
+            bail!("locked via drill is not smaller than its diameter");
+        }
+        routing.vias.push(LockedViaModel {
+            x_um,
+            y_um,
+            diameter_um,
+            drill_um,
+            net,
+        });
+    }
+    routing.tracks.sort_by(|left, right| {
+        (
+            &left.net,
+            &left.layer,
+            left.start_x_um,
+            left.start_y_um,
+            left.end_x_um,
+            left.end_y_um,
+        )
+            .cmp(&(
+                &right.net,
+                &right.layer,
+                right.start_x_um,
+                right.start_y_um,
+                right.end_x_um,
+                right.end_y_um,
+            ))
+    });
+    routing.vias.sort_by(|left, right| {
+        (&left.net, left.x_um, left.y_um).cmp(&(&right.net, right.x_um, right.y_um))
+    });
+    Ok(routing)
 }
 
 fn copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
@@ -1052,6 +1202,7 @@ fn build_pcb(
     net_classes: &BTreeMap<String, String>,
     padstack_names: &BTreeMap<PadstackKey, String>,
     via_names: &BTreeMap<RuleKey, String>,
+    locked_routing: &LockedRouting,
 ) -> Result<dsn::Pcb> {
     let default_rule = class_nets
         .keys()
@@ -1163,6 +1314,64 @@ fn build_pcb(
         .collect();
     debug_assert_eq!(net_classes.len(), net_pins.len());
 
+    let net_rules = class_nets
+        .iter()
+        .flat_map(|(rule, nets)| nets.iter().map(move |net| (net, rule)))
+        .collect::<BTreeMap<_, _>>();
+    let wires = locked_routing
+        .tracks
+        .iter()
+        .map(|track| {
+            if !net_rules.contains_key(&track.net) {
+                bail!("locked track uses unknown routing net '{}'", track.net);
+            }
+            Ok(dsn::Wire {
+                path: dsn::Path {
+                    layer: track.layer.clone(),
+                    width: track.width_um as f64,
+                    coords: vec![
+                        dsn::Point {
+                            x: track.start_x_um as f64,
+                            y: track.start_y_um as f64,
+                        },
+                        dsn::Point {
+                            x: track.end_x_um as f64,
+                            y: track.end_y_um as f64,
+                        },
+                    ],
+                },
+                net: track.net.clone(),
+                r#type: "fix".to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let fixed_vias = locked_routing
+        .vias
+        .iter()
+        .map(|via| {
+            let rule = net_rules
+                .get(&via.net)
+                .with_context(|| format!("locked via uses unknown routing net '{}'", via.net))?;
+            if via.diameter_um != rule.via_diameter_um || via.drill_um != rule.via_drill_um {
+                bail!(
+                    "locked via on net '{}' is {}:{} um, but its effective via rule is {}:{} um",
+                    via.net,
+                    via.diameter_um,
+                    via.drill_um,
+                    rule.via_diameter_um,
+                    rule.via_drill_um
+                );
+            }
+            Ok(dsn::Via {
+                name: via_names[*rule].clone(),
+                x: via.x_um as f64,
+                y: via.y_um as f64,
+                net: via.net.clone(),
+                r#type: Some("fix".to_string()),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(dsn::Pcb {
         name: board_path
             .file_name()
@@ -1202,8 +1411,8 @@ fn build_pcb(
         library: dsn::Library { images, padstacks },
         network: dsn::Network { nets, classes },
         wiring: dsn::Wiring {
-            wires: Vec::new(),
-            vias: Vec::new(),
+            wires,
+            vias: fixed_vias,
         },
     })
 }
@@ -1265,6 +1474,7 @@ fn build_manifest(
     net_classes: &BTreeMap<String, String>,
     padstack_names: &BTreeMap<PadstackKey, String>,
     via_names: &BTreeMap<RuleKey, String>,
+    locked_routing: &LockedRouting,
 ) -> Result<String> {
     let components = footprints
         .iter()
@@ -1329,7 +1539,9 @@ fn build_manifest(
             copper_layers: 2,
             component_side: "front".to_string(),
             pad_shapes: vec!["circle".to_string(), "rect".to_string()],
-            existing_routing: false,
+            existing_routing: !locked_routing.tracks.is_empty() || !locked_routing.vias.is_empty(),
+            locked_track_count: locked_routing.tracks.len(),
+            locked_via_count: locked_routing.vias.len(),
             copper_zones: false,
             custom_rules: false,
             outline: "one closed loop of straight Edge.Cuts lines".to_string(),
@@ -1618,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_routing_is_refused_before_export() {
+    fn unlocked_routing_is_refused_before_export() {
         let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb").replace(
             "\n)",
             "\n  (segment (start 1 1) (end 2 2) (width 0.2) (layer \"F.Cu\") (net 1))\n)",
@@ -1627,6 +1839,49 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("existing track segment"), "{error}");
+    }
+
+    #[test]
+    fn locked_tracks_and_vias_are_exported_as_fixed_wiring() {
+        let source = include_str!("../tests/fixtures/specctra_two_resistors_locked.kicad_pcb");
+        let export = export_dsn(Path::new("board.kicad_pcb"), source, &rules()).unwrap();
+        assert!(export.dsn.contains("(type fix)"));
+        assert!(export.dsn.contains("(path F.Cu 250"));
+        assert!(export.dsn.contains("(via konnect_via_"));
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["supported_profile"]["existing_routing"], true);
+        assert_eq!(manifest["supported_profile"]["locked_track_count"], 1);
+        assert_eq!(manifest["supported_profile"]["locked_via_count"], 1);
+    }
+
+    #[test]
+    fn freerouting_session_preserves_locked_routing_outside_the_import_plan() {
+        let source = include_str!("../tests/fixtures/specctra_two_resistors_locked.kicad_pcb");
+        let native =
+            include_str!("../tests/fixtures/specctra_two_resistors_locked.native-kicad-10.dsn");
+        let ses =
+            include_str!("../tests/fixtures/specctra_two_resistors_locked.freerouting-2.3.0.ses");
+        let temp = tempfile::tempdir().unwrap();
+        let board_path = temp.path().join("specctra_two_resistors_locked.kicad_pcb");
+        std::fs::write(&board_path, source).unwrap();
+        let baseline = export_dsn(&board_path, source, &native_fixture_rules()).unwrap();
+        let adopted = adopt_native_dsn(baseline, native.to_string()).unwrap();
+        let plan =
+            crate::specctra_ses::parse_import_plan(&board_path, source, &adopted.manifest, ses)
+                .unwrap();
+        assert_eq!(plan.locked_track_count, 1);
+        assert_eq!(plan.locked_via_count, 1);
+        assert!(!plan.tracks.is_empty() || !plan.vias.is_empty());
+    }
+
+    #[test]
+    fn locked_arcs_are_refused_instead_of_approximated() {
+        let source = include_str!("../tests/fixtures/specctra_two_resistors_locked_arc.kicad_pcb");
+        let error = export_dsn(Path::new("board.kicad_pcb"), source, &rules())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("locked routed arc"), "{error}");
+        assert!(error.contains("without approximation"), "{error}");
     }
 
     #[test]

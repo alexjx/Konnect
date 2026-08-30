@@ -11,8 +11,9 @@ use crate::tools::{
 };
 use anyhow::Context;
 use konnect_sexp::writer::{apply_edits, write_atomic, SexpEdit};
+use prost::Message;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use super::cli;
@@ -617,6 +618,10 @@ async fn handle_plan_specctra_ses_import(
             "track_count": plan.tracks.len(),
             "arc_count": plan.arcs.len(),
             "via_count": plan.vias.len(),
+            "preserved_locked_routing": {
+                "tracks": plan.locked_track_count,
+                "vias": plan.locked_via_count
+            },
             "tracks": plan.tracks,
             "arcs": plan.arcs,
             "vias": plan.vias,
@@ -642,9 +647,41 @@ struct ApplyEvidence {
     arc_count: usize,
     via_count: usize,
     created_count: usize,
+    preserved_locked_track_count: usize,
+    preserved_locked_via_count: usize,
     drc_violations: usize,
     unconnected_items: usize,
     schematic_parity_violations: usize,
+}
+
+fn created_route_item_ids(items: &[prost_types::Any]) -> anyhow::Result<Vec<String>> {
+    use konnect_ipc::gen::kiapi::board::types::{Arc, Track, Via};
+
+    let mut ids = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let id = if item.type_url.ends_with("kiapi.board.types.Track") {
+            Track::decode(item.value.as_slice())?.id
+        } else if item.type_url.ends_with("kiapi.board.types.Arc") {
+            Arc::decode(item.value.as_slice())?.id
+        } else if item.type_url.ends_with("kiapi.board.types.Via") {
+            Via::decode(item.value.as_slice())?.id
+        } else {
+            anyhow::bail!(
+                "KiCad returned unexpected created item type '{}' at index {index}",
+                item.type_url
+            );
+        }
+        .with_context(|| format!("KiCad returned created route item {index} without a KIID"))?
+        .value;
+        if id.is_empty() {
+            anyhow::bail!("KiCad returned created route item {index} with an empty KIID");
+        }
+        ids.push(id);
+    }
+    if ids.iter().collect::<HashSet<_>>().len() != ids.len() {
+        anyhow::bail!("KiCad returned duplicate KIIDs for created route items");
+    }
+    Ok(ids)
 }
 
 async fn handle_apply_specctra_ses(
@@ -727,9 +764,17 @@ async fn handle_apply_specctra_ses(
         let existing_tracks = client.get_items_in(document.clone(), ObjectType::KotPcbTrace)?;
         let existing_arcs = client.get_items_in(document.clone(), ObjectType::KotPcbArc)?;
         let existing_vias = client.get_items_in(document.clone(), ObjectType::KotPcbVia)?;
-        if !existing_tracks.is_empty() || !existing_arcs.is_empty() || !existing_vias.is_empty() {
+        if existing_tracks.len() != plan.locked_track_count
+            || !existing_arcs.is_empty()
+            || existing_vias.len() != plan.locked_via_count
+        {
             anyhow::bail!(
-                "live board contains routing even though the bound export profile did not"
+                "live locked-routing inventory changed: manifest has {} track(s)/{} via(s), IPC read {} track(s)/{} arc(s)/{} via(s)",
+                plan.locked_track_count,
+                plan.locked_via_count,
+                existing_tracks.len(),
+                existing_arcs.len(),
+                existing_vias.len()
             );
         }
         let net_codes = client
@@ -792,8 +837,7 @@ async fn handle_apply_specctra_ses(
             anyhow::bail!("KiCad board changed while route items were prepared; retry from a stable editor revision");
         }
         let expected_count = items.len();
-        let mut candidate_created = false;
-        let operation = client.run_commit("Import Freerouting SES", |client| {
+        let created_ids = client.run_commit("Import Freerouting SES", |client| {
             let created = client.create_items_in_returning(document.clone(), items)?;
             if created.len() != expected_count {
                 anyhow::bail!(
@@ -802,48 +846,68 @@ async fn handle_apply_specctra_ses(
                     expected_count
                 );
             }
+            created_route_item_ids(&created)
+        })?;
+
+        // KiCad 10 publishes neither GetItems nor SaveDocumentToString changes
+        // while a commit is open. End the single user-visible undo transaction,
+        // then validate the exact live inventory and serialized candidate. If
+        // any post-commit gate fails, delete only the KIIDs returned by
+        // CreateItems in a compensating transaction and prove the original
+        // serialized board was restored.
+        let operation = (|| {
             let read_tracks = client.get_items_in(document.clone(), ObjectType::KotPcbTrace)?;
             let read_arcs = client.get_items_in(document.clone(), ObjectType::KotPcbArc)?;
             let read_vias = client.get_items_in(document.clone(), ObjectType::KotPcbVia)?;
-            if read_tracks.len() != plan.tracks.len()
+            if read_tracks.len() != plan.locked_track_count + plan.tracks.len()
                 || read_arcs.len() != plan.arcs.len()
-                || read_vias.len() != plan.vias.len()
+                || read_vias.len() != plan.locked_via_count + plan.vias.len()
             {
                 anyhow::bail!(
-                    "IPC read-back mismatch: planned {} tracks/{} arcs/{} vias, read {} tracks/{} arcs/{} vias",
-                    plan.tracks.len(), plan.arcs.len(), plan.vias.len(),
+                    "post-commit IPC read-back mismatch: expected {} tracks/{} arcs/{} vias, read {} tracks/{} arcs/{} vias",
+                    plan.locked_track_count + plan.tracks.len(),
+                    plan.arcs.len(),
+                    plan.locked_via_count + plan.vias.len(),
                     read_tracks.len(), read_arcs.len(), read_vias.len()
                 );
             }
             let candidate_source = client.save_document_to_string_in(document.clone())?;
             konnect_sexp::write_new_atomic(&candidate_for_ipc, &candidate_source)
                 .with_context(|| format!("create candidate {}", candidate_for_ipc.display()))?;
-            candidate_created = true;
             let drc = runtime.block_on(cli::run_drc(&cli_path, &candidate_for_ipc, false))?;
             let parity_count = drc.schematic_parity.as_ref().map_or(0, Vec::len);
-            if !drc.violations.is_empty() || parity_count != 0 {
-                anyhow::bail!(
-                    "candidate failed KiCad DRC with {} violation(s) and {} schematic-parity violation(s)",
-                    drc.violations.len(),
-                    parity_count
-                );
-            }
             Ok(ApplyEvidence {
                 source_sha256: plan.source_sha256.clone(),
                 session_id: plan.session_id.clone(),
-                track_count: read_tracks.len(),
-                arc_count: read_arcs.len(),
-                via_count: read_vias.len(),
-                created_count: created.len(),
+                track_count: plan.tracks.len(),
+                arc_count: plan.arcs.len(),
+                via_count: plan.vias.len(),
+                created_count: created_ids.len(),
+                preserved_locked_track_count: plan.locked_track_count,
+                preserved_locked_via_count: plan.locked_via_count,
                 drc_violations: drc.violations.len(),
                 unconnected_items: drc.unconnected_items.as_ref().map_or(0, Vec::len),
                 schematic_parity_violations: parity_count,
             })
-        });
+        })();
         match operation {
             Ok(evidence) => Ok(evidence),
             Err(error) => {
-                if candidate_created {
+                let rollback = client.run_commit("Rollback failed Freerouting SES import", |client| {
+                    client.delete_items_in(document.clone(), created_ids.clone())
+                });
+                if let Err(rollback_error) = rollback {
+                    anyhow::bail!(
+                        "SES import failed ({error}); compensating deletion also failed ({rollback_error})"
+                    );
+                }
+                let restored = client.save_document_to_string_in(document.clone())?;
+                if restored != before {
+                    anyhow::bail!(
+                        "SES import failed ({error}); compensating deletion completed but the live board did not return to its exact pre-import serialization"
+                    );
+                }
+                if candidate_for_ipc.exists() {
                     std::fs::remove_file(&candidate_for_ipc).with_context(|| {
                         format!(
                             "SES import failed ({error}); also failed to remove candidate {}",
@@ -879,8 +943,15 @@ async fn handle_apply_specctra_ses(
             "arc_count": evidence.arc_count,
             "via_count": evidence.via_count,
             "created_count": evidence.created_count,
+            "preserved_locked_routing": {
+                "tracks": evidence.preserved_locked_track_count,
+                "vias": evidence.preserved_locked_via_count
+            },
             "ipc_readback": "exact_count_match",
             "drc": {
+                "clean": evidence.drc_violations == 0
+                    && evidence.unconnected_items == 0
+                    && evidence.schematic_parity_violations == 0,
                 "violations": evidence.drc_violations,
                 "unconnected_items": evidence.unconnected_items,
                 "schematic_parity_violations": evidence.schematic_parity_violations
@@ -1586,6 +1657,163 @@ async fn handle_route_diff_pair(
         "net_pos": net_pos, "net_neg": net_neg,
         "layer": layer, "width": width, "gap": gap
     })))
+}
+
+/// Manual live acceptance gate for the final #337 undo boundary.
+///
+/// KiCad IPC can create a named commit but exposes no command that invokes the
+/// editor's Undo action. This test therefore performs the complete import,
+/// proves that routing appeared, and then waits for the operator to press
+/// Ctrl+Z once in PCB Editor. It passes only when the exact pre-import IPC
+/// snapshot returns. The UI action is test evidence; Konnect's runtime remains
+/// IPC-only.
+#[cfg(test)]
+mod specctra_live_undo_test {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn response_json(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => {
+                serde_json::from_str(text).expect("handler returned JSON text")
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn created_route_items_must_return_unique_kicad_ids() {
+        use konnect_ipc::gen::kiapi::board::types::{Track, Via};
+        use konnect_ipc::gen::kiapi::common::types::Kiid;
+
+        let track = Track {
+            id: Some(Kiid {
+                value: "track-id".into(),
+            }),
+            ..Default::default()
+        };
+        let via = Via {
+            id: Some(Kiid {
+                value: "via-id".into(),
+            }),
+            ..Default::default()
+        };
+        let items = vec![
+            konnect_ipc::builders::pack_any(&track, "kiapi.board.types.Track"),
+            konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via"),
+        ];
+        assert_eq!(
+            created_route_item_ids(&items).unwrap(),
+            ["track-id", "via-id"]
+        );
+
+        let duplicate = vec![items[0].clone(), items[0].clone()];
+        assert!(created_route_item_ids(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable locked fixture open in KiCad and one manual Ctrl+Z"]
+    async fn one_undo_restores_the_exact_pre_import_board_snapshot() {
+        let board = std::path::PathBuf::from(
+            std::env::var_os("KONNECT_LIVE_SPECCTRA_BOARD")
+                .expect("set KONNECT_LIVE_SPECCTRA_BOARD to the disposable open board"),
+        )
+        .canonicalize()
+        .expect("resolve disposable board");
+        let ipc_address = std::env::var("KICAD_API_SOCKET")
+            .expect("set KICAD_API_SOCKET to the PCB Editor IPC endpoint");
+        let kicad_cli = std::env::var("KICAD_CLI_PATH").unwrap_or_else(|_| "kicad-cli".into());
+        let freerouting_jar = std::path::PathBuf::from(
+            std::env::var_os("FREEROUTING_JAR").expect("set FREEROUTING_JAR"),
+        );
+        let client = konnect_ipc::KiCadIpcClient::new(&ipc_address);
+        let document = client.find_open_board(&board).expect("find open board");
+        let before = client
+            .save_document_to_string_in(document.clone())
+            .expect("capture board before import");
+        let rules = client
+            .get_effective_routing_rules_in(document.clone())
+            .expect("capture routing rules");
+        let export = crate::specctra::export_dsn(&board, &before, &rules)
+            .expect("export locked-routing fixture");
+
+        let temp = tempfile::tempdir().expect("create output directory");
+        let dsn = temp.path().join("board.dsn");
+        let manifest = temp.path().join("board.dsn.konnect.json");
+        let ses = temp.path().join("board.ses");
+        let candidate = temp.path().join("board.freerouted.kicad_pcb");
+        std::fs::write(&dsn, export.dsn).expect("write deterministic DSN");
+        std::fs::write(&manifest, export.manifest).expect("write reverse manifest");
+        crate::freerouting_mcp::route_local(
+            &freerouting_jar,
+            &dsn,
+            &ses,
+            &crate::freerouting_mcp::RouteSettings {
+                max_passes: Some(20),
+                optimizer_enabled: Some(false),
+                job_timeout_seconds: Some(120),
+                poll_interval: Duration::from_secs(2),
+                overall_timeout: Duration::from_secs(180),
+            },
+        )
+        .await
+        .expect("route deterministic DSN through local Freerouting MCP");
+        let ctx = ToolContext::new(
+            ServerConfig {
+                kicad_cli,
+                kicad_binary: String::new(),
+                ipc_address: ipc_address.clone(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        );
+        let result = handle_apply_specctra_ses(
+            &json!({
+                "board": board,
+                "ses_path": ses,
+                "manifest_path": manifest,
+                "candidate_output_path": candidate
+            }),
+            &ctx,
+        )
+        .await
+        .expect("apply handler returned");
+        assert!(!result.is_error, "{}", response_json(&result));
+        let body = response_json(&result);
+        assert_eq!(body["success"], true);
+        assert_eq!(body["undo_description"], "Import Freerouting SES");
+        assert!(body["created_count"].as_u64().unwrap_or(0) > 0);
+
+        let after = client
+            .save_document_to_string_in(document.clone())
+            .expect("capture board after import");
+        assert_ne!(after, before, "import created no observable board change");
+        eprintln!("LIVE_UNDO_READY: press Ctrl+Z once in PCB Editor");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let observed = client
+                .save_document_to_string_in(document.clone())
+                .expect("observe board while waiting for undo");
+            if observed == before {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "one Ctrl+Z did not restore the exact pre-import IPC snapshot within 60 seconds"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 }
 
 #[cfg(test)]
