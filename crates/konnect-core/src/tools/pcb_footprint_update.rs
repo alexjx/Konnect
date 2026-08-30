@@ -26,6 +26,13 @@ struct LibraryFootprint {
     models: Vec<kiapi::board::types::Footprint3DModel>,
 }
 
+#[derive(Debug)]
+struct ParsedLibraryProperties {
+    datasheet: Option<String>,
+    description: Option<String>,
+    custom: Vec<kiapi::board::types::Field>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ChangedDomain {
@@ -733,15 +740,13 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     }
 
     validate_supported_children(&root)?;
+    let properties = parse_library_properties(&root)?;
     let pads = super::pcb_components::extract_pad_definitions(source)?;
     // Custom properties travel as typed Field items below. Treating visible
     // properties as generic graphics as well would duplicate their text.
     let graphics = super::pcb_components::extract_graphic_definitions_without_properties(source)?;
     let models = parse_models(&root)?;
     let attributes = parse_attributes(&root)?;
-    let datasheet = property_value(&root, "Datasheet");
-    let description_field = property_value(&root, "Description");
-    let properties = parse_custom_properties(&root)?;
     let definition = kiapi::board::types::Footprint {
         id: Some(kiapi::common::types::LibraryIdentifier {
             library_nickname: library_nickname.to_string(),
@@ -759,49 +764,63 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         library_id: library_id.to_string(),
         definition,
         attributes,
-        datasheet,
-        description_field,
-        properties,
+        datasheet: properties.datasheet,
+        description_field: properties.description,
+        properties: properties.custom,
         pads,
         graphics,
         models,
     })
 }
 
-fn property_value(root: &konnect_sexp::SexpNode, name: &str) -> Option<String> {
-    root.find_all("property")
-        .into_iter()
-        .find(|property| property.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some(name))
-        .and_then(|property| property.get(2))
-        .and_then(konnect_sexp::SexpNode::as_str)
-        .map(str::to_string)
-}
-
-fn parse_custom_properties(
-    root: &konnect_sexp::SexpNode,
-) -> Result<Vec<kiapi::board::types::Field>> {
+fn parse_library_properties(root: &konnect_sexp::SexpNode) -> Result<ParsedLibraryProperties> {
     let mut names = BTreeSet::new();
-    root.find_all("property")
-        .into_iter()
-        .filter_map(|property| {
-            let name = property.get(1).and_then(konnect_sexp::SexpNode::as_str)?;
-            (!matches!(name, "Reference" | "Value" | "Datasheet" | "Description"))
-                .then_some((name, property))
-        })
-        .map(|(name, property)| {
-            if !names.insert(name.to_string()) {
-                bail!("property '{name}' appears more than once in the library footprint");
-            }
-            parse_custom_property(property)
-        })
-        .collect()
+    let mut datasheet = None;
+    let mut description = None;
+    let mut custom = Vec::new();
+    for property in root.find_all("property") {
+        let name = property
+            .get(1)
+            .and_then(konnect_sexp::SexpNode::as_str)
+            .context("property is missing its name")?;
+        if !names.insert(name.to_string()) {
+            bail!("property '{name}' appears more than once in the library footprint");
+        }
+
+        // Mandatory and custom properties share one lossless clause validator.
+        // The mandatory values keep their existing first-class IPC fields; the
+        // shared parser proves that none of their authored clauses would be
+        // silently ignored without requiring a typed custom Field.
+        let mandatory = matches!(name, "Reference" | "Value" | "Datasheet" | "Description");
+        let parsed = parse_library_property(property, !mandatory)?;
+        let value = property
+            .get(2)
+            .and_then(konnect_sexp::SexpNode::as_str)
+            .with_context(|| format!("property '{name}' is missing its value"))?;
+        match name {
+            "Reference" | "Value" => {}
+            "Datasheet" => datasheet = Some(value.to_string()),
+            "Description" => description = Some(value.to_string()),
+            _ => custom.push(parsed.context("custom property did not produce a typed field")?),
+        }
+    }
+
+    Ok(ParsedLibraryProperties {
+        datasheet,
+        description,
+        custom,
+    })
 }
 
-/// Convert a non-mandatory footprint property into the typed `Field` item
-/// carried by KiCad's IPC model. Unknown clauses refuse here: accepting a
-/// property while dropping part of its authored presentation would make the
-/// refresh lossy even when the value itself happened to survive.
-fn parse_custom_property(property: &konnect_sexp::SexpNode) -> Result<kiapi::board::types::Field> {
+/// Convert a footprint property into the typed `Field` shape carried by
+/// KiCad's IPC model. Mandatory properties are validated through this same
+/// path and then stored in their existing first-class fields. Unknown clauses
+/// refuse here: accepting a property while dropping part of its authored
+/// presentation would make the refresh lossy even when its value survived.
+fn parse_library_property(
+    property: &konnect_sexp::SexpNode,
+    require_typed_field: bool,
+) -> Result<Option<kiapi::board::types::Field>> {
     use kiapi::common::types::LockedState;
 
     let name = property
@@ -815,8 +834,8 @@ fn parse_custom_property(property: &konnect_sexp::SexpNode) -> Result<kiapi::boa
     let mut position = None;
     let mut rotation = 0.0;
     let mut layer = None;
-    let mut visible = true;
-    let mut knockout = false;
+    let mut hidden = None;
+    let mut knockout = None;
     let mut attributes = None;
     let mut identifier = None;
 
@@ -863,8 +882,18 @@ fn parse_custom_property(property: &konnect_sexp::SexpNode) -> Result<kiapi::boa
                         as i32,
                 );
             }
-            "hide" => visible = !property_yes_no(clause, name, "hide")?,
-            "knockout" => knockout = property_yes_no(clause, name, "knockout")?,
+            "hide" => {
+                if hidden.is_some() {
+                    bail!("property '{name}' contains duplicate 'hide' clauses");
+                }
+                hidden = Some(property_yes_no(clause, name, "hide")?);
+            }
+            "knockout" => {
+                if knockout.is_some() {
+                    bail!("property '{name}' contains duplicate 'knockout' clauses");
+                }
+                knockout = Some(property_yes_no(clause, name, "knockout")?);
+            }
             "uuid" | "tstamp" => {
                 if let Some(previous) = identifier {
                     bail!(
@@ -893,6 +922,10 @@ fn parse_custom_property(property: &konnect_sexp::SexpNode) -> Result<kiapi::boa
         }
     }
 
+    if !require_typed_field {
+        return Ok(None);
+    }
+
     let position =
         position.with_context(|| format!("property '{name}' is missing its 'at' clause"))?;
     let layer =
@@ -902,7 +935,7 @@ fn parse_custom_property(property: &konnect_sexp::SexpNode) -> Result<kiapi::boa
     attributes.angle = Some(kiapi::common::types::Angle {
         value_degrees: rotation,
     });
-    Ok(kiapi::board::types::Field {
+    Ok(Some(kiapi::board::types::Field {
         id: None,
         name: name.to_string(),
         text: Some(kiapi::board::types::BoardText {
@@ -916,11 +949,11 @@ fn parse_custom_property(property: &konnect_sexp::SexpNode) -> Result<kiapi::boa
                 hyperlink: String::new(),
             }),
             layer,
-            knockout,
+            knockout: knockout.unwrap_or(false),
             locked: LockedState::LsUnlocked as i32,
         }),
-        visible,
-    })
+        visible: !hidden.unwrap_or(false),
+    }))
 }
 
 fn property_yes_no(clause: &konnect_sexp::SexpNode, name: &str, tag: &str) -> Result<bool> {
@@ -996,9 +1029,9 @@ fn parse_property_effects(
     let mut font_name = String::new();
     let mut size = None;
     let mut thickness = None;
-    let mut bold = false;
-    let mut italic = false;
-    let mut line_spacing = 1.0;
+    let mut bold = None;
+    let mut italic = None;
+    let mut line_spacing = None;
     for clause in font.children().unwrap_or_default().iter().skip(1) {
         let tag = clause
             .head()
@@ -1048,9 +1081,22 @@ fn parse_property_effects(
                 }
                 thickness = Some(value);
             }
-            "bold" => bold = property_yes_no(clause, name, "font bold")?,
-            "italic" => italic = property_yes_no(clause, name, "font italic")?,
+            "bold" => {
+                if bold.is_some() {
+                    bail!("property '{name}' contains duplicate font 'bold' clauses");
+                }
+                bold = Some(property_yes_no(clause, name, "font bold")?);
+            }
+            "italic" => {
+                if italic.is_some() {
+                    bail!("property '{name}' contains duplicate font 'italic' clauses");
+                }
+                italic = Some(property_yes_no(clause, name, "font italic")?);
+            }
             "line_spacing" => {
+                if line_spacing.is_some() {
+                    bail!("property '{name}' contains duplicate font 'line_spacing' clauses");
+                }
                 let value = clause
                     .get_f64(1)
                     .with_context(|| format!("property '{name}' line spacing is invalid"))?;
@@ -1060,7 +1106,7 @@ fn parse_property_effects(
                 {
                     bail!("property '{name}' line spacing must be finite and positive");
                 }
-                line_spacing = value;
+                line_spacing = Some(value);
             }
             unsupported => {
                 bail!("property '{name}' font clause '{unsupported}' is not supported losslessly")
@@ -1074,12 +1120,12 @@ fn parse_property_effects(
         horizontal_alignment: horizontal as i32,
         vertical_alignment: vertical as i32,
         angle: None,
-        line_spacing,
+        line_spacing: line_spacing.unwrap_or(1.0),
         stroke_width: Some(konnect_ipc::builders::distance(
             thickness.unwrap_or(width * 0.15),
         )),
-        italic,
-        bold,
+        italic: italic.unwrap_or(false),
+        bold: bold.unwrap_or(false),
         underlined: false,
         visible: true,
         mirrored,
@@ -1133,15 +1179,6 @@ fn validate_supported_children(root: &konnect_sexp::SexpNode) -> Result<()> {
                             "fp_text kind '{kind}' is not supported losslessly by typed library refresh"
                         );
                     }
-                }
-            }
-            "property" => {
-                let name = child
-                    .get(1)
-                    .and_then(konnect_sexp::SexpNode::as_str)
-                    .context("property is missing its name")?;
-                if !matches!(name, "Reference" | "Value" | "Datasheet" | "Description") {
-                    parse_custom_property(child)?;
                 }
             }
             _ => {}
@@ -2849,6 +2886,104 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("AssemblyVendor"), "{message}");
         assert!(message.contains("more than once"), "{message}");
+    }
+
+    #[test]
+    fn mandatory_properties_are_validated_and_duplicate_names_refuse() {
+        let mut accepted = Vec::new();
+        for (name, value) in [
+            ("Reference", "REF**"),
+            ("Value", "Socket"),
+            ("Datasheet", "new-datasheet.pdf"),
+            ("Description", "new field description"),
+        ] {
+            let authored = format!("\t(property \"{name}\" \"{value}\"\n\t\t(at");
+            let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
+                &authored,
+                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(unlocked yes)\n\t\t(at"),
+            );
+            assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
+            match parse_library_footprint("Test:Socket", &unsupported) {
+                Ok(_) => accepted.push(format!("{name} unsupported clause")),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(message.contains(name), "{message}");
+                    assert!(message.contains("unlocked"), "{message}");
+                }
+            }
+
+            let duplicate = KICAD_LIBRARY_FOOTPRINT.replace(
+                "\"KiLib_Generator\" \"konnect_test_generator\"",
+                &format!("\"{name}\" \"konnect_test_generator\""),
+            );
+            assert_ne!(duplicate, KICAD_LIBRARY_FOOTPRINT);
+            match parse_library_footprint("Test:Socket", &duplicate) {
+                Ok(_) => accepted.push(format!("{name} duplicate name")),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(message.contains(name), "{message}");
+                    assert!(message.contains("more than once"), "{message}");
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "parser accepted mandatory-property cases that must refuse: {}",
+            accepted.join(", ")
+        );
+    }
+
+    #[test]
+    fn repeated_scalar_property_clauses_refuse() {
+        let mut accepted = Vec::new();
+        let vendor_prefix = "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at 0.5 0.75 15)\n\t\t(layer \"F.Fab\")\n\t\t(hide yes)";
+        for (clause, replacement) in [
+            ("hide", format!("{vendor_prefix}\n\t\t(hide no)")),
+            (
+                "knockout",
+                format!("{vendor_prefix}\n\t\t(knockout yes)\n\t\t(knockout no)"),
+            ),
+        ] {
+            let repeated = KICAD_LIBRARY_FOOTPRINT.replace(vendor_prefix, &replacement);
+            assert_ne!(repeated, KICAD_LIBRARY_FOOTPRINT);
+            match parse_library_footprint("Test:Socket", &repeated) {
+                Ok(_) => accepted.push(clause),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(message.contains("AssemblyVendor"), "{message}");
+                    assert!(message.contains(clause), "{message}");
+                }
+            }
+        }
+
+        let vendor_font =
+            "\t\t\t\t(size 1 1)\n\t\t\t\t(thickness 0.15)\n\t\t\t)\n\t\t)\n\t)\n\t(attr";
+        for (clause, repeated_clauses) in [
+            ("bold", "\t\t\t\t(bold yes)\n\t\t\t\t(bold no)\n"),
+            ("italic", "\t\t\t\t(italic yes)\n\t\t\t\t(italic no)\n"),
+            (
+                "line_spacing",
+                "\t\t\t\t(line_spacing 1.1)\n\t\t\t\t(line_spacing 1.2)\n",
+            ),
+        ] {
+            let replacement =
+                vendor_font.replace("\t\t\t)\n", &format!("{repeated_clauses}\t\t\t)\n"));
+            let repeated = KICAD_LIBRARY_FOOTPRINT.replace(vendor_font, &replacement);
+            assert_ne!(repeated, KICAD_LIBRARY_FOOTPRINT);
+            match parse_library_footprint("Test:Socket", &repeated) {
+                Ok(_) => accepted.push(clause),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(message.contains("AssemblyVendor"), "{message}");
+                    assert!(message.contains(clause), "{message}");
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "parser accepted repeated scalar clauses that must refuse: {}",
+            accepted.join(", ")
+        );
     }
 
     #[test]
