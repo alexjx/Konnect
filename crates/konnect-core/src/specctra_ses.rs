@@ -18,6 +18,8 @@ pub(crate) struct SesImportPlan {
     pub board_path: String,
     pub source_sha256: String,
     pub session_id: String,
+    pub locked_track_count: usize,
+    pub locked_via_count: usize,
     pub tracks: Vec<SesTrack>,
     pub arcs: Vec<SesArc>,
     pub vias: Vec<SesVia>,
@@ -79,6 +81,10 @@ struct SupportedProfile {
     component_side: String,
     pad_shapes: Vec<String>,
     existing_routing: bool,
+    #[serde(default)]
+    locked_track_count: usize,
+    #[serde(default)]
+    locked_via_count: usize,
     copper_zones: bool,
     custom_rules: bool,
     outline: String,
@@ -156,8 +162,15 @@ pub(crate) fn parse_import_plan(
         .and_then(|value| value.to_str())
         .context("board path has no UTF-8 file stem")?;
     let actual_base = atom(base_design, 1, "base_design name")?;
-    if actual_base != expected_base {
-        bail!("SES base_design '{actual_base}' does not match board '{expected_base}'");
+    // Freerouting's native MCP stores the uploaded DSN under its generated job
+    // id and writes that id as both the session name and base_design. The exact
+    // target board remains bound by the manifest path and snapshot hash below;
+    // accept only that self-consistent transport alias, never an unrelated
+    // design name.
+    if actual_base != expected_base && actual_base != session_id {
+        bail!(
+            "SES base_design '{actual_base}' matches neither board '{expected_base}' nor session '{session_id}'"
+        );
     }
 
     let was_is = one_child(&root, "was_is")?;
@@ -192,6 +205,8 @@ pub(crate) fn parse_import_plan(
         board_path: manifest.board_path,
         source_sha256: manifest.source_sha256,
         session_id,
+        locked_track_count: manifest.supported_profile.locked_track_count,
+        locked_via_count: manifest.supported_profile.locked_via_count,
         tracks,
         arcs,
         vias,
@@ -214,13 +229,20 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
     }
     if manifest.supported_profile.copper_layers != 2
         || manifest.supported_profile.component_side != "front"
-        || manifest.supported_profile.existing_routing
         || manifest.supported_profile.copper_zones
         || manifest.supported_profile.custom_rules
         || manifest.supported_profile.outline.is_empty()
         || manifest.supported_profile.pad_shapes.is_empty()
     {
         bail!("manifest does not describe the supported first routing profile");
+    }
+    let (locked_track_count, locked_via_count) = locked_routing_counts(board_source)?;
+    let has_locked_routing = locked_track_count > 0 || locked_via_count > 0;
+    if manifest.supported_profile.existing_routing != has_locked_routing
+        || manifest.supported_profile.locked_track_count != locked_track_count
+        || manifest.supported_profile.locked_via_count != locked_via_count
+    {
+        bail!("manifest locked-routing inventory does not match the live board snapshot");
     }
     let requested = canonical_existing(board_path)?;
     let recorded = canonical_existing(Path::new(&manifest.board_path))?;
@@ -240,6 +262,26 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
         );
     }
     validate_manifest_relations(manifest)
+}
+
+fn locked_routing_counts(board_source: &str) -> Result<(usize, usize)> {
+    let tree =
+        parse_sexp(board_source).context("parse KiCad board for locked-routing inventory")?;
+    if !tree.find_all("arc").is_empty() {
+        bail!("live board contains an unsupported routed arc");
+    }
+    let tracks = tree.find_all("segment");
+    if tracks
+        .iter()
+        .any(|track| track.find_str("locked") != Some("yes"))
+    {
+        bail!("live board contains an existing track segment that is not locked");
+    }
+    let vias = tree.find_all("via");
+    if vias.iter().any(|via| via.find_str("locked") != Some("yes")) {
+        bail!("live board contains an existing via that is not locked");
+    }
+    Ok((tracks.len(), vias.len()))
 }
 
 fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
@@ -619,10 +661,15 @@ fn parse_network(
             let padstack = vias_by_name
                 .get(padstack_name)
                 .with_context(|| format!("SES via uses unknown padstack '{padstack_name}'"))?;
-            let nested_net = one_child(via_node, "net")?;
-            require_direct_shape(nested_net, 1, &[])?;
-            if atom(nested_net, 1, "via net")? != net_name {
-                bail!("SES via net does not match enclosing net '{net_name}'");
+            // KiCad's SES writer repeats `(net ...)` on a via; Freerouting's
+            // native MCP output omits it because the via is already nested in
+            // `network_out/net`. Inherit only that validated enclosing net.
+            // When the redundant child is present, it must agree.
+            if let Some(nested_net) = optional_child(via_node, "net")? {
+                require_direct_shape(nested_net, 1, &[])?;
+                if atom(nested_net, 1, "via net")? != net_name {
+                    bail!("SES via net does not match enclosing net '{net_name}'");
+                }
             }
             if let Some(kind) = optional_child(via_node, "type")? {
                 require_direct_shape(kind, 1, &[])?;
@@ -873,6 +920,41 @@ mod tests {
         assert_eq!(plan.vias[0].x_mm, 105.0);
         assert_eq!(plan.vias[0].y_mm, 51.0);
         assert_eq!(plan.vias[0].drill_mm, 0.3);
+    }
+
+    #[test]
+    fn native_mcp_job_alias_is_accepted_as_the_transport_design_name() {
+        let (_dir, board, source, manifest) = fixture();
+        let ses = sample_ses()
+            .replacen("(session board", "(session J-ABC123", 1)
+            .replacen("(base_design board)", "(base_design J-ABC123)", 1);
+        let plan = parse_import_plan(&board, &source, &manifest, &ses).unwrap();
+        assert_eq!(plan.session_id, "J-ABC123");
+    }
+
+    #[test]
+    fn unrelated_base_design_is_still_refused() {
+        let (_dir, board, source, manifest) = fixture();
+        let ses = sample_ses().replacen("(base_design board)", "(base_design other)", 1);
+        let error = parse_import_plan(&board, &source, &manifest, &ses).unwrap_err();
+        assert!(error.to_string().contains("matches neither"), "{error:#}");
+    }
+
+    #[test]
+    fn native_mcp_via_inherits_its_validated_enclosing_net() {
+        let (_dir, board, source, manifest) = fixture();
+        let ses = sample_ses().replace(" (net GND) (type protect)", "");
+        let plan = parse_import_plan(&board, &source, &manifest, &ses).unwrap();
+        assert_eq!(plan.vias.len(), 1);
+        assert_eq!(plan.vias[0].net_name, "GND");
+    }
+
+    #[test]
+    fn redundant_via_net_must_match_its_enclosing_net() {
+        let (_dir, board, source, manifest) = fixture();
+        let ses = sample_ses().replace("(net GND) (type protect)", "(net VCC) (type protect)");
+        let error = parse_import_plan(&board, &source, &manifest, &ses).unwrap_err();
+        assert!(error.to_string().contains("enclosing net"), "{error:#}");
     }
 
     #[test]

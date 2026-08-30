@@ -16,12 +16,31 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU32, Ordering};
+
+#[cfg(test)]
+static LAST_CHILD_PID: AtomicU32 = AtomicU32::new(0);
+
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SES_BYTES: u64 = 512 * 1024 * 1024;
+
+fn server_arguments() -> &'static [&'static str] {
+    &[
+        "--api_server.enabled=true",
+        "--api_server.authentication.enabled=false",
+        "--api_server-endpoints=http://127.0.0.1:37864",
+        "--mcp_server.enabled=true",
+        "--mcp_server.authentication.enabled=false",
+        "--mcp_server-endpoints=http://127.0.0.1:37964",
+        "--mcp_server.stdio=true",
+        "--gui.enabled=false",
+    ]
+}
 
 const REQUIRED_TOOLS: &[&str] = &[
     "create_session",
@@ -53,6 +72,69 @@ pub(crate) struct RouteEvidence {
     pub diagnostics_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BridgeProbe {
+    pub native_mcp_available: bool,
+    pub bridge_available: bool,
+    pub server_protocol_version: Option<String>,
+    pub tool_count: usize,
+    pub diagnostics: Option<String>,
+    pub error: Option<String>,
+}
+
+pub(crate) async fn probe_local(jar: &Path) -> BridgeProbe {
+    let mut client = match LocalMcpClient::start(jar).await {
+        Ok(client) => client,
+        Err(error) => {
+            return BridgeProbe {
+                native_mcp_available: false,
+                bridge_available: false,
+                server_protocol_version: None,
+                tool_count: 0,
+                diagnostics: None,
+                error: Some(format!("{error:#}")),
+            };
+        }
+    };
+    let server_protocol_version = Some(client.server_protocol_version.clone());
+    let contract = async {
+        let tools = client.list_tools().await?;
+        validate_tool_contracts(&tools)?;
+        let missing = REQUIRED_TOOLS
+            .iter()
+            .filter(|name| !tools.contains_key(**name))
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "Freerouting MCP is missing required tool(s): {}",
+                missing.join(", ")
+            );
+        }
+        Ok::<usize, anyhow::Error>(tools.len())
+    }
+    .await;
+    let diagnostics = client.close().await;
+    match contract {
+        Ok(tool_count) => BridgeProbe {
+            native_mcp_available: true,
+            bridge_available: true,
+            server_protocol_version,
+            tool_count,
+            diagnostics: (!diagnostics.is_empty()).then_some(diagnostics),
+            error: None,
+        },
+        Err(error) => BridgeProbe {
+            native_mcp_available: true,
+            bridge_available: false,
+            server_protocol_version,
+            tool_count: 0,
+            diagnostics: (!diagnostics.is_empty()).then_some(diagnostics),
+            error: Some(format!("{error:#}")),
+        },
+    }
+}
+
 pub(crate) async fn route_local(
     jar: &Path,
     dsn: &Path,
@@ -78,17 +160,18 @@ pub(crate) async fn route_local(
 
     let mut client = LocalMcpClient::start(jar).await?;
     let started = Instant::now();
-    let route_result = timeout(
+    let route_result = match timeout(
         settings.overall_timeout,
         run_state_machine(&mut client, dsn, &temporary, settings, started),
     )
     .await
-    .map_err(|_| {
-        anyhow::anyhow!(
+    {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
             "Freerouting MCP job exceeded the overall timeout of {} seconds",
             settings.overall_timeout.as_secs()
-        )
-    })?;
+        )),
+    };
     let diagnostics = client.close().await;
     let diagnostics_path = write_diagnostics(ses_output, &diagnostics).await?;
 
@@ -105,6 +188,7 @@ pub(crate) async fn route_local(
     let evidence = match result {
         Ok(evidence) => evidence,
         Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
             return Err(error);
         }
     };
@@ -183,7 +267,12 @@ fn validate_inputs(
     {
         bail!("poll interval must be between 2 and 5 seconds");
     }
-    if settings.overall_timeout < Duration::from_secs(10)
+    let minimum_overall_timeout = if cfg!(test) {
+        Duration::from_millis(1)
+    } else {
+        Duration::from_secs(10)
+    };
+    if settings.overall_timeout < minimum_overall_timeout
         || settings.overall_timeout > Duration::from_secs(86_400)
     {
         bail!("overall timeout must be between 10 and 86400 seconds");
@@ -358,28 +447,34 @@ fn require_schema_path(
 }
 
 struct LocalMcpClient {
-    child: Child,
+    child: Option<Child>,
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
-    stderr_task: JoinHandle<String>,
+    stderr_task: Option<JoinHandle<String>>,
     next_id: u64,
     server_protocol_version: String,
 }
 
 impl LocalMcpClient {
     async fn start(jar: &Path) -> Result<Self> {
+        let mut client = Self::spawn(jar)?;
+        if let Err(error) = client.initialize().await {
+            let diagnostics = client.close().await;
+            return if diagnostics.is_empty() {
+                Err(error)
+            } else {
+                Err(error).context(format!("Freerouting stderr: {diagnostics}"))
+            };
+        }
+        Ok(client)
+    }
+
+    fn spawn(jar: &Path) -> Result<Self> {
         let mut command = Command::new("java");
         command
             .arg("-jar")
             .arg(jar)
-            .args([
-                "--api_server.enabled=true",
-                "--api_server.authentication.enabled=false",
-                "--mcp_server.enabled=true",
-                "--mcp_server.authentication.enabled=false",
-                "--mcp_server.stdio=true",
-                "--gui.enabled=false",
-            ])
+            .args(server_arguments())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -387,6 +482,10 @@ impl LocalMcpClient {
         let mut child = command
             .spawn()
             .context("start local Freerouting MCP server")?;
+        #[cfg(test)]
+        if let Some(pid) = child.id() {
+            LAST_CHILD_PID.store(pid, Ordering::SeqCst);
+        }
         let stdin = child.stdin.take().context("Freerouting MCP has no stdin")?;
         let stdout = child
             .stdout
@@ -405,17 +504,20 @@ impl LocalMcpClient {
                 .await;
             String::from_utf8_lossy(&bytes).trim().to_string()
         });
-        let mut client = Self {
-            child,
+        Ok(Self {
+            child: Some(child),
             stdin,
             stdout: BufReader::new(stdout).lines(),
-            stderr_task,
+            stderr_task: Some(stderr_task),
             next_id: 1,
             server_protocol_version: String::new(),
-        };
+        })
+    }
+
+    async fn initialize(&mut self) -> Result<()> {
         let initialize = timeout(
             STARTUP_TIMEOUT,
-            client.request(
+            self.request(
                 "initialize",
                 json!({
                     "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -427,12 +529,10 @@ impl LocalMcpClient {
         )
         .await
         .map_err(|_| anyhow::anyhow!("Freerouting MCP initialization timed out"))??;
-        client.server_protocol_version = find_string(&initialize, &["protocolVersion"])
+        self.server_protocol_version = find_string(&initialize, &["protocolVersion"])
             .unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_string());
-        client
-            .notify("notifications/initialized", json!({}))
-            .await?;
-        Ok(client)
+        self.notify("notifications/initialized", json!({})).await?;
+        Ok(())
     }
 
     async fn list_tools(&mut self) -> Result<BTreeMap<String, Value>> {
@@ -542,11 +642,32 @@ impl LocalMcpClient {
 
     async fn close(mut self) -> String {
         let _ = self.stdin.shutdown().await;
-        if timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await.is_err() {
-            let _ = self.child.kill().await;
-            let _ = self.child.wait().await;
+        if let Some(mut child) = self.child.take() {
+            if timeout(SHUTDOWN_TIMEOUT, child.wait()).await.is_err() {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
         }
-        self.stderr_task.await.unwrap_or_default()
+        match self.stderr_task.take() {
+            Some(task) => task.await.unwrap_or_default(),
+            None => String::new(),
+        }
+    }
+}
+
+impl Drop for LocalMcpClient {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = child.wait().await;
+                });
+            }
+        }
+        if let Some(task) = self.stderr_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -643,6 +764,34 @@ mod tests {
     use super::*;
     use konnect_ipc::{IpcEffectiveRoutingRules, IpcRoutingRules};
 
+    #[cfg(windows)]
+    fn process_is_running(pid: u32) -> bool {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .expect("run tasklist");
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+    }
+
+    #[cfg(not(windows))]
+    fn process_is_running(pid: u32) -> bool {
+        std::process::Command::new("sh")
+            .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+            .status()
+            .expect("probe process")
+            .success()
+    }
+
+    async fn wait_for_process_exit(pid: u32) -> bool {
+        for _ in 0..50 {
+            if !process_is_running(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
     fn routing_rules() -> IpcEffectiveRoutingRules {
         ["GND", "VCC"]
             .into_iter()
@@ -684,6 +833,18 @@ mod tests {
         assert_eq!(first.parent(), output.parent());
         assert_ne!(first, second);
         assert!(extension_is(&first, "ses"));
+    }
+
+    #[test]
+    fn unauthenticated_servers_are_forced_to_loopback() {
+        let arguments = server_arguments();
+        assert!(arguments.contains(&"--api_server.authentication.enabled=false"));
+        assert!(arguments.contains(&"--api_server-endpoints=http://127.0.0.1:37864"));
+        assert!(arguments.contains(&"--mcp_server.authentication.enabled=false"));
+        assert!(arguments.contains(&"--mcp_server-endpoints=http://127.0.0.1:37964"));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument.contains("0.0.0.0")));
     }
 
     #[test]
@@ -766,5 +927,96 @@ mod tests {
         assert_eq!(evidence.final_state, "COMPLETED");
         assert!(evidence.ses_bytes > 0);
         assert!(ses.is_file());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Java and FREEROUTING_JAR"]
+    async fn overall_timeout_closes_child_and_removes_partial_output() {
+        let jar = PathBuf::from(std::env::var_os("FREEROUTING_JAR").expect("set FREEROUTING_JAR"));
+        let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&board, source).unwrap();
+        let export = crate::specctra::export_dsn(&board, source, &routing_rules()).unwrap();
+        std::fs::write(&dsn, export.dsn).unwrap();
+
+        let error = format!(
+            "{:#}",
+            route_local(
+                &jar,
+                &dsn,
+                &ses,
+                &RouteSettings {
+                    max_passes: Some(100),
+                    optimizer_enabled: Some(true),
+                    job_timeout_seconds: Some(300),
+                    poll_interval: Duration::from_secs(5),
+                    overall_timeout: Duration::from_millis(100),
+                },
+            )
+            .await
+            .unwrap_err()
+        );
+        assert!(error.contains("overall timeout"), "{error}");
+        let pid = LAST_CHILD_PID.load(Ordering::SeqCst);
+        assert!(
+            wait_for_process_exit(pid).await,
+            "Freerouting child {pid} survived timeout"
+        );
+        assert!(!ses.exists());
+        assert!(
+            std::fs::read_dir(temp.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp.ses")),
+            "timeout left a temporary SES"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Java and FREEROUTING_JAR"]
+    async fn cancelling_route_reaps_the_owned_child() {
+        let jar = PathBuf::from(std::env::var_os("FREEROUTING_JAR").expect("set FREEROUTING_JAR"));
+        let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        let dsn = temp.path().join("board.dsn");
+        let ses = temp.path().join("board.ses");
+        std::fs::write(&board, source).unwrap();
+        let export = crate::specctra::export_dsn(&board, source, &routing_rules()).unwrap();
+        std::fs::write(&dsn, export.dsn).unwrap();
+
+        LAST_CHILD_PID.store(0, Ordering::SeqCst);
+        let task = tokio::spawn(async move {
+            route_local(
+                &jar,
+                &dsn,
+                &ses,
+                &RouteSettings {
+                    max_passes: Some(100),
+                    optimizer_enabled: Some(true),
+                    job_timeout_seconds: Some(300),
+                    poll_interval: Duration::from_secs(5),
+                    overall_timeout: Duration::from_secs(300),
+                },
+            )
+            .await
+        });
+        let pid = loop {
+            let pid = LAST_CHILD_PID.load(Ordering::SeqCst);
+            if pid != 0 {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        task.abort();
+        let _ = task.await;
+        assert!(
+            wait_for_process_exit(pid).await,
+            "Freerouting child {pid} survived cancellation"
+        );
     }
 }

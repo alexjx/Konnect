@@ -49,6 +49,21 @@ tests should prove request construction and failure classification; an ignored
 live test or the end-to-end workflow should prove behavior that depends on a
 running editor.
 
+The Specctra import undo boundary has a manual live gate because KiCad IPC can
+create a named commit but cannot invoke the editor's Undo action. Open a
+disposable copy of
+`crates/konnect-core/tests/fixtures/specctra_two_resistors_locked.kicad_pcb`,
+set `KONNECT_LIVE_SPECCTRA_BOARD`, `KICAD_API_SOCKET`, and (when it is not on
+`PATH`) `KICAD_CLI_PATH`, set `FREEROUTING_JAR` to the local Freerouting 2.3.0
+JAR, then run:
+
+```text
+cargo test -p konnect-core --locked one_undo_restores_the_exact_pre_import_board_snapshot -- --ignored --nocapture
+```
+
+When the test prints `LIVE_UNDO_READY`, press Ctrl+Z once in PCB Editor. The
+test passes only when the exact pre-import IPC snapshot returns.
+
 ## CI And Live Validation
 
 `.github/workflows/ci.yml` covers the Rust workspace, formatting, clippy,

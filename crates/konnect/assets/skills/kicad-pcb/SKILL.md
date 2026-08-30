@@ -72,9 +72,8 @@ Always call `get_active_toolsets()` first to see what is already loaded.
   selecting a copper, fabrication, user, or mechanical layer or deciding which
   side owns an item.
 - Read [`references/trace-width-table.md`](references/trace-width-table.md) when
-  estimating an initial trace width. Treat it as a starting point; the selected
-  stackup, current and voltage-drop budget, impedance calculation, netclass,
-  and fabricator contract decide the actual value.
+  sizing a current-carrying trace, via, or controlled-impedance route. It defines
+  the required calculation inputs and acceptance record; it is not a lookup table.
 - Read [`references/design-rules.md`](references/design-rules.md) when creating
   netclasses, configuring project constraints, or adjudicating DRC results.
 
@@ -188,7 +187,7 @@ route_pad_to_pad(board, net_name, ref1, pad1, ref2, pad2, layer?, width?)
 ```
 
 - Emits one segment when the pads already share an X or Y, two otherwise
-- Specify width in mm (e.g., 0.25 for signal, 0.5 for power)
+- Specify the width in mm from the accepted project netclass or sizing record.
 - Routes entirely on `layer` (default `F.Cu`) — it does not add a via. To
   change layer mid-route, place the via yourself with `add_via` and route each
   side separately
@@ -232,16 +231,11 @@ create_netclass(board, name, trace_width?, clearance?, via_drill?, via_diameter?
 The class is written to the project's `.kicad_pro` file, which is where KiCad
 has kept netclasses since v7 — the board file is not modified.
 
-Common netclass configurations:
-- Signal: 0.25mm track, 0.2mm clearance
-- Power: 0.5-1.0mm track, 0.3mm clearance
-- USB: 0.3mm track, 0.15mm spacing (90 ohm differential)
-
-### Via Defaults
-
-- Standard signal via: 0.4mm drill, 0.8mm pad diameter
-- Power via: 0.6mm drill, 1.0mm pad diameter
-- Micro via (HDI): 0.1mm drill, 0.3mm pad diameter
+Before creating or updating a class, read `get_netclasses` and the applicable
+design-rule/trace-sizing references. Derive width, clearance, gap, drill, and
+diameter from the selected fabrication contract, stackup, and electrical
+calculation. Read the classes back after the write and confirm every special net
+resolves through the intended class. Missing inputs make the rule `INCOMPLETE`.
 
 ### Pre-defined sizes
 

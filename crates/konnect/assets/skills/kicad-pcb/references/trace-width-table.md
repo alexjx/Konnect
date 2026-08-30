@@ -1,70 +1,69 @@
-# Trace Width Reference
+# Trace, Via, and Impedance Sizing
 
-## Current Capacity (1oz/ft² copper, 10°C rise, external layer)
+This reference defines the sizing process, not universal dimensions. Store the
+accepted results in project netclasses and predefined sizes so routing tools use
+the same values that were reviewed.
 
-| Current (A) | Min Width (mm) | Recommended Width (mm) |
-|-------------|---------------|----------------------|
-| 0.1 | 0.05 | 0.15 |
-| 0.25 | 0.10 | 0.20 |
-| 0.5 | 0.15 | 0.30 |
-| 1.0 | 0.30 | 0.50 |
-| 2.0 | 0.70 | 1.00 |
-| 3.0 | 1.10 | 1.50 |
-| 5.0 | 2.00 | 2.50 |
+## Current-carrying traces
 
-**For internal layers**: multiply width by 1.5x (less cooling)
-**For 2oz copper**: divide width by ~0.7x
+For each current-carrying net, capture:
 
-## Standard Trace Widths by Application
+- continuous and transient current;
+- copper thickness and plating assumptions;
+- external or internal layer;
+- ambient and temperature-rise budget;
+- trace length and voltage-drop budget;
+- available routing width and thermal environment; and
+- the selected fabricator's current minimums and stackup.
 
-| Application | Width (mm) | Netclass name |
-|-------------|-----------|--------------|
-| Signal (general) | 0.15–0.25 | Default |
-| High-speed digital | 0.10–0.15 | HighSpeed |
-| Power (< 1A) | 0.30–0.50 | Power |
-| Power (1–3A) | 0.50–1.50 | PowerHigh |
-| USB 2.0 differential | 0.15 (90Ω diff) | USB |
-| USB 3.0 differential | 0.10 (85Ω diff) | USB3 |
-| Antenna / RF | per impedance calc | RF |
+Use an accepted current-capacity method or calculator with those inputs. Record
+the method, inputs, result, and chosen margin. Changing copper weight, layer,
+temperature, length, or allowed drop requires a new calculation; a scale factor
+is not sufficient acceptance evidence.
 
-## Via Sizing
+Completion criterion: the selected width satisfies both thermal and voltage-drop
+limits and is no narrower than the current fabrication contract.
 
-| Application | Drill (mm) | Pad (mm) | Current capacity |
-|-------------|-----------|---------|-----------------|
-| Signal via | 0.30 | 0.60 | ~0.5A |
-| Standard via | 0.40 | 0.80 | ~1A |
-| Power via | 0.50 | 1.00 | ~1.5A |
-| Thermal via | 0.30 | 0.60 | Array of 4-9 for heat |
+## Ordinary signals
 
-## Clearance Rules
+For an ordinary, non-impedance-controlled signal, choose a width and clearance
+that the selected process can fabricate reliably and the available geometry can
+route. Keep one project netclass as the source of truth. A prose default is only
+a candidate until it is written to the project and passes DRC.
 
-| Item pair | Minimum (mm) | Recommended (mm) |
-|-----------|-------------|-----------------|
-| Trace-to-trace | 0.15 | 0.20 |
-| Trace-to-pad | 0.15 | 0.20 |
-| Trace-to-edge | 0.25 | 0.50 |
-| Via-to-via | 0.20 | 0.30 |
-| Via-to-trace | 0.15 | 0.20 |
-| Component-to-edge | 1.00 | 2.00 |
+## Controlled impedance
 
-## JLCPCB Minimums (standard process)
+Obtain the actual stackup before choosing geometry. An external microstrip and
+an internal stripline have different fields; an internal conductor is not a
+microstrip. A differential pair additionally depends on spacing, reference
+planes, copper thickness, dielectric properties, solder mask, and the
+fabricator's impedance-control process.
 
-| Parameter | Minimum |
-|-----------|---------|
-| Trace width | 0.127mm (5mil) |
-| Trace spacing | 0.127mm (5mil) |
-| Via drill | 0.30mm |
-| Via annular ring | 0.15mm |
-| Hole-to-hole | 0.50mm |
-| Board edge clearance | 0.30mm |
+Use a field solver or the fabricator's stackup calculator. Record:
 
-## Impedance Reference (FR4, 1.6mm, 1oz)
+- target single-ended or differential impedance and tolerance;
+- layer and reference plane(s);
+- dielectric thickness and material assumptions;
+- copper thickness, finished trace width, and etch assumptions;
+- pair spacing and solder-mask treatment; and
+- solver/tool version and result.
 
-| Target | Trace width | Gap | Layer |
-|--------|------------|-----|-------|
-| 50Ω single-ended | 0.30mm | — | External |
-| 90Ω differential (USB 2.0) | 0.15mm | 0.15mm | External |
-| 100Ω differential (Ethernet) | 0.12mm | 0.18mm | External |
-| 50Ω microstrip (internal) | 0.18mm | — | Internal |
+Apply the solved width and gap to the project netclass. Re-solve whenever the
+stackup or fabricator changes, and verify the ordered impedance service matches
+the calculation.
 
-*Note: These are approximate. Use a proper impedance calculator for production designs.*
+## Vias
+
+Choose via drill and finished diameter from the selected fabricator's current
+capability, required annular ring, board thickness/aspect ratio, current, and
+reliability target. Power and thermal paths may require parallel vias; justify
+their count with electrical/thermal evidence rather than a fixed lookup table.
+
+Use `set_predefined_sizes` to record accepted via choices and
+`get_predefined_sizes` to verify the stored palette before routing.
+
+## Acceptance record
+
+For every non-default netclass, preserve the sizing purpose, governing inputs,
+calculation or current contract, selected values, and DRC result. A required
+input that is unavailable makes the sizing decision `INCOMPLETE`.

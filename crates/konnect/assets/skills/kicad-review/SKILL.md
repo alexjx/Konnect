@@ -316,7 +316,9 @@ Present findings grouped by severity with actionable fix suggestions:
 ### Pre-Manufacturing Review
 
 1. Full review (above)
-2. `validate_for_manufacturing()` — fab-specific checks
+2. Run `validate_for_manufacturing()`, then inspect `verdict`, `issues`, and
+   `drc` against the handler's limited contract; it does not replace outline,
+   drill, silkscreen, artifact, BOM/CPL, or order-preview acceptance
 3. Verify BOM completeness
 4. Check part availability (if targeting specific fab house)
 5. Final verdict: ready to manufacture or not
