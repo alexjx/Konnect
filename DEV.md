@@ -192,6 +192,11 @@ Konnect/
 - Cooperative lock files live under `KONNECT_STATE_DIR/locks` when that
   absolute override is set, otherwise under the platform local-data directory
   (`konnect/locks`). Reads never create files in the KiCad project.
+- Schematic writes also refuse while KiCad's sibling `~<name>.kicad_sch.lck`
+  exists. KiCad records only a username and hostname, so Konnect cannot prove
+  that a same-host or remote lock is stale; valid, foreign, empty, and malformed
+  locks all fail closed. The check runs before a transaction journal is created
+  and again at the final target-write boundary.
 - Multi-file schematic changes use project-local
   `.konnect-transaction-*.json` write-ahead journals. These journals contain
   complete before/after images and must be treated as sensitive project data.

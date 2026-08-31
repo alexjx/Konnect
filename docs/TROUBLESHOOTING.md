@@ -155,6 +155,20 @@ This option is unavailable on KiCad 11 after removal of the legacy SWIG Python
 API. Konnect then uses its Rust exporter unless KiCad gains an equivalent
 supported IPC operation.
 
+## A schematic write is blocked by a KiCad editor lock
+
+Konnect refuses to change a `.kicad_sch` file while the sibling
+`~<name>.kicad_sch.lck` exists. Close the schematic editor normally and retry.
+Read-only schematic tools remain available while the lock exists.
+
+KiCad's lock stores only a username and hostname, not a process identifier or
+document-instance token. Konnect therefore cannot distinguish a live lock from
+one left by a crash without risking unsaved editor state. It treats valid,
+foreign-host, empty, and malformed locks alike and never removes one
+automatically. If KiCad crashed, first confirm that no schematic editor owns the
+file; reopening and closing the project cleanly is the preferred way to resolve
+the lock. Remove a confirmed stale lock manually only as a last resort.
+
 ## Transaction recovery is blocked by divergent content
 
 Multi-file schematic changes persist a `.konnect-transaction-<id>.json`
