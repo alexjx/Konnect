@@ -20,9 +20,17 @@ struct LibraryFootprint {
     attributes: kiapi::board::types::FootprintAttributes,
     datasheet: Option<String>,
     description_field: Option<String>,
+    properties: Vec<kiapi::board::types::Field>,
     pads: Vec<konnect_ipc::IpcPadDefinition>,
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
+}
+
+#[derive(Debug)]
+struct ParsedLibraryProperties {
+    datasheet: Option<String>,
+    description: Option<String>,
+    custom: Vec<kiapi::board::types::Field>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -732,12 +740,13 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     }
 
     validate_supported_children(&root)?;
+    let properties = parse_library_properties(&root)?;
     let pads = super::pcb_components::extract_pad_definitions(source)?;
-    let graphics = super::pcb_components::extract_graphic_definitions(source)?;
+    // Custom properties travel as typed Field items below. Treating visible
+    // properties as generic graphics as well would duplicate their text.
+    let graphics = super::pcb_components::extract_graphic_definitions_without_properties(source)?;
     let models = parse_models(&root)?;
     let attributes = parse_attributes(&root)?;
-    let datasheet = property_value(&root, "Datasheet");
-    let description_field = property_value(&root, "Description");
     let definition = kiapi::board::types::Footprint {
         id: Some(kiapi::common::types::LibraryIdentifier {
             library_nickname: library_nickname.to_string(),
@@ -755,21 +764,375 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         library_id: library_id.to_string(),
         definition,
         attributes,
-        datasheet,
-        description_field,
+        datasheet: properties.datasheet,
+        description_field: properties.description,
+        properties: properties.custom,
         pads,
         graphics,
         models,
     })
 }
 
-fn property_value(root: &konnect_sexp::SexpNode, name: &str) -> Option<String> {
-    root.find_all("property")
-        .into_iter()
-        .find(|property| property.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some(name))
-        .and_then(|property| property.get(2))
+fn parse_library_properties(root: &konnect_sexp::SexpNode) -> Result<ParsedLibraryProperties> {
+    let mut names = BTreeSet::new();
+    let mut datasheet = None;
+    let mut description = None;
+    let mut custom = Vec::new();
+    for property in root.find_all("property") {
+        let name = property
+            .get(1)
+            .and_then(konnect_sexp::SexpNode::as_str)
+            .context("property is missing its name")?;
+        if !names.insert(name.to_string()) {
+            bail!("property '{name}' appears more than once in the library footprint");
+        }
+
+        // Mandatory and custom properties share one lossless clause validator.
+        // The mandatory values keep their existing first-class IPC fields; the
+        // shared parser proves that none of their authored clauses would be
+        // silently ignored without requiring a typed custom Field.
+        let mandatory = matches!(name, "Reference" | "Value" | "Datasheet" | "Description");
+        let parsed = parse_library_property(property, !mandatory)?;
+        let value = property
+            .get(2)
+            .and_then(konnect_sexp::SexpNode::as_str)
+            .with_context(|| format!("property '{name}' is missing its value"))?;
+        match name {
+            "Reference" | "Value" => {}
+            "Datasheet" => datasheet = Some(value.to_string()),
+            "Description" => description = Some(value.to_string()),
+            _ => custom.push(parsed.context("custom property did not produce a typed field")?),
+        }
+    }
+
+    Ok(ParsedLibraryProperties {
+        datasheet,
+        description,
+        custom,
+    })
+}
+
+/// Convert a footprint property into the typed `Field` shape carried by
+/// KiCad's IPC model. Mandatory properties are validated through this same
+/// path and then stored in their existing first-class fields. Unknown clauses
+/// refuse here: accepting a property while dropping part of its authored
+/// presentation would make the refresh lossy even when its value survived.
+fn parse_library_property(
+    property: &konnect_sexp::SexpNode,
+    require_typed_field: bool,
+) -> Result<Option<kiapi::board::types::Field>> {
+    use kiapi::common::types::LockedState;
+
+    let name = property
+        .get(1)
         .and_then(konnect_sexp::SexpNode::as_str)
-        .map(str::to_string)
+        .context("property is missing its name")?;
+    let value = property
+        .get(2)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .with_context(|| format!("property '{name}' is missing its value"))?;
+    let mut position = None;
+    let mut rotation = 0.0;
+    let mut layer = None;
+    let mut hidden = None;
+    let mut knockout = None;
+    let mut attributes = None;
+    let mut identifier = None;
+
+    for clause in property.children().unwrap_or_default().iter().skip(3) {
+        let tag = clause
+            .head()
+            .with_context(|| format!("property '{name}' contains an unsupported atom"))?;
+        match tag {
+            "at" => {
+                if position.is_some() {
+                    bail!("property '{name}' contains duplicate 'at' clauses");
+                }
+                let count = clause.children().map_or(0, |children| children.len());
+                if !matches!(count, 3 | 4) {
+                    bail!("property '{name}' 'at' must contain x, y, and optional rotation");
+                }
+                let x = clause
+                    .get_f64(1)
+                    .with_context(|| format!("property '{name}' has an invalid X position"))?;
+                let y = clause
+                    .get_f64(2)
+                    .with_context(|| format!("property '{name}' has an invalid Y position"))?;
+                rotation = clause.get_f64(3).unwrap_or(0.0);
+                if !x.is_finite() || !y.is_finite() || !rotation.is_finite() {
+                    bail!("property '{name}' position and rotation must be finite");
+                }
+                position = Some(konnect_ipc::builders::vec2(x, y));
+            }
+            "layer" => {
+                if layer.is_some() {
+                    bail!("property '{name}' contains duplicate 'layer' clauses");
+                }
+                let layer_name = clause
+                    .get(1)
+                    .and_then(konnect_sexp::SexpNode::as_str)
+                    .filter(|name| !name.is_empty())
+                    .with_context(|| format!("property '{name}' has no layer name"))?;
+                if clause.children().map_or(0, |children| children.len()) != 2 {
+                    bail!("property '{name}' 'layer' must name exactly one layer");
+                }
+                layer = Some(
+                    konnect_ipc::builders::try_layer_from_name(layer_name)
+                        .with_context(|| format!("property '{name}' has an unsupported layer"))?
+                        as i32,
+                );
+            }
+            "hide" => {
+                if hidden.is_some() {
+                    bail!("property '{name}' contains duplicate 'hide' clauses");
+                }
+                hidden = Some(property_yes_no(clause, name, "hide")?);
+            }
+            "knockout" => {
+                if knockout.is_some() {
+                    bail!("property '{name}' contains duplicate 'knockout' clauses");
+                }
+                knockout = Some(property_yes_no(clause, name, "knockout")?);
+            }
+            "uuid" | "tstamp" => {
+                if let Some(previous) = identifier {
+                    bail!(
+                        "property '{name}' contains multiple identifier clauses ('{previous}' and '{tag}')"
+                    );
+                }
+                identifier = Some(tag);
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || clause
+                        .get(1)
+                        .and_then(konnect_sexp::SexpNode::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    bail!("property '{name}' '{tag}' must contain exactly one identifier");
+                }
+            }
+            "effects" => {
+                if attributes.is_some() {
+                    bail!("property '{name}' contains duplicate 'effects' clauses");
+                }
+                attributes = Some(parse_property_effects(clause, name)?);
+            }
+            unsupported => {
+                bail!("property '{name}' clause '{unsupported}' is not supported losslessly")
+            }
+        }
+    }
+
+    if !require_typed_field {
+        return Ok(None);
+    }
+
+    let position =
+        position.with_context(|| format!("property '{name}' is missing its 'at' clause"))?;
+    let layer =
+        layer.with_context(|| format!("property '{name}' is missing its 'layer' clause"))?;
+    let mut attributes =
+        attributes.with_context(|| format!("property '{name}' is missing its 'effects' clause"))?;
+    attributes.angle = Some(kiapi::common::types::Angle {
+        value_degrees: rotation,
+    });
+    Ok(Some(kiapi::board::types::Field {
+        id: None,
+        name: name.to_string(),
+        text: Some(kiapi::board::types::BoardText {
+            // A library child's UUID is definition-local and cannot be reused
+            // across placed instances. Let KiCad assign the board child ID.
+            id: None,
+            text: Some(kiapi::common::types::Text {
+                position: Some(position),
+                attributes: Some(attributes),
+                text: value.to_string(),
+                hyperlink: String::new(),
+            }),
+            layer,
+            knockout: knockout.unwrap_or(false),
+            locked: LockedState::LsUnlocked as i32,
+        }),
+        visible: !hidden.unwrap_or(false),
+    }))
+}
+
+fn property_yes_no(clause: &konnect_sexp::SexpNode, name: &str, tag: &str) -> Result<bool> {
+    if clause.children().map_or(0, |children| children.len()) != 2 {
+        bail!("property '{name}' '{tag}' must contain exactly one yes/no value");
+    }
+    match clause.get(1).and_then(konnect_sexp::SexpNode::as_str) {
+        Some("yes") => Ok(true),
+        Some("no") => Ok(false),
+        _ => bail!("property '{name}' '{tag}' must be yes or no"),
+    }
+}
+
+fn parse_property_effects(
+    effects: &konnect_sexp::SexpNode,
+    name: &str,
+) -> Result<kiapi::common::types::TextAttributes> {
+    use kiapi::common::types::{HorizontalAlignment, VerticalAlignment};
+
+    let mut font = None;
+    let mut horizontal = HorizontalAlignment::HaCenter;
+    let mut vertical = VerticalAlignment::VaCenter;
+    let mut mirrored = false;
+    for clause in effects.children().unwrap_or_default().iter().skip(1) {
+        let tag = clause
+            .head()
+            .with_context(|| format!("property '{name}' effects contain an unsupported atom"))?;
+        match tag {
+            "font" => {
+                if font.replace(clause).is_some() {
+                    bail!("property '{name}' contains duplicate font clauses");
+                }
+            }
+            "justify" => {
+                for value in clause.children().unwrap_or_default().iter().skip(1) {
+                    match value.as_str().with_context(|| {
+                        format!("property '{name}' justify contains a non-atom")
+                    })? {
+                        "left" if horizontal == HorizontalAlignment::HaCenter => {
+                            horizontal = HorizontalAlignment::HaLeft
+                        }
+                        "right" if horizontal == HorizontalAlignment::HaCenter => {
+                            horizontal = HorizontalAlignment::HaRight
+                        }
+                        "top" if vertical == VerticalAlignment::VaCenter => {
+                            vertical = VerticalAlignment::VaTop
+                        }
+                        "bottom" if vertical == VerticalAlignment::VaCenter => {
+                            vertical = VerticalAlignment::VaBottom
+                        }
+                        "mirror" if !mirrored => mirrored = true,
+                        "left" | "right" => bail!(
+                            "property '{name}' has conflicting horizontal justification"
+                        ),
+                        "top" | "bottom" => {
+                            bail!("property '{name}' has conflicting vertical justification")
+                        }
+                        "mirror" => bail!("property '{name}' repeats mirrored justification"),
+                        unsupported => bail!(
+                            "property '{name}' justification '{unsupported}' is not supported losslessly"
+                        ),
+                    }
+                }
+            }
+            unsupported => bail!(
+                "property '{name}' effects clause '{unsupported}' is not supported losslessly"
+            ),
+        }
+    }
+    let font =
+        font.with_context(|| format!("property '{name}' effects are missing the font clause"))?;
+
+    let mut font_name = String::new();
+    let mut size = None;
+    let mut thickness = None;
+    let mut bold = None;
+    let mut italic = None;
+    let mut line_spacing = None;
+    for clause in font.children().unwrap_or_default().iter().skip(1) {
+        let tag = clause
+            .head()
+            .with_context(|| format!("property '{name}' font contains an unsupported atom"))?;
+        match tag {
+            "face" => {
+                if !font_name.is_empty() {
+                    bail!("property '{name}' contains duplicate font face clauses");
+                }
+                font_name = clause
+                    .get(1)
+                    .and_then(konnect_sexp::SexpNode::as_str)
+                    .filter(|face| !face.is_empty())
+                    .with_context(|| format!("property '{name}' font face is invalid"))?
+                    .to_string();
+            }
+            "size" => {
+                if size.is_some() {
+                    bail!("property '{name}' contains duplicate font size clauses");
+                }
+                if clause.children().map_or(0, |children| children.len()) != 3 {
+                    bail!("property '{name}' font size must contain width and height");
+                }
+                let width = clause
+                    .get_f64(1)
+                    .with_context(|| format!("property '{name}' font width is invalid"))?;
+                let height = clause
+                    .get_f64(2)
+                    .with_context(|| format!("property '{name}' font height is invalid"))?;
+                if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+                    bail!("property '{name}' font size must be finite and positive");
+                }
+                size = Some((width, height));
+            }
+            "thickness" => {
+                if thickness.is_some() {
+                    bail!("property '{name}' contains duplicate font thickness clauses");
+                }
+                let value = clause
+                    .get_f64(1)
+                    .with_context(|| format!("property '{name}' font thickness is invalid"))?;
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || !value.is_finite()
+                    || value <= 0.0
+                {
+                    bail!("property '{name}' font thickness must be finite and positive");
+                }
+                thickness = Some(value);
+            }
+            "bold" => {
+                if bold.is_some() {
+                    bail!("property '{name}' contains duplicate font 'bold' clauses");
+                }
+                bold = Some(property_yes_no(clause, name, "font bold")?);
+            }
+            "italic" => {
+                if italic.is_some() {
+                    bail!("property '{name}' contains duplicate font 'italic' clauses");
+                }
+                italic = Some(property_yes_no(clause, name, "font italic")?);
+            }
+            "line_spacing" => {
+                if line_spacing.is_some() {
+                    bail!("property '{name}' contains duplicate font 'line_spacing' clauses");
+                }
+                let value = clause
+                    .get_f64(1)
+                    .with_context(|| format!("property '{name}' line spacing is invalid"))?;
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || !value.is_finite()
+                    || value <= 0.0
+                {
+                    bail!("property '{name}' line spacing must be finite and positive");
+                }
+                line_spacing = Some(value);
+            }
+            unsupported => {
+                bail!("property '{name}' font clause '{unsupported}' is not supported losslessly")
+            }
+        }
+    }
+    let (width, height) =
+        size.with_context(|| format!("property '{name}' font is missing its size"))?;
+    Ok(kiapi::common::types::TextAttributes {
+        font_name,
+        horizontal_alignment: horizontal as i32,
+        vertical_alignment: vertical as i32,
+        angle: None,
+        line_spacing: line_spacing.unwrap_or(1.0),
+        stroke_width: Some(konnect_ipc::builders::distance(
+            thickness.unwrap_or(width * 0.15),
+        )),
+        italic: italic.unwrap_or(false),
+        bold: bold.unwrap_or(false),
+        underlined: false,
+        visible: true,
+        mirrored,
+        multiline: false,
+        keep_upright: false,
+        size: Some(konnect_ipc::builders::vec2(width, height)),
+    })
 }
 
 fn validate_supported_children(root: &konnect_sexp::SexpNode) -> Result<()> {
@@ -816,15 +1179,6 @@ fn validate_supported_children(root: &konnect_sexp::SexpNode) -> Result<()> {
                             "fp_text kind '{kind}' is not supported losslessly by typed library refresh"
                         );
                     }
-                }
-            }
-            "property" => {
-                let name = child
-                    .get(1)
-                    .and_then(konnect_sexp::SexpNode::as_str)
-                    .context("property is missing its name")?;
-                if !matches!(name, "Reference" | "Value" | "Datasheet" | "Description") {
-                    bail!("property '{name}' is not supported losslessly by typed library refresh");
                 }
             }
             _ => {}
@@ -1338,6 +1692,14 @@ fn build_updated_instance(
             *item = konnect_ipc::builders::pack_any(&text, "kiapi.board.types.BoardText");
         }
     }
+    merge_custom_properties(
+        &mut definition,
+        current_definition,
+        &library.properties,
+        &position,
+        rotation,
+        is_back,
+    )?;
     updated.definition = Some(definition);
     apply_field_value(&mut updated.datasheet_field, library.datasheet.as_deref());
     apply_field_value(
@@ -1371,6 +1733,124 @@ fn apply_field_value(field: &mut Option<kiapi::board::types::Field>, value: Opti
         .text
         .get_or_insert_with(Default::default)
         .text = value.to_string();
+}
+
+fn merge_custom_properties(
+    updated: &mut kiapi::board::types::Footprint,
+    current: &kiapi::board::types::Footprint,
+    library_properties: &[kiapi::board::types::Field],
+    footprint_position: &kiapi::common::types::Vector2,
+    footprint_rotation: f64,
+    is_back: bool,
+) -> Result<()> {
+    let library_names = library_properties
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut current_names = BTreeSet::new();
+    for item in current
+        .items
+        .iter()
+        .filter(|item| item.type_url.ends_with("kiapi.board.types.Field"))
+    {
+        let field = kiapi::board::types::Field::decode(item.value.as_slice())
+            .context("board footprint contains an invalid custom property")?;
+        if field.name.is_empty() {
+            bail!("board footprint contains a custom property without a name");
+        }
+        if !current_names.insert(field.name.clone()) {
+            bail!(
+                "board footprint contains more than one custom property named '{}'",
+                field.name
+            );
+        }
+        if !library_names.contains(field.name.as_str()) {
+            // A field that exists only on the placed instance belongs to that
+            // instance. Preserve its complete typed representation verbatim.
+            updated.items.push(item.clone());
+        }
+    }
+    for property in library_properties {
+        let property =
+            transform_library_property(property, footprint_position, footprint_rotation, is_back)?;
+        updated.items.push(konnect_ipc::builders::pack_any(
+            &property,
+            "kiapi.board.types.Field",
+        ));
+    }
+    Ok(())
+}
+
+fn transform_library_property(
+    property: &kiapi::board::types::Field,
+    footprint_position: &kiapi::common::types::Vector2,
+    footprint_rotation: f64,
+    is_back: bool,
+) -> Result<kiapi::board::types::Field> {
+    let mut property = property.clone();
+    property.id = None;
+    let board_text = property
+        .text
+        .as_mut()
+        .with_context(|| format!("property '{}' has no board text", property.name))?;
+    board_text.id = None;
+    let text = board_text
+        .text
+        .as_mut()
+        .with_context(|| format!("property '{}' has no text value", property.name))?;
+    let local_position = text
+        .position
+        .as_ref()
+        .with_context(|| format!("property '{}' has no position", property.name))?;
+    let local_x = konnect_ipc::builders::nm_to_mm(local_position.x_nm);
+    let mut local_y = konnect_ipc::builders::nm_to_mm(local_position.y_nm);
+    if is_back {
+        local_y = -local_y;
+    }
+    let (board_x, board_y) = konnect_sexp::geometry::transform_pad(
+        local_x,
+        local_y,
+        konnect_ipc::builders::nm_to_mm(footprint_position.x_nm),
+        konnect_ipc::builders::nm_to_mm(footprint_position.y_nm),
+        footprint_rotation,
+    );
+    text.position = Some(konnect_ipc::builders::vec2(board_x, board_y));
+
+    let attributes = text
+        .attributes
+        .as_mut()
+        .with_context(|| format!("property '{}' has no text attributes", property.name))?;
+    let local_angle = attributes
+        .angle
+        .as_ref()
+        .map(|angle| angle.value_degrees)
+        .unwrap_or(0.0);
+    let local_angle = if is_back {
+        180.0 - local_angle
+    } else {
+        local_angle
+    };
+    attributes.angle = Some(kiapi::common::types::Angle {
+        value_degrees: readable_property_angle(local_angle + footprint_rotation),
+    });
+    if is_back {
+        attributes.mirrored = !attributes.mirrored;
+        let layer = kiapi::board::types::BoardLayer::try_from(board_text.layer)
+            .with_context(|| format!("property '{}' has an invalid layer", property.name))?;
+        let layer_name = konnect_ipc::builders::layer_name(layer)
+            .with_context(|| format!("property '{}' has an unnamed layer", property.name))?;
+        board_text.layer =
+            konnect_ipc::builders::try_layer_from_name(&flip_layer_name(layer_name)?)? as i32;
+    }
+    Ok(property)
+}
+
+fn readable_property_angle(degrees: f64) -> f64 {
+    let mut angle = degrees.rem_euclid(360.0);
+    if angle > 90.0 && angle <= 270.0 {
+        angle -= 180.0;
+    }
+    angle
 }
 
 fn mirror_pad(pad: &konnect_ipc::IpcPadDefinition) -> Result<konnect_ipc::IpcPadDefinition> {
@@ -1554,6 +2034,8 @@ fn changed_domains(
             != field_text(&updated_definition.datasheet_field)
         || field_text(&current_definition.description_field)
             != field_text(&updated_definition.description_field)
+        || normalized_items(current_definition, "Field")?
+            != normalized_items(updated_definition, "Field")?
     {
         changed.insert(ChangedDomain::Metadata);
     }
@@ -1602,6 +2084,13 @@ fn normalized_items(
                     }
                 }
                 Ok(pad.encode_to_vec())
+            } else if suffix == "Field" {
+                let mut field = kiapi::board::types::Field::decode(item.value.as_slice())?;
+                field.id = None;
+                if let Some(text) = field.text.as_mut() {
+                    text.id = None;
+                }
+                Ok(field.encode_to_vec())
             } else {
                 Ok(item.value.clone())
             }
@@ -1778,7 +2267,7 @@ mod tests {
     /// CONTRIBUTING).
     #[test]
     fn a_footprint_kicad_saved_is_accepted_not_refused() {
-        let source = include_str!("../../tests/fixtures/socket_kicad10.kicad_mod");
+        let source = KICAD_LIBRARY_FOOTPRINT;
         let library = parse_library_footprint("Konnect:Socket", source)
             .expect("KiCad's own serialization of the fixture must parse");
         assert_eq!(library.pads.len(), 4, "two '1' variants plus '2' and '3'");
@@ -1806,6 +2295,18 @@ mod tests {
             )
         }));
         assert_eq!(library.datasheet.as_deref(), Some("new-datasheet.pdf"));
+        assert_eq!(
+            library
+                .properties
+                .iter()
+                .map(|property| (property.name.as_str(), field_text_value(property)))
+                .collect::<Vec<_>>(),
+            vec![
+                ("KiLib_Generator", "konnect_test_generator"),
+                ("AssemblyVendor", "Example Assembly"),
+            ]
+        );
+        assert!(library.properties.iter().all(|property| !property.visible));
         assert_eq!(library.models.len(), 1);
 
         // The same flags at a non-default value carry semantics the typed
@@ -1824,6 +2325,66 @@ mod tests {
                 "refusal names the unsupported clause: {error}"
             );
         }
+    }
+
+    #[test]
+    fn stock_kicad_generator_property_is_preserved_as_a_typed_field() {
+        // Unmodified KiCad 10.0.5 standard-library output from
+        // Capacitor_SMD.pretty/C_0603_1608Metric.kicad_mod. This is the stock
+        // footprint that exposed #373; keeping its real generator-authored
+        // shape prevents a synthetic fixture from agreeing with this parser.
+        let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+        let library = parse_library_footprint("Capacitor_SMD:C_0603_1608Metric", source)
+            .expect("the stock KiCad generator footprint must parse losslessly");
+
+        assert_eq!(library.pads.len(), 2);
+        let generator = library
+            .properties
+            .iter()
+            .find(|property| property.name == "KiLib_Generator")
+            .expect("KiCad's generator property must remain a typed Field");
+        assert_eq!(field_text_value(generator), "SMD_2terminal_chip_molded");
+        assert!(!generator.visible);
+        assert_eq!(library.models.len(), 1);
+    }
+
+    #[test]
+    fn visible_property_is_a_field_only_and_clause_order_does_not_change_its_angle() {
+        let source = KICAD_LIBRARY_FOOTPRINT.replace(
+            "\t\t(at 0.5 0.75 15)\n\t\t(layer \"F.Fab\")\n\t\t(hide yes)",
+            "\t\t(layer \"F.Fab\")\n\t\t(hide no)\n\t\t(at 0.5 0.75 15)",
+        );
+        assert_ne!(source, KICAD_LIBRARY_FOOTPRINT);
+
+        let library = parse_library_footprint("Konnect:Socket", &source).unwrap();
+        let property = library
+            .properties
+            .iter()
+            .find(|property| property.name == "AssemblyVendor")
+            .unwrap();
+        assert!(property.visible);
+        assert_eq!(
+            property
+                .text
+                .as_ref()
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap()
+                .attributes
+                .as_ref()
+                .unwrap()
+                .angle
+                .as_ref()
+                .unwrap()
+                .value_degrees,
+            15.0
+        );
+        assert!(!library.graphics.iter().any(|graphic| matches!(
+            graphic,
+            konnect_ipc::IpcGraphicDefinition::Text { text, .. }
+                if text == "Example Assembly"
+        )));
     }
 
     /// `preserved` must be a comparison of the rebuilt instance against the
@@ -1892,6 +2453,9 @@ mod tests {
             "untouched fields stay preserved: {diverged:?}"
         );
     }
+
+    const KICAD_LIBRARY_FOOTPRINT: &str =
+        include_str!("../../tests/fixtures/socket_kicad10.kicad_mod");
 
     const LIBRARY_FOOTPRINT: &str = r#"
 (footprint "Socket"
@@ -2039,6 +2603,32 @@ mod tests {
             .collect()
     }
 
+    fn decoded_custom_fields(
+        instance: &kiapi::board::types::FootprintInstance,
+    ) -> Vec<kiapi::board::types::Field> {
+        instance
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| item.type_url.ends_with("kiapi.board.types.Field"))
+            .map(|item| {
+                kiapi::board::types::Field::decode(item.value.as_slice())
+                    .expect("custom field must decode")
+            })
+            .collect()
+    }
+
+    fn field_text_value(field: &kiapi::board::types::Field) -> &str {
+        field
+            .text
+            .as_ref()
+            .and_then(|text| text.text.as_ref())
+            .map(|text| text.text.as_str())
+            .unwrap_or_default()
+    }
+
     #[test]
     fn parses_supported_library_definition_without_dropping_domains() {
         let library = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
@@ -2074,7 +2664,7 @@ mod tests {
     #[test]
     fn merge_preserves_instance_state_and_nets_by_logical_pad_number() {
         let current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
-        let library = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
         let prepared = build_updated_instance(
             &current,
             &library,
@@ -2136,6 +2726,42 @@ mod tests {
             current.symbol_footprint_filters
         );
 
+        let properties = decoded_custom_fields(&updated);
+        assert_eq!(
+            properties
+                .iter()
+                .map(|property| (property.name.as_str(), field_text_value(property)))
+                .collect::<Vec<_>>(),
+            vec![
+                ("KiLib_Generator", "konnect_test_generator"),
+                ("AssemblyVendor", "Example Assembly"),
+            ]
+        );
+        let assembly = properties
+            .iter()
+            .find(|property| property.name == "AssemblyVendor")
+            .unwrap();
+        let assembly_text = assembly.text.as_ref().unwrap();
+        assert_eq!(
+            assembly_text.layer,
+            kiapi::board::types::BoardLayer::BlBFab as i32
+        );
+        let text = assembly_text.text.as_ref().unwrap();
+        let expected = konnect_sexp::geometry::transform_pad(0.5, -0.75, 100.0, 50.0, 37.0);
+        let actual = text.position.as_ref().unwrap();
+        let actual = (
+            builders::nm_to_mm(actual.x_nm),
+            builders::nm_to_mm(actual.y_nm),
+        );
+        assert!((actual.0 - expected.0).abs() <= 0.000_001);
+        assert!((actual.1 - expected.1).abs() <= 0.000_001);
+        let attributes = text.attributes.as_ref().unwrap();
+        assert!(attributes.mirrored);
+        assert_eq!(
+            attributes.angle.as_ref().unwrap().value_degrees,
+            readable_property_angle(180.0 - 15.0 + 37.0)
+        );
+
         let pads = decoded_pads(&updated);
         assert_eq!(pads.iter().filter(|pad| pad.number == "1").count(), 2);
         assert!(pads.iter().filter(|pad| pad.number == "1").all(|pad| pad
@@ -2181,6 +2807,54 @@ mod tests {
     }
 
     #[test]
+    fn merge_preserves_instance_only_properties_and_refreshes_library_properties() {
+        let mut current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let instance_only = field("InstanceNote", "keep this", 105.0, 55.0, false);
+        let stale_library_property = field("AssemblyVendor", "old library value", 99.0, 49.0, true);
+        current.definition.as_mut().unwrap().items.extend([
+            builders::pack_any(&instance_only, "kiapi.board.types.Field"),
+            builders::pack_any(&stale_library_property, "kiapi.board.types.Field"),
+        ]);
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        let properties = decoded_custom_fields(&updated);
+
+        assert_eq!(
+            properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["InstanceNote", "KiLib_Generator", "AssemblyVendor"]
+        );
+        assert_eq!(
+            properties
+                .iter()
+                .find(|property| property.name == "InstanceNote")
+                .unwrap(),
+            &instance_only
+        );
+        assert_eq!(
+            field_text_value(
+                properties
+                    .iter()
+                    .find(|property| property.name == "AssemblyVendor")
+                    .unwrap()
+            ),
+            "Example Assembly"
+        );
+        assert!(prepared.changed_domains.contains(&ChangedDomain::Metadata));
+    }
+
+    #[test]
     fn merge_conflicts_when_library_removes_a_connected_logical_pad() {
         let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
         let without_pad_two = LIBRARY_FOOTPRINT.replace(
@@ -2210,6 +2884,127 @@ mod tests {
         let error = parse_library_footprint("Test:Socket", &unsupported).unwrap_err();
 
         assert!(error.to_string().contains("zone"), "{error:#}");
+    }
+
+    #[test]
+    fn parser_names_unrepresentable_or_ambiguous_custom_properties() {
+        let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+        );
+        assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
+        let error = parse_library_footprint("Test:Socket", &unsupported).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("AssemblyVendor"), "{message}");
+        assert!(message.contains("unlocked"), "{message}");
+
+        let duplicate = KICAD_LIBRARY_FOOTPRINT.replace(
+            "\"KiLib_Generator\" \"konnect_test_generator\"",
+            "\"AssemblyVendor\" \"konnect_test_generator\"",
+        );
+        assert_ne!(duplicate, KICAD_LIBRARY_FOOTPRINT);
+        let error = parse_library_footprint("Test:Socket", &duplicate).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("AssemblyVendor"), "{message}");
+        assert!(message.contains("more than once"), "{message}");
+    }
+
+    #[test]
+    fn mandatory_properties_are_validated_and_duplicate_names_refuse() {
+        let mut accepted = Vec::new();
+        for (name, value) in [
+            ("Reference", "REF**"),
+            ("Value", "Socket"),
+            ("Datasheet", "new-datasheet.pdf"),
+            ("Description", "new field description"),
+        ] {
+            let authored = format!("\t(property \"{name}\" \"{value}\"\n\t\t(at");
+            let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
+                &authored,
+                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(unlocked yes)\n\t\t(at"),
+            );
+            assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
+            match parse_library_footprint("Test:Socket", &unsupported) {
+                Ok(_) => accepted.push(format!("{name} unsupported clause")),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(message.contains(name), "{message}");
+                    assert!(message.contains("unlocked"), "{message}");
+                }
+            }
+
+            let duplicate = KICAD_LIBRARY_FOOTPRINT.replace(
+                "\"KiLib_Generator\" \"konnect_test_generator\"",
+                &format!("\"{name}\" \"konnect_test_generator\""),
+            );
+            assert_ne!(duplicate, KICAD_LIBRARY_FOOTPRINT);
+            match parse_library_footprint("Test:Socket", &duplicate) {
+                Ok(_) => accepted.push(format!("{name} duplicate name")),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(message.contains(name), "{message}");
+                    assert!(message.contains("more than once"), "{message}");
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "parser accepted mandatory-property cases that must refuse: {}",
+            accepted.join(", ")
+        );
+    }
+
+    #[test]
+    fn repeated_scalar_property_clauses_refuse() {
+        let mut accepted = Vec::new();
+        let vendor_prefix = "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at 0.5 0.75 15)\n\t\t(layer \"F.Fab\")\n\t\t(hide yes)";
+        for (clause, replacement) in [
+            ("hide", format!("{vendor_prefix}\n\t\t(hide no)")),
+            (
+                "knockout",
+                format!("{vendor_prefix}\n\t\t(knockout yes)\n\t\t(knockout no)"),
+            ),
+        ] {
+            let repeated = KICAD_LIBRARY_FOOTPRINT.replace(vendor_prefix, &replacement);
+            assert_ne!(repeated, KICAD_LIBRARY_FOOTPRINT);
+            match parse_library_footprint("Test:Socket", &repeated) {
+                Ok(_) => accepted.push(clause),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(message.contains("AssemblyVendor"), "{message}");
+                    assert!(message.contains(clause), "{message}");
+                }
+            }
+        }
+
+        let vendor_font =
+            "\t\t\t\t(size 1 1)\n\t\t\t\t(thickness 0.15)\n\t\t\t)\n\t\t)\n\t)\n\t(attr";
+        for (clause, repeated_clauses) in [
+            ("bold", "\t\t\t\t(bold yes)\n\t\t\t\t(bold no)\n"),
+            ("italic", "\t\t\t\t(italic yes)\n\t\t\t\t(italic no)\n"),
+            (
+                "line_spacing",
+                "\t\t\t\t(line_spacing 1.1)\n\t\t\t\t(line_spacing 1.2)\n",
+            ),
+        ] {
+            let replacement =
+                vendor_font.replace("\t\t\t)\n", &format!("{repeated_clauses}\t\t\t)\n"));
+            let repeated = KICAD_LIBRARY_FOOTPRINT.replace(vendor_font, &replacement);
+            assert_ne!(repeated, KICAD_LIBRARY_FOOTPRINT);
+            match parse_library_footprint("Test:Socket", &repeated) {
+                Ok(_) => accepted.push(clause),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(message.contains("AssemblyVendor"), "{message}");
+                    assert!(message.contains(clause), "{message}");
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "parser accepted repeated scalar clauses that must refuse: {}",
+            accepted.join(", ")
+        );
     }
 
     #[test]
@@ -2298,7 +3093,7 @@ mod tests {
 
     #[test]
     fn rebuilding_an_applied_instance_is_a_noop_at_every_rotation_and_side() {
-        let library = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
         let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
         let routed = BTreeSet::from(["ROW1".to_string(), "COL1".to_string()]);
 
@@ -2469,7 +3264,11 @@ mod tests {
         std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
         let library_dir = temp.path().join("Test.pretty");
         std::fs::create_dir(&library_dir).unwrap();
-        std::fs::write(library_dir.join("Socket.kicad_mod"), LIBRARY_FOOTPRINT).unwrap();
+        std::fs::write(
+            library_dir.join("Socket.kicad_mod"),
+            KICAD_LIBRARY_FOOTPRINT,
+        )
+        .unwrap();
         std::fs::write(
             temp.path().join("fp-lib-table"),
             "(fp_lib_table (lib (name \"Test\") (type \"KiCad\") (uri \"${KIPRJMOD}/Test.pretty\") (options \"\") (descr \"\")))",
@@ -2481,6 +3280,37 @@ mod tests {
             plan_item("SW1", Some("Test:Socket"), "kiid-1"),
         ];
         (temp, board, items)
+    }
+
+    #[test]
+    fn planner_refuses_an_unrepresentable_property_before_preparing_any_update() {
+        let (temp, board, items) = plan_fixture();
+        let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+        );
+        std::fs::write(
+            temp.path().join("Test.pretty/Socket.kicad_mod"),
+            unsupported,
+        )
+        .unwrap();
+
+        let plan = plan_updates(
+            &board,
+            &items,
+            &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
+            &BTreeSet::new(),
+            &UpdateFilters::default(),
+        );
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.prepared_items.is_empty());
+        assert!(plan.changes.is_empty());
+        assert!(plan.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "unsupported_library_footprint"
+                && diagnostic.message.contains("AssemblyVendor")
+                && diagnostic.message.contains("unlocked")
+        }));
     }
 
     #[test]
