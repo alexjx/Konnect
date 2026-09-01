@@ -231,7 +231,10 @@ transaction abandon` escape hatch documented in
 ### Plugin Installation
 - **PCM zip** is the correct install method
 - KiCad installs to: `C:\Users\<YOU>\Documents\KiCad\10.0\3rdparty\plugins\com_github_mixelpixx_konnect\`
-- Both `__init__.py` (SWIG ActionPlugin for PCB editor settings dialog) and `plugin.json` (IPC exec plugin) are included
+- Both `__init__.py` (the **Konnect Settings** SWIG ActionPlugin for the PCB
+  editor settings dialog) and `plugin.json` (the **Konnect** IPC executable
+  action) are included. Their names must remain distinct because KiCad loads
+  both registrations into the same menu.
 - `native_bridge.py` is a KiCad-10-only, opt-in compatibility bridge. It exposes
   only authenticated status and native Specctra export over an ephemeral
   loopback port. The caller cannot choose an output path; the plugin owns and

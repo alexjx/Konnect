@@ -18,6 +18,7 @@ Requires: pip install jsonschema
 """
 
 import argparse
+import ast
 import json
 import sys
 import zipfile
@@ -73,6 +74,56 @@ def validate_metadata(meta: dict, label: str) -> list[str]:
     return errors
 
 
+def python_action_names(source: str) -> list[str]:
+    """Return statically declared pcbnew ActionPlugin names."""
+    tree = ast.parse(source)
+    names = []
+    for class_node in (node for node in tree.body if isinstance(node, ast.ClassDef)):
+        is_action_plugin = any(
+            (
+                isinstance(base, ast.Attribute)
+                and isinstance(base.value, ast.Name)
+                and base.value.id == "pcbnew"
+                and base.attr == "ActionPlugin"
+            )
+            or (isinstance(base, ast.Name) and base.id == "ActionPlugin")
+            for base in class_node.bases
+        )
+        if not is_action_plugin:
+            continue
+        for node in ast.walk(class_node):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not isinstance(node.value, ast.Constant) or not isinstance(
+                node.value.value, str
+            ):
+                continue
+            if any(
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+                and target.attr == "name"
+                for target in node.targets
+            ):
+                names.append(node.value.value)
+    return names
+
+
+def duplicate_action_names(plugin: dict, python_source: str) -> list[str]:
+    """Find menu names shared by exec and legacy Python action plugins."""
+    python_names = {
+        name.strip().casefold() for name in python_action_names(python_source)
+    }
+    duplicates = {
+        name
+        for action in plugin.get("actions", [])
+        if isinstance(action, dict)
+        and isinstance((name := action.get("name")), str)
+        and name.strip().casefold() in python_names
+    }
+    return sorted(duplicates, key=str.casefold)
+
+
 def validate_zip(zip_path: Path) -> list[str]:
     errors = []
     z = zipfile.ZipFile(zip_path)
@@ -97,6 +148,24 @@ def validate_zip(zip_path: Path) -> list[str]:
                     f"{zip_path.name}: plugin.json entrypoint '{ep}' "
                     f"not present in the zip"
                 )
+
+        # KiCad loads executable actions from plugin.json and legacy Python
+        # ActionPlugins from __init__.py. Identical names make them appear as
+        # indistinguishable duplicate menu and toolbar entries.
+        if "plugins/__init__.py" in names:
+            try:
+                python_source = z.read("plugins/__init__.py").decode("utf-8")
+                duplicates = duplicate_action_names(plugin, python_source)
+            except (SyntaxError, UnicodeDecodeError) as error:
+                errors.append(
+                    f"{zip_path.name}: cannot inspect Python action names: {error}"
+                )
+            else:
+                for name in duplicates:
+                    errors.append(
+                        f"{zip_path.name}: duplicate KiCad action name '{name}' "
+                        "in plugin.json and __init__.py"
+                    )
 
     if "metadata.json" in names:
         meta = json.loads(z.read("metadata.json"))

@@ -246,7 +246,7 @@ def is_server_running():
 
 class KonnectPlugin(pcbnew.ActionPlugin):
     def defaults(self):
-        self.name = "Konnect"
+        self.name = "Konnect Settings"
         self.category = "AI Tools"
         self.description = (
             "Configure and control the Konnect -- enables AI assistants "
