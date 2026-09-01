@@ -24,9 +24,8 @@ separate documentation change.
 
 ## Stable constraints
 
-1. Never integrate directly on `main`; use the permanent
-   `upstream-integration` branch.
-2. The first integration establishes `upstream-integration` at the fetched
+1. Never integrate directly on `main`; use the permanent `dev` branch.
+2. The first integration establishes `dev` at the fetched
    upstream tip. Later integrations continue on that same branch instead of
    creating per-run topic branches. Do not rebuild or reset the permanent branch
    without an explicit recovery decision.
@@ -152,13 +151,13 @@ adopting it. A clean textual merge does not prove semantic compatibility.
 ## Phase 2: create or resume the permanent integration line
 
 Create a recoverable marker for the current product tip. On the first run only,
-create `upstream-integration` from upstream and restore the fork-only workflow
+create `dev` from upstream and restore the fork-only workflow
 files. On every later run, switch to the existing branch and continue from its
 verified tip.
 
 ```powershell
 git tag "fork-before-upstream-$runId" $forkTip
-$integrationBranch = "upstream-integration"
+$integrationBranch = "dev"
 $existing = git branch --list $integrationBranch
 if ($existing) {
     git switch $integrationBranch
@@ -169,7 +168,7 @@ if ($existing) {
 ```
 
 Publish the permanent branch to the fork with
-`git push -u origin upstream-integration` after its first validated commit. Do
+`git push -u origin dev` after its first validated commit. Do
 not push the safety tag automatically; decide whether it should be published
 when the integration is ready for team review. Restoring the two workflow files
 is required only on the first run because a branch rooted at upstream does not
@@ -182,13 +181,13 @@ refspec once, then verify that ahead/behind checks use the real remote-tracking
 reference:
 
 ```powershell
-$integrationRefspec = "+refs/heads/upstream-integration:refs/remotes/origin/upstream-integration"
+$integrationRefspec = "+refs/heads/dev:refs/remotes/origin/dev"
 if ((git config --get-all remote.origin.fetch) -notcontains $integrationRefspec) {
     git config --add remote.origin.fetch $integrationRefspec
 }
-git fetch origin upstream-integration
+git fetch origin dev
 git rev-parse --abbrev-ref --symbolic-full-name '@{u}'
-git rev-list --left-right --count HEAD...origin/upstream-integration
+git rev-list --left-right --count HEAD...origin/dev
 ```
 
 For later runs, record which upstream commit the branch last integrated. Measure
