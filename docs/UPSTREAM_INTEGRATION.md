@@ -15,9 +15,9 @@ changed the same architectural areas independently.
   not change them implicitly.
 - **Experimental steps** may be reordered, split, combined, or automated when a
   run produces evidence that the change is safer or easier to review.
-- Every run records its result in the experiment log below. Temporary command
-  output and investigation notes belong under `.agents/research/`, not in this
-  document.
+- Record each run's checklist and outcome in `.agents/tasks/todo.md`, with raw
+  investigation notes under `.agents/research/`. Promote only evidence-backed,
+  reusable process rules into this document.
 
 Changing a stable constraint requires an explicit product decision and a
 separate documentation change.
@@ -54,7 +54,7 @@ The following are workflow choices rather than product policy:
 - how equivalence between fork and upstream behavior is measured;
 - how often the slower validation levels run;
 - automation for inventory, conflict classification, and invariant checks;
-- the structure of the temporary integration branch or worktree.
+- the structure of diagnostic worktrees or per-slice scratch layouts.
 
 Record the reason, observed result, and decision whenever one of these changes.
 
@@ -87,6 +87,22 @@ operating system.
 ```powershell
 $runId = Get-Date -Format "yyyyMMdd-HHmmss"
 ```
+
+When parallel agents share one worktree, assign mutually exclusive file ranges.
+Only the coordinating agent may change branches, stage, commit, or clean files.
+Serialize Cargo commands that use the default target directory, or give each
+agent a distinct `CARGO_TARGET_DIR`. Before every commit, inspect both the
+worktree and the exact staged file list:
+
+```powershell
+git status --short
+git diff --cached --name-only
+```
+
+Use explicit paths with `git add`; never use `git add -A` during an integration
+run. Prefer `git grep` or explicit tracked product paths for inventory and
+documentation scans so `.agents/`, `target/`, and generated output cannot alter
+the result.
 
 ## Phase 1: measure the divergence
 
@@ -210,6 +226,10 @@ Assign every fork-only commit or behavior to exactly one disposition:
 
 Patch identity alone is insufficient. Independently implemented fixes will not
 have matching patch IDs even when upstream has superseded the fork behavior.
+Treat the old fork's inputs, outputs, errors, and regression tests as contract
+evidence, not its helpers, types, or control flow as design authority. Map the
+contract onto upstream's current document/session, transaction, and typed-IPC
+primitives before writing an adapter.
 
 Good leaf candidates are isolated documentation additions and the distinct
 `Konnect Settings` plugin action. Cross-cutting IPC, router, installer, manifest,
@@ -231,11 +251,18 @@ For each slice:
 
 1. State the behavior and its inputs, outputs, mutations, and failure modes.
 2. Identify the upstream implementation points and tests it must compose with.
-3. Implement the smallest coherent change.
-4. Add or adapt a regression test that proves the behavior contract.
-5. Run the appropriate validation level below.
+3. Add or adapt a focused regression test that proves the behavior contract.
+4. Implement the smallest coherent change.
+5. Run the appropriate validation level below; do not commit a failing slice.
 6. Review the diff against both upstream and the old fork implementation.
-7. Commit the slice with the source fork commits noted in the message or run log.
+7. Commit the slice independently, with source fork commits noted in the message
+   or run log. Do not combine unrelated policy, plugin, schematic, or IPC work.
+
+Any tool addition, removal, or rename must update the registry, tool directory,
+README, developer guide, package metadata, and plugin manifest wherever they
+state the public surface. Run `cargo test -p konnect --test doc_tool_counts`
+before committing that slice; record the current values in product files, not
+as permanent numbers in this workflow.
 
 If a port starts reproducing an upstream subsystem, stop and redesign it around
 the upstream abstraction instead.
@@ -338,56 +365,14 @@ slice or rebuilding the integration branch from the recorded upstream tip. Do
 not repair a failed experiment by rewriting `main` or discarding the old fork
 marker.
 
-## Experiment log
+## Workflow provenance
 
-### Run 2026-09-01 — discovery baseline
+### 2026-09-01 discovery baseline
 
-- Fork tip: `47655d5` (`0.1.3-xinj.40`)
-- Upstream tip: `e7aeaa6` (`v0.11.0-48-ge7aeaa6`)
-- Merge base: `672fbb9`
 - Divergence: 36 fork-only commits and 666 upstream-only commits
-- Changed paths: 97 in the fork, 213 upstream, 71 overlapping
 - Trial merge: 46 content conflicts and 15 delete/modify conflicts
 - Intentional removals: 17 paths; all exist upstream, 15 were modified upstream
 - Decision: use semantic replay from upstream; do not direct-merge or replay all
   36 commits mechanically
 - Confidence: 0.94 against direct merge; 0.88 for semantic replay; 0.80 for
   individual keep/drop choices before behavior-level testing
-- Workflow refinement: restore the runbook and removal inventory immediately
-  after branching from upstream, because those fork-only files are otherwise
-  unavailable to the first policy slice
-- Workflow refinement: validate removals by iterating `git ls-files` over the
-  inventory; the installed Git version does not support
-  `ls-files --pathspec-from-file`
-- Workflow refinement: use one permanent `upstream-integration` branch for all
-  runs. The first run starts it at upstream; later runs continue it and evaluate
-  only the newly arrived upstream interval instead of creating topic branches.
-- Workflow refinement: preserve a non-empty `CODEX_HOME` as the Codex skill
-  target while using upstream's `~/.agents/skills` default otherwise. Migrate
-  only exact Konnect-owned names from the old canonical `~/.codex/skills` root.
-- Workflow refinement: a namespaced skill must describe the capabilities present
-  in the current integration slice. The initial policy slice uses accurate raw
-  upstream operations; guarded lifecycle guidance returns only after the
-  guarded backend and its tests have been ported.
-
-Initial optimization candidates:
-
-1. Automate divergence and overlap inventory into a reproducible report.
-2. Add a CI test for the intentional-removal inventory.
-3. Build behavior-contract tests before porting the largest IPC/workflow slices.
-4. Record elapsed time and rework per slice to improve the default ordering.
-
-### Run template
-
-- Run/date:
-- Fork tip:
-- Upstream tip:
-- Merge base and divergence:
-- Changed-path overlap:
-- Trial-merge result:
-- Slice-order experiment:
-- Validation result:
-- Unexpected regressions or restored paths:
-- Workflow change proposed:
-- Evidence supporting the change:
-- Decision and confidence:
