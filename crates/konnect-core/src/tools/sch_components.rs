@@ -14,7 +14,7 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     commit_command,
     geometry::{snap_point, transform_pin},
-    parse_sexp,
+    parse_sexp, prepare_command,
     schematic::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, parse_subsymbol_unit,
         pin_endpoint, pin_outward_direction, read_schematic,
@@ -797,6 +797,25 @@ pub(crate) struct PlannedSchematicComponentEdits {
     pub changes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PlannedSchematicPlacement {
+    pub reference: String,
+    pub unit: u32,
+    pub old_x: f64,
+    pub old_y: f64,
+    pub new_x: f64,
+    pub new_y: f64,
+}
+
+#[derive(Debug)]
+pub(crate) struct PlannedSchematicMoves {
+    pub candidate: String,
+    pub command: SchematicCommand,
+    pub placements: Vec<PlannedSchematicPlacement>,
+    pub junctions_added: usize,
+    pub junctions_pruned: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PropertyWriteCounts {
     updated: usize,
@@ -1170,6 +1189,236 @@ pub(crate) fn plan_schematic_component_edits(
     })
 }
 
+fn property_translation_edits(
+    content: &str,
+    symbol_start: usize,
+    symbol_end: usize,
+    dx: f64,
+    dy: f64,
+) -> anyhow::Result<Vec<SexpEdit>> {
+    if dx == 0.0 && dy == 0.0 {
+        return Ok(Vec::new());
+    }
+    let mut edits = Vec::new();
+    for property_start in konnect_sexp::writer::find_block_starts(content, "property") {
+        if property_start < symbol_start || property_start >= symbol_end {
+            continue;
+        }
+        let (_, property_end) = konnect_sexp::writer::find_balanced_block(content, property_start)
+            .ok_or_else(|| anyhow::anyhow!("property block is malformed"))?;
+        let property = &content[property_start..property_end];
+        let at_relative = property
+            .find("(at ")
+            .ok_or_else(|| anyhow::anyhow!("property has no placement"))?;
+        let values_start = property_start + at_relative + "(at ".len();
+        let close_relative = property[at_relative..]
+            .find(')')
+            .ok_or_else(|| anyhow::anyhow!("property placement is malformed"))?;
+        let values_end = property_start + at_relative + close_relative;
+        let parts: Vec<_> = content[values_start..values_end]
+            .split_whitespace()
+            .collect();
+        let x = parts
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("property placement has no x coordinate"))?
+            .parse::<f64>()?;
+        let y = parts
+            .get(1)
+            .ok_or_else(|| anyhow::anyhow!("property placement has no y coordinate"))?
+            .parse::<f64>()?;
+        let rotation = parts.get(2).copied().unwrap_or("0");
+        edits.push(SexpEdit::replace(
+            values_start,
+            values_end,
+            format!(
+                "{} {} {rotation}",
+                cse::types::fmt_f64(x + dx),
+                cse::types::fmt_f64(y + dy)
+            ),
+        ));
+    }
+    Ok(edits)
+}
+
+fn symbol_placement(
+    content: &str,
+    symbol_start: usize,
+    symbol_end: usize,
+) -> anyhow::Result<((usize, usize), f64, f64, String)> {
+    let symbol = &content[symbol_start..symbol_end];
+    let placements: Vec<_> = find_direct_child_blocks(symbol, "symbol")
+        .into_iter()
+        .filter(|(start, end)| {
+            parse_sexp(&symbol[*start..*end])
+                .ok()
+                .is_some_and(|node| node.head() == Some("at"))
+        })
+        .collect();
+    let [(start, end)] = placements.as_slice() else {
+        anyhow::bail!("placed symbol must carry exactly one direct (at ...) coordinate");
+    };
+    let node = parse_sexp(&symbol[*start..*end])?;
+    let x = node
+        .get_f64(1)
+        .ok_or_else(|| anyhow::anyhow!("symbol placement has no numeric x coordinate"))?;
+    let y = node
+        .get_f64(2)
+        .ok_or_else(|| anyhow::anyhow!("symbol placement has no numeric y coordinate"))?;
+    let rotation = node
+        .get(3)
+        .and_then(SexpNode::as_str)
+        .unwrap_or("0")
+        .to_owned();
+    Ok(((symbol_start + start, symbol_start + end), x, y, rotation))
+}
+
+fn symbol_unit(content: &str, symbol_start: usize, symbol_end: usize) -> anyhow::Result<u32> {
+    let symbol = parse_sexp(&content[symbol_start..symbol_end])?;
+    symbol
+        .find("unit")
+        .and_then(|unit| unit.get(1))
+        .and_then(SexpNode::as_str)
+        .and_then(|unit| unit.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("placed symbol has no valid unit number"))
+}
+
+fn schematic_pin_endpoints(source: &str) -> anyhow::Result<Vec<(f64, f64)>> {
+    let tree = parse_sexp(source)?;
+    Ok(crate::tools::all_pin_endpoints(&tree))
+}
+
+/// Plan one uniform, grid-snapped move across every placed unit of each
+/// requested component. Symbols, absolute property coordinates, and junction
+/// insertions/deletions are captured in one immutable command.
+pub(crate) fn plan_schematic_component_moves(
+    source: &str,
+    requested_references: &[String],
+    dx: f64,
+    dy: f64,
+) -> anyhow::Result<PlannedSchematicMoves> {
+    if requested_references.is_empty() {
+        anyhow::bail!("component move plan contains no references");
+    }
+    if !dx.is_finite() || !dy.is_finite() {
+        anyhow::bail!("component move delta must be finite");
+    }
+    let mut unique = HashSet::new();
+    let mut targets = Vec::new();
+    for reference in requested_references {
+        if reference.trim().is_empty() {
+            anyhow::bail!("component move reference cannot be empty");
+        }
+        if !unique.insert(reference.as_str()) {
+            anyhow::bail!("component move plan contains duplicate reference '{reference}'");
+        }
+        let blocks = find_all_symbol_instance_blocks(source, reference);
+        if blocks.is_empty() {
+            anyhow::bail!("component '{reference}' not found in schematic");
+        }
+        targets.push((reference, blocks));
+    }
+
+    let before_pins = if source.contains("(wire") {
+        schematic_pin_endpoints(source)?
+    } else {
+        Vec::new()
+    };
+    let &(anchor_start, anchor_end) = targets
+        .first()
+        .and_then(|(_, blocks)| blocks.first())
+        .expect("validated move targets have at least one placed unit");
+    let (_, anchor_x, anchor_y, _) = symbol_placement(source, anchor_start, anchor_end)?;
+    let (snapped_anchor_x, snapped_anchor_y) = snap_point(anchor_x + dx, anchor_y + dy, 1.27);
+    let shared_dx = snapped_anchor_x - anchor_x;
+    let shared_dy = snapped_anchor_y - anchor_y;
+    let mut edits = Vec::new();
+    let mut placements = Vec::new();
+    let mut target_ids = Vec::new();
+    for (reference, blocks) in targets {
+        target_ids.extend(symbol_item_ids(source, reference)?);
+        for (symbol_start, symbol_end) in blocks {
+            let unit = symbol_unit(source, symbol_start, symbol_end)?;
+            let ((at_start, at_end), old_x, old_y, rotation) =
+                symbol_placement(source, symbol_start, symbol_end).map_err(|error| {
+                    anyhow::anyhow!("component '{reference}' unit {unit}: {error}")
+                })?;
+            let new_x = old_x + shared_dx;
+            let new_y = old_y + shared_dy;
+            edits.push(SexpEdit::replace(
+                at_start,
+                at_end,
+                format!(
+                    "(at {} {} {rotation})",
+                    cse::types::fmt_f64(new_x),
+                    cse::types::fmt_f64(new_y)
+                ),
+            ));
+            edits.extend(property_translation_edits(
+                source,
+                symbol_start,
+                symbol_end,
+                shared_dx,
+                shared_dy,
+            )?);
+            placements.push(PlannedSchematicPlacement {
+                reference: reference.clone(),
+                unit,
+                old_x,
+                old_y,
+                new_x,
+                new_y,
+            });
+        }
+    }
+
+    let moved = apply_edits(source.to_owned(), edits);
+    let after_pins = if before_pins.is_empty() {
+        Vec::new()
+    } else {
+        schematic_pin_endpoints(&moved)?
+    };
+    const TOLERANCE: f64 = 0.01;
+    let differs = |left: &[(f64, f64)], right: &[(f64, f64)]| {
+        left.iter()
+            .copied()
+            .filter(|&(x, y)| {
+                !right.iter().any(|&(other_x, other_y)| {
+                    konnect_sexp::geometry::points_coincident(x, y, other_x, other_y, TOLERANCE)
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut changed_pin_points = differs(&before_pins, &after_pins);
+    changed_pin_points.extend(differs(&after_pins, &before_pins));
+    let (reconciled, junctions_added, junctions_pruned) =
+        crate::tools::sch_wiring::reconcile_junctions_at(moved, &changed_pin_points);
+
+    let command = if reconciled == source {
+        SchematicCommand::replace_items_from_document(
+            source,
+            source,
+            target_ids,
+            "Move schematic components",
+        )?
+    } else {
+        SchematicCommand::from_document_diff(source, &reconciled, "Move schematic components")?
+    }
+    .requiring_unchanged_document();
+    let (candidate, _) = prepare_command(
+        std::path::Path::new("planned-schematic.kicad_sch"),
+        source,
+        &command,
+    )?;
+
+    Ok(PlannedSchematicMoves {
+        candidate,
+        command,
+        placements,
+        junctions_added,
+        junctions_pruned,
+    })
+}
+
 async fn handle_edit_schematic_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1236,7 +1485,7 @@ async fn handle_edit_schematic_component(
         Ok(planned) => planned,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
-    debug_assert_ne!(planned.candidate, source);
+    debug_assert!(parse_sexp(&planned.candidate).is_ok());
     commit_command(&sch_path, &planned.command)?;
 
     let result = json!({
@@ -1360,101 +1609,52 @@ async fn handle_move_schematic_component(
         Err(e) => return Ok(e),
     };
     let (new_x, new_y) = snap_point(new_x, new_y, 1.27);
-
-    // Pin positions before the move, so the dots the pins vacate can be judged
-    // afterwards (#120). Wires do not change here — pins do. A sheet with no
-    // wires has nothing to reconcile, and skipping spares it the symbol walk.
-    let before_pins = if read_consistent(&sch_path)
-        .map(|c| c.contains("(wire"))
-        .unwrap_or(false)
-    {
-        pin_endpoints_of(&sch_path)
-    } else {
-        Vec::new()
-    };
-
-    let mut sch = cse::Schematic::load(&sch_path)?;
-
-    let Some(anchor) = sch
-        .symbols
+    let source = read_consistent(&sch_path)?;
+    let blocks = find_all_symbol_instance_blocks(&source, &reference);
+    let anchor = blocks
         .iter()
-        .filter(|symbol| symbol.reference() == Some(reference.as_str()))
-        .min_by_key(|symbol| symbol.unit)
-    else {
-        return Err(anyhow::anyhow!("Component '{}' not found", reference));
+        .map(|&(start, end)| {
+            Ok((
+                symbol_unit(&source, start, end)?,
+                symbol_placement(&source, start, end)?,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .min_by_key(|(unit, _)| *unit);
+    let Some((_, (_, old_x, old_y, _))) = anchor else {
+        return Ok(CallToolResult::error(format!(
+            "Component '{reference}' not found"
+        )));
     };
-    let (old_x, old_y) = anchor.position();
-    let (dx, dy) = (new_x - old_x, new_y - old_y);
-    let mut placements = Vec::new();
-    for symbol in sch
-        .symbols
-        .iter_mut()
-        .filter(|symbol| symbol.reference() == Some(reference.as_str()))
-    {
-        symbol.translate(dx, dy);
-        placements.push(json!({
-            "unit": symbol.unit,
-            "x": symbol.at.x,
-            "y": symbol.at.y
-        }));
-    }
-    sch.overwrite()?;
-    let (added, pruned) = reconcile_junctions_after_move(&sch_path, &before_pins)?;
+    let planned = plan_schematic_component_moves(
+        &source,
+        std::slice::from_ref(&reference),
+        new_x - old_x,
+        new_y - old_y,
+    )?;
+    debug_assert!(parse_sexp(&planned.candidate).is_ok());
+    commit_command(&sch_path, &planned.command)?;
+    let placements: Vec<_> = planned
+        .placements
+        .iter()
+        .map(|placement| {
+            json!({
+                "unit": placement.unit,
+                "x": placement.new_x,
+                "y": placement.new_y
+            })
+        })
+        .collect();
     Ok(CallToolResult::json(&json!({
         "moved": reference,
         "x": new_x,
         "y": new_y,
         "moved_units": placements.len(),
         "placements": placements,
-        "junctions_added_count": added,
-        "junctions_pruned_count": pruned
+        "junctions_added_count": planned.junctions_added,
+        "junctions_pruned_count": planned.junctions_pruned
     })))
-}
-
-/// Pin endpoints on the sheet as it currently stands on disk, or empty if it
-/// cannot be read — the caller only ever diffs two of these.
-fn pin_endpoints_of(path: &std::path::Path) -> Vec<(f64, f64)> {
-    read_consistent(path)
-        .ok()
-        .and_then(|c| konnect_sexp::parse_sexp(&c).ok())
-        .map(|t| crate::tools::all_pin_endpoints(&t))
-        .unwrap_or_default()
-}
-
-/// Re-judge junction dots wherever a pin appeared or disappeared.
-///
-/// The points that matter are exactly the symmetric difference of the pin sets:
-/// a dot at a vacated position may now be stranded, and a pin that has landed
-/// mid-span on a wire needs one. Everything else on the sheet is untouched, so
-/// unrelated dots cannot be disturbed.
-fn reconcile_junctions_after_move(
-    path: &std::path::Path,
-    before_pins: &[(f64, f64)],
-) -> anyhow::Result<(usize, usize)> {
-    const TOL: f64 = 0.01;
-    let after_pins = pin_endpoints_of(path);
-    let differs = |a: &[(f64, f64)], b: &[(f64, f64)]| -> Vec<(f64, f64)> {
-        a.iter()
-            .copied()
-            .filter(|&(x, y)| {
-                !b.iter()
-                    .any(|&(ox, oy)| konnect_sexp::geometry::points_coincident(x, y, ox, oy, TOL))
-            })
-            .collect()
-    };
-    let mut points = differs(before_pins, &after_pins);
-    points.extend(differs(&after_pins, before_pins));
-    if points.is_empty() {
-        return Ok((0, 0));
-    }
-    let content = read_consistent(path)?;
-    let expected = content.clone();
-    let (new_content, added, pruned) =
-        crate::tools::sch_wiring::reconcile_junctions_at(content, &points);
-    if added > 0 || pruned > 0 {
-        write_atomic_if_unchanged(path, &expected, &new_content)?;
-    }
-    Ok((added, pruned))
 }
 
 async fn handle_rotate_schematic_component(
@@ -5058,6 +5258,110 @@ mod multi_unit_component_tests {
 
         assert!(konnect_sexp::commit_command(&path, &planned.command).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), SCHEMATIC);
+    }
+
+    #[test]
+    fn pure_move_plan_moves_all_units_and_properties_by_one_grid_snapped_delta() {
+        let planned =
+            plan_schematic_component_moves(SCHEMATIC, &["U1".to_string()], 0.4, 0.4).unwrap();
+
+        assert_eq!(planned.placements.len(), 2);
+        let shared_dx = planned.placements[0].new_x - planned.placements[0].old_x;
+        let shared_dy = planned.placements[0].new_y - planned.placements[0].old_y;
+        assert!(planned
+            .placements
+            .iter()
+            .all(|placement| ((placement.new_x - placement.old_x) - shared_dx).abs() < 1e-9));
+        assert!(planned
+            .placements
+            .iter()
+            .all(|placement| ((placement.new_y - placement.old_y) - shared_dy).abs() < 1e-9));
+        assert!(
+            (planned.placements[0].new_x / 1.27 - (planned.placements[0].new_x / 1.27).round())
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (planned.placements[0].new_y / 1.27 - (planned.placements[0].new_y / 1.27).round())
+                .abs()
+                < 1e-9
+        );
+        for placement in &planned.placements {
+            let old_reference_y = if placement.unit == 1 { 98.0 } else { 118.0 };
+            let expected_y = old_reference_y + placement.new_y - placement.old_y;
+            assert!(planned.candidate.contains(&format!(
+                "(property \"Reference\" \"U1\" (at {} {} 0))",
+                cse::types::fmt_f64(placement.new_x),
+                cse::types::fmt_f64(expected_y)
+            )));
+        }
+        assert_eq!(SCHEMATIC.matches("(at 100 100 0)").count(), 4);
+        assert!(!planned.candidate.contains("(at 100 100 0)"));
+        assert!(planned.command.require_unchanged_document);
+    }
+
+    #[test]
+    fn pure_move_plan_rejects_missing_or_duplicate_targets_as_a_whole() {
+        let missing = plan_schematic_component_moves(
+            SCHEMATIC,
+            &["U1".to_string(), "U404".to_string()],
+            1.27,
+            0.0,
+        )
+        .unwrap_err();
+        assert!(missing.to_string().contains("U404"));
+
+        let duplicate = plan_schematic_component_moves(
+            SCHEMATIC,
+            &["U1".to_string(), "U1".to_string()],
+            1.27,
+            0.0,
+        )
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("duplicate reference 'U1'"));
+        assert!(SCHEMATIC.contains("(at 100 100 0)"));
+    }
+
+    #[test]
+    fn pure_move_plan_captures_junction_insertion_deletion_and_preservation() {
+        const JUNCTIONS: &str = include_str!("../../tests/fixtures/junction_reconcile.kicad_sch");
+        let planned =
+            plan_schematic_component_moves(JUNCTIONS, &["R1".to_string()], 69.85, 0.0).unwrap();
+
+        assert_eq!(planned.junctions_added, 1);
+        assert_eq!(planned.junctions_pruned, 1);
+        assert_eq!(planned.candidate.matches("(junction").count(), 3);
+        assert!(!planned.candidate.contains("(at 120.65 139.7)"));
+        assert!(planned.candidate.contains("(at 190.5 132.08)"));
+        assert!(planned.candidate.contains("(at 120.65 170.18)"));
+        assert!(planned.candidate.contains("(at 260.35 140)"));
+        assert!(planned
+            .command
+            .changes
+            .iter()
+            .any(|change| change.before.is_some() && change.after.is_none()));
+        assert!(planned
+            .command
+            .changes
+            .iter()
+            .any(|change| change.before.is_none() && change.after.is_some()));
+    }
+
+    #[test]
+    fn immutable_move_plan_rejects_intervening_edit_and_editor_lock() {
+        let planned =
+            plan_schematic_component_moves(SCHEMATIC, &["U1".to_string()], 1.27, 0.0).unwrap();
+        let (directory, path) = fixture();
+        let intervening = SCHEMATIC.replace("(page \"1\")", "(page \"2\")");
+        std::fs::write(&path, &intervening).unwrap();
+        assert!(commit_command(&path, &planned.command).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), intervening);
+
+        std::fs::write(&path, SCHEMATIC).unwrap();
+        std::fs::write(path.with_file_name("~multi.kicad_sch.lck"), "{}\n").unwrap();
+        assert!(commit_command(&path, &planned.command).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), SCHEMATIC);
+        drop(directory);
     }
 
     /// A real eeschema save (KiCad's ecc83 demo): tabs, CRLF, and U1 placed

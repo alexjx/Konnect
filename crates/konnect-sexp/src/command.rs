@@ -510,6 +510,114 @@ impl SchematicCommand {
         })
     }
 
+    /// Build one command from the UUID-owned top-level item differences
+    /// between `source` and a fully edited candidate document.
+    ///
+    /// Replacements, insertions, and deletions are all represented explicitly.
+    /// Changes to UUID-less document metadata are intentionally outside this
+    /// helper's contract.
+    pub fn from_document_diff(
+        source: &str,
+        edited_source: &str,
+        label: impl Into<String>,
+    ) -> Result<Self, SexpError> {
+        let current = document_items(source)?;
+        let edited = document_items(edited_source)?;
+        ensure_unique_item_ids(&current, "source")?;
+        ensure_unique_item_ids(&edited, "edited document")?;
+
+        let current_by_id: std::collections::HashMap<_, _> = current
+            .iter()
+            .filter_map(|item| item.id.as_ref().map(|id| (id, item)))
+            .collect();
+        let edited_by_id: std::collections::HashMap<_, _> = edited
+            .iter()
+            .filter_map(|item| item.id.as_ref().map(|id| (id, item)))
+            .collect();
+        let footer_after = |items: &[DocumentItem<'_>], index: usize| {
+            items[index + 1..].iter().any(|item| {
+                matches!(
+                    item.kind.as_deref(),
+                    Some("sheet_instances" | "symbol_instances" | "embedded_fonts")
+                )
+            })
+        };
+
+        let mut changes = Vec::new();
+        for item in &current {
+            let Some(id) = item.id.as_ref() else { continue };
+            if let Some(after) = edited_by_id.get(id) {
+                if item.source != after.source {
+                    changes.push(ItemChange {
+                        id: id.clone(),
+                        before: Some(item.source.to_owned()),
+                        after: Some(after.source.to_owned()),
+                        anchor: ItemAnchor::EndOfDocument,
+                    });
+                }
+            }
+        }
+
+        // Reverse document order and anchor only to surviving source items, as
+        // delete_items does, so an inverse can restore adjacent deletions.
+        for (index, item) in current.iter().enumerate().rev() {
+            let Some(id) = item.id.as_ref() else { continue };
+            if edited_by_id.contains_key(id) {
+                continue;
+            }
+            let anchor = current[index + 1..]
+                .iter()
+                .filter_map(|candidate| candidate.id.as_ref())
+                .find(|candidate| edited_by_id.contains_key(*candidate))
+                .cloned()
+                .map(ItemAnchor::Before)
+                .unwrap_or_else(|| {
+                    if footer_after(&current, index) {
+                        ItemAnchor::BeforeFooter
+                    } else {
+                        ItemAnchor::EndOfDocument
+                    }
+                });
+            changes.push(ItemChange {
+                id: id.clone(),
+                before: Some(item.source.to_owned()),
+                after: None,
+                anchor,
+            });
+        }
+
+        // Equal-offset insertions are applied sequentially and therefore end
+        // up reversed. Emit them in reverse candidate order so their final
+        // document order matches the candidate.
+        for (index, item) in edited.iter().enumerate().rev() {
+            let Some(id) = item.id.as_ref() else { continue };
+            if current_by_id.contains_key(id) {
+                continue;
+            }
+            let anchor = edited[index + 1..]
+                .iter()
+                .filter_map(|candidate| candidate.id.as_ref())
+                .find(|candidate| current_by_id.contains_key(*candidate))
+                .cloned()
+                .map(ItemAnchor::Before)
+                .unwrap_or_else(|| {
+                    if footer_after(&edited, index) {
+                        ItemAnchor::BeforeFooter
+                    } else {
+                        ItemAnchor::EndOfDocument
+                    }
+                });
+            changes.push(ItemChange {
+                id: id.clone(),
+                before: None,
+                after: Some(item.source.to_owned()),
+                anchor,
+            });
+        }
+
+        Self::from_changes(source, label, changes)
+    }
+
     /// Build an atomic multi-item command from validated transitions.
     ///
     /// # Errors
@@ -736,6 +844,18 @@ fn document_items(source: &str) -> Result<Vec<DocumentItem<'_>>, SexpError> {
             })
         })
         .collect()
+}
+
+fn ensure_unique_item_ids(items: &[DocumentItem<'_>], document: &str) -> Result<(), SexpError> {
+    let mut ids = std::collections::HashSet::new();
+    for id in items.iter().filter_map(|item| item.id.as_ref()) {
+        if !ids.insert(id) {
+            return Err(SexpError::InvalidValue(format!(
+                "{document} contains duplicate top-level item UUID {id}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn block_id(block: &str) -> Result<Option<ItemId>, SexpError> {
@@ -1207,6 +1327,53 @@ mod tests {
         let result = std::fs::read_to_string(path).expect("read result");
         assert!(result.contains("(xy 20 0)"));
         assert!(!result.contains("strict-label"));
+    }
+
+    #[test]
+    fn document_diff_expresses_replacement_insertion_and_deletion() {
+        let edited = SOURCE
+            .replace("(xy 10 0)", "(xy 20 0)")
+            .replace("  (junction (at 10 0) (uuid \"junction-b\"))\n", "")
+            .replace(
+                "  (sheet_instances",
+                "  (junction (at 30 0) (uuid \"junction-c\"))\n  (sheet_instances",
+            );
+
+        let command = SchematicCommand::from_document_diff(SOURCE, &edited, "Mixed item diff")
+            .expect("UUID item diff prepares");
+        assert_eq!(command.changes.len(), 3);
+        assert!(command.changes.iter().any(|change| {
+            change.id.as_str() == "wire-a" && change.before.is_some() && change.after.is_some()
+        }));
+        assert!(command.changes.iter().any(|change| {
+            change.id.as_str() == "junction-b" && change.before.is_some() && change.after.is_none()
+        }));
+        assert!(command.changes.iter().any(|change| {
+            change.id.as_str() == "junction-c" && change.before.is_none() && change.after.is_some()
+        }));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mixed.kicad_sch");
+        std::fs::write(&path, SOURCE).unwrap();
+        commit_command(&path, &command).unwrap();
+        let result = std::fs::read_to_string(path).unwrap();
+        assert!(result.contains("(xy 20 0)"));
+        assert!(!result.contains("junction-b"));
+        assert!(result.contains("junction-c"));
+        assert!(result.find("junction-c").unwrap() < result.find("sheet_instances").unwrap());
+    }
+
+    #[test]
+    fn document_diff_rejects_duplicate_uuid_ownership() {
+        let duplicate = SOURCE.replace(
+            "  (sheet_instances",
+            "  (junction (at 20 0) (uuid \"wire-a\"))\n  (sheet_instances",
+        );
+
+        let error = SchematicCommand::from_document_diff(SOURCE, &duplicate, "Invalid diff")
+            .expect_err("one UUID cannot own two top-level items");
+        assert!(error.to_string().contains("duplicate"));
+        assert!(error.to_string().contains("wire-a"));
     }
 
     #[test]
