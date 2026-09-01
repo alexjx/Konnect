@@ -808,6 +808,69 @@ impl KiCadIpcClient {
         Ok(footprints)
     }
 
+    /// Return live, board-space courtyard geometry for every footprint on the
+    /// first open board.
+    pub fn list_footprint_courtyards(&self) -> Result<Vec<IpcFootprintCourtyard>> {
+        self.list_footprint_courtyards_in(self.get_board_document()?)
+    }
+
+    /// Return live, board-space courtyard geometry for every footprint in an
+    /// explicitly selected open document.
+    ///
+    /// KiCad exposes embedded footprint graphics already transformed into
+    /// board coordinates, so applying the footprint transform again would be
+    /// incorrect.
+    pub fn list_footprint_courtyards_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Vec<IpcFootprintCourtyard>> {
+        let items = self.get_items_in(
+            document,
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )?;
+        let mut result = Vec::new();
+        for item in items {
+            if !crate::builders::any_is(&item, "kiapi.board.types.FootprintInstance") {
+                continue;
+            }
+            let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                .context("KiCad returned an unreadable footprint instance")?;
+            let reference = footprint_reference(&footprint).to_owned();
+            let mut by_layer: std::collections::BTreeMap<String, Vec<IpcCourtyardPrimitive>> =
+                Default::default();
+            if let Some(definition) = footprint.definition {
+                for child in definition.items {
+                    if !crate::builders::any_is(&child, "kiapi.board.types.BoardGraphicShape") {
+                        continue;
+                    }
+                    let graphic =
+                        kiapi::board::types::BoardGraphicShape::decode(child.value.as_slice())
+                            .context("KiCad returned an unreadable footprint graphic")?;
+                    let layer = layer_enum_to_name(graphic.layer).to_string();
+                    if layer != "F.CrtYd" && layer != "B.CrtYd" {
+                        continue;
+                    }
+                    if let Some(shape) = graphic.shape {
+                        append_courtyard_shape(
+                            &layer,
+                            &shape,
+                            by_layer.entry(layer.clone()).or_default(),
+                        );
+                    }
+                }
+            }
+            for (layer, primitives) in by_layer {
+                result.push(IpcFootprintCourtyard {
+                    reference: reference.clone(),
+                    layer,
+                    bounds: bounds_for_primitives(&primitives),
+                    primitives,
+                });
+            }
+        }
+        Ok(result)
+    }
+
     /// Create items on the board.
     ///
     /// `created_items` is documented as the status of each item *to be*
@@ -1057,9 +1120,13 @@ impl KiCadIpcClient {
 
     /// Save the open board document.
     pub fn save_board(&self) -> Result<()> {
-        let doc = self.get_board_document()?;
+        self.save_board_in(self.get_board_document()?)
+    }
+
+    /// Save an explicitly selected open board document.
+    pub fn save_board_in(&self, document: kiapi::common::types::DocumentSpecifier) -> Result<()> {
         let cmd = kiapi::common::commands::SaveDocument {
-            document: Some(doc),
+            document: Some(document),
         };
         self.send_command(&cmd, "kiapi.common.commands.SaveDocument")?;
         Ok(())
@@ -1785,6 +1852,21 @@ impl KiCadIpcClient {
         if placements.is_empty() {
             return Ok(Vec::new());
         }
+        self.set_footprint_placements_in(self.get_board_document()?, placements)
+    }
+
+    /// As [`Self::set_footprint_placements`], targeting one exact open board.
+    /// Target validation and update construction finish before the undo commit
+    /// begins, so a rejected request cannot create even an empty mutation
+    /// transaction.
+    pub fn set_footprint_placements_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        placements: &[IpcFootprintPlacement],
+    ) -> Result<Vec<IpcFootprintPlacement>> {
+        if placements.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let mut requested = std::collections::HashSet::new();
         for placement in placements {
@@ -1796,92 +1878,99 @@ impl KiCadIpcClient {
             }
         }
 
-        self.run_commit("Set component placements", |client| {
-            let items = client.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
-            let mut matched = std::collections::HashSet::new();
-            let mut updates = Vec::with_capacity(placements.len());
+        let items = self.get_items_in(
+            document.clone(),
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )?;
+        let mut matched = std::collections::HashSet::new();
+        let mut updates = Vec::with_capacity(placements.len());
 
-            for item in items {
-                if !crate::builders::any_is(&item, "kiapi.board.types.FootprintInstance") {
-                    continue;
-                }
-                let mut footprint =
-                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
-                let reference = footprint
-                    .reference_field
-                    .as_ref()
-                    .and_then(|field| field.text.as_ref())
-                    .and_then(|text| text.text.as_ref())
-                    .map(|text| text.text.as_str())
-                    .unwrap_or("");
-                let Some(target) = placements
-                    .iter()
-                    .find(|placement| placement.reference == reference)
-                else {
-                    continue;
-                };
-                if !matched.insert(reference.to_string()) {
-                    anyhow::bail!(
-                        "footprint reference '{}' appears more than once on the board",
-                        reference
-                    );
-                }
-
-                let old_position = footprint.position.unwrap_or_default();
-                let old_rotation = footprint
-                    .orientation
-                    .as_ref()
-                    .map(|angle| angle.value_degrees)
-                    .unwrap_or(0.0);
-                let rotation_delta = target.rotation - old_rotation;
-                if rotation_delta != 0.0 {
-                    crate::transform::transform_footprint_children(
-                        &mut footprint,
-                        &crate::transform::Xform::Rotate {
-                            cx_nm: old_position.x_nm,
-                            cy_nm: old_position.y_nm,
-                            delta_deg: rotation_delta,
-                        },
-                    )?;
-                }
-
-                let new_position = crate::builders::vec2(target.x, target.y);
-                let dx_nm = new_position.x_nm - old_position.x_nm;
-                let dy_nm = new_position.y_nm - old_position.y_nm;
-                if dx_nm != 0 || dy_nm != 0 {
-                    crate::transform::transform_footprint_children(
-                        &mut footprint,
-                        &crate::transform::Xform::Translate { dx_nm, dy_nm },
-                    )?;
-                }
-                footprint.position = Some(new_position);
-                footprint.orientation = Some(kiapi::common::types::Angle {
-                    value_degrees: target.rotation,
-                });
-                updates.push(crate::builders::pack_any(
-                    &footprint,
-                    "kiapi.board.types.FootprintInstance",
-                ));
+        for item in items {
+            if !crate::builders::any_is(&item, "kiapi.board.types.FootprintInstance") {
+                continue;
             }
-
-            let missing: Vec<_> = placements
+            let mut footprint =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+            let reference = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            let Some(target) = placements
                 .iter()
-                .filter(|placement| !matched.contains(&placement.reference))
-                .map(|placement| placement.reference.as_str())
-                .collect();
-            if !missing.is_empty() {
+                .find(|placement| placement.reference == reference)
+            else {
+                continue;
+            };
+            if !matched.insert(reference.to_string()) {
                 anyhow::bail!(
-                    "footprint{} {} not found on board",
-                    if missing.len() == 1 { "" } else { "s" },
-                    missing.join(", ")
+                    "footprint reference '{}' appears more than once on the board",
+                    reference
                 );
             }
 
-            client.update_items(updates)
+            let old_position = footprint.position.unwrap_or_default();
+            let old_rotation = footprint
+                .orientation
+                .as_ref()
+                .map(|angle| angle.value_degrees)
+                .unwrap_or(0.0);
+            let rotation_delta = target.rotation - old_rotation;
+            if rotation_delta != 0.0 {
+                crate::transform::transform_footprint_children(
+                    &mut footprint,
+                    &crate::transform::Xform::Rotate {
+                        cx_nm: old_position.x_nm,
+                        cy_nm: old_position.y_nm,
+                        delta_deg: rotation_delta,
+                    },
+                )?;
+            }
+
+            let new_position = crate::builders::vec2(target.x, target.y);
+            let dx_nm = new_position.x_nm - old_position.x_nm;
+            let dy_nm = new_position.y_nm - old_position.y_nm;
+            if dx_nm != 0 || dy_nm != 0 {
+                crate::transform::transform_footprint_children(
+                    &mut footprint,
+                    &crate::transform::Xform::Translate { dx_nm, dy_nm },
+                )?;
+            }
+            footprint.position = Some(new_position);
+            footprint.orientation = Some(kiapi::common::types::Angle {
+                value_degrees: target.rotation,
+            });
+            updates.push(crate::builders::pack_any(
+                &footprint,
+                "kiapi.board.types.FootprintInstance",
+            ));
+        }
+
+        let missing: Vec<_> = placements
+            .iter()
+            .filter(|placement| !matched.contains(&placement.reference))
+            .map(|placement| placement.reference.as_str())
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "footprint{} {} not found on board",
+                if missing.len() == 1 { "" } else { "s" },
+                missing.join(", ")
+            );
+        }
+
+        let update_document = document.clone();
+        self.run_commit("Set component placements", move |client| {
+            client.update_items_in(update_document, updates)
         })?;
 
         // Post-commit read-back: report what the board holds, in request order.
-        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let items = self.get_items_in(
+            document,
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )?;
         let mut held = std::collections::HashMap::new();
         for item in &items {
             if !crate::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
@@ -2543,6 +2632,223 @@ fn build_graphic_child(
 
 /// The reference designator text of a placed footprint, or `""` when the
 /// instance carries no reference field.
+fn courtyard_point(point: &kiapi::common::types::Vector2) -> IpcVector2 {
+    IpcVector2 {
+        x: nm_to_mm(point.x_nm),
+        y: nm_to_mm(point.y_nm),
+    }
+}
+
+fn tessellate_courtyard_arc(arc: &kiapi::common::types::ArcStartMidEnd) -> Vec<IpcVector2> {
+    let (Some(start), Some(mid), Some(end)) = (&arc.start, &arc.mid, &arc.end) else {
+        return Vec::new();
+    };
+    let (x1, y1, x2, y2, x3, y3) = (
+        start.x_nm as f64,
+        start.y_nm as f64,
+        mid.x_nm as f64,
+        mid.y_nm as f64,
+        end.x_nm as f64,
+        end.y_nm as f64,
+    );
+    let determinant = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
+    if determinant.abs() < 1.0 {
+        return vec![
+            courtyard_point(start),
+            courtyard_point(mid),
+            courtyard_point(end),
+        ];
+    }
+    let center_x = ((x1 * x1 + y1 * y1) * (y2 - y3)
+        + (x2 * x2 + y2 * y2) * (y3 - y1)
+        + (x3 * x3 + y3 * y3) * (y1 - y2))
+        / determinant;
+    let center_y = ((x1 * x1 + y1 * y1) * (x3 - x2)
+        + (x2 * x2 + y2 * y2) * (x1 - x3)
+        + (x3 * x3 + y3 * y3) * (x2 - x1))
+        / determinant;
+    let start_angle = (y1 - center_y).atan2(x1 - center_x);
+    let mid_angle = (y2 - center_y).atan2(x2 - center_x);
+    let end_angle = (y3 - center_y).atan2(x3 - center_x);
+    let tau = std::f64::consts::TAU;
+    let counterclockwise = (end_angle - start_angle).rem_euclid(tau);
+    let mid_counterclockwise = (mid_angle - start_angle).rem_euclid(tau);
+    let sweep = if mid_counterclockwise <= counterclockwise {
+        counterclockwise
+    } else {
+        counterclockwise - tau
+    };
+    let radius = ((x1 - center_x).powi(2) + (y1 - center_y).powi(2)).sqrt();
+    let steps = ((sweep.abs() / std::f64::consts::FRAC_PI_2) * 16.0)
+        .ceil()
+        .max(2.0) as usize;
+    let mut points: Vec<_> = (0..=steps)
+        .map(|step| {
+            let angle = start_angle + sweep * step as f64 / steps as f64;
+            IpcVector2 {
+                x: (center_x + radius * angle.cos()) / 1e6,
+                y: (center_y + radius * angle.sin()) / 1e6,
+            }
+        })
+        .collect();
+    // Include exact cardinal extrema so bounds do not depend on tessellation.
+    for angle in [
+        0.0,
+        std::f64::consts::FRAC_PI_2,
+        std::f64::consts::PI,
+        3.0 * std::f64::consts::FRAC_PI_2,
+    ] {
+        let delta = if sweep >= 0.0 {
+            (angle - start_angle).rem_euclid(tau)
+        } else {
+            -((start_angle - angle).rem_euclid(tau))
+        };
+        if (sweep >= 0.0 && delta <= sweep) || (sweep < 0.0 && delta >= sweep) {
+            points.push(IpcVector2 {
+                x: (center_x + radius * angle.cos()) / 1e6,
+                y: (center_y + radius * angle.sin()) / 1e6,
+            });
+        }
+    }
+    points
+}
+
+fn courtyard_polyline_points(line: &kiapi::common::types::PolyLine) -> Vec<IpcVector2> {
+    use kiapi::common::types::poly_line_node::Geometry;
+    line.nodes
+        .iter()
+        .flat_map(|node| match &node.geometry {
+            Some(Geometry::Point(point)) => vec![courtyard_point(point)],
+            Some(Geometry::Arc(arc)) => tessellate_courtyard_arc(arc),
+            None => Vec::new(),
+        })
+        .collect()
+}
+
+fn append_courtyard_shape(
+    layer: &str,
+    shape: &kiapi::common::types::GraphicShape,
+    output: &mut Vec<IpcCourtyardPrimitive>,
+) {
+    use kiapi::common::types::graphic_shape::Geometry;
+    let mut push = |kind: &str, points: Vec<IpcVector2>| {
+        if !points.is_empty() {
+            output.push(IpcCourtyardPrimitive {
+                kind: kind.to_owned(),
+                layer: layer.to_owned(),
+                points,
+            });
+        }
+    };
+    match &shape.geometry {
+        Some(Geometry::Segment(segment)) => {
+            if let (Some(start), Some(end)) = (&segment.start, &segment.end) {
+                push(
+                    "segment",
+                    vec![courtyard_point(start), courtyard_point(end)],
+                );
+            }
+        }
+        Some(Geometry::Rectangle(rectangle)) => {
+            if let (Some(top_left), Some(bottom_right)) =
+                (&rectangle.top_left, &rectangle.bottom_right)
+            {
+                let (top_left, bottom_right) =
+                    (courtyard_point(top_left), courtyard_point(bottom_right));
+                push(
+                    "rectangle",
+                    vec![
+                        IpcVector2 {
+                            x: top_left.x,
+                            y: top_left.y,
+                        },
+                        IpcVector2 {
+                            x: bottom_right.x,
+                            y: top_left.y,
+                        },
+                        IpcVector2 {
+                            x: bottom_right.x,
+                            y: bottom_right.y,
+                        },
+                        IpcVector2 {
+                            x: top_left.x,
+                            y: bottom_right.y,
+                        },
+                    ],
+                );
+            }
+        }
+        Some(Geometry::Arc(arc)) => push(
+            "arc",
+            tessellate_courtyard_arc(&kiapi::common::types::ArcStartMidEnd {
+                start: arc.start,
+                mid: arc.mid,
+                end: arc.end,
+            }),
+        ),
+        Some(Geometry::Circle(circle)) => {
+            if let (Some(center), Some(radius_point)) = (&circle.center, &circle.radius_point) {
+                let (center, radius_point) =
+                    (courtyard_point(center), courtyard_point(radius_point));
+                let radius = ((radius_point.x - center.x).powi(2)
+                    + (radius_point.y - center.y).powi(2))
+                .sqrt();
+                push(
+                    "circle",
+                    (0..64)
+                        .map(|step| {
+                            let angle = std::f64::consts::TAU * step as f64 / 64.0;
+                            IpcVector2 {
+                                x: center.x + radius * angle.cos(),
+                                y: center.y + radius * angle.sin(),
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        }
+        Some(Geometry::Polygon(polygon)) => {
+            for polygon in &polygon.polygons {
+                if let Some(outline) = &polygon.outline {
+                    push("polygon", courtyard_polyline_points(outline));
+                }
+            }
+        }
+        Some(Geometry::Bezier(bezier)) => push(
+            "bezier",
+            [
+                &bezier.start,
+                &bezier.control1,
+                &bezier.control2,
+                &bezier.end,
+            ]
+            .into_iter()
+            .filter_map(|point| point.as_ref())
+            .map(courtyard_point)
+            .collect(),
+        ),
+        None => {}
+    }
+}
+
+fn bounds_for_primitives(primitives: &[IpcCourtyardPrimitive]) -> Option<IpcBounds> {
+    let mut points = primitives
+        .iter()
+        .flat_map(|primitive| primitive.points.iter());
+    let first = points.next()?;
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (first.x, first.y, first.x, first.y);
+    for point in points {
+        min_x = min_x.min(point.x);
+        min_y = min_y.min(point.y);
+        max_x = max_x.max(point.x);
+        max_y = max_y.max(point.y);
+    }
+    Some(IpcBounds {
+        min: IpcVector2 { x: min_x, y: min_y },
+        max: IpcVector2 { x: max_x, y: max_y },
+    })
+}
+
 fn footprint_reference(footprint: &kiapi::board::types::FootprintInstance) -> &str {
     footprint
         .reference_field

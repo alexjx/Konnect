@@ -154,6 +154,91 @@ fn save_document_to_string_targets_the_named_open_board() {
 }
 
 #[test]
+fn save_board_in_targets_the_selected_document() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        assert!(message.type_url.ends_with("SaveDocument"));
+        let command = kiapi::common::commands::SaveDocument::decode(message.value.as_slice())
+            .expect("decode SaveDocument");
+        assert_eq!(command.document, Some(doc_for("target.kicad_pcb")));
+        Some(ok_response())
+    });
+
+    KiCadIpcClient::new(&mock.url)
+        .save_board_in(doc_for("target.kicad_pcb"))
+        .expect("save selected board");
+}
+
+#[test]
+fn courtyard_read_targets_selected_document_and_preserves_board_coordinates() {
+    let mut footprint = kiapi::board::types::FootprintInstance {
+        position: Some(builders::vec2(100.0, 100.0)),
+        reference_field: Some(kiapi::board::types::Field {
+            name: "Reference".to_string(),
+            text: Some(kiapi::board::types::BoardText {
+                text: Some(kiapi::common::types::Text {
+                    text: "H1".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        definition: Some(kiapi::board::types::Footprint::default()),
+        ..Default::default()
+    };
+    footprint
+        .definition
+        .as_mut()
+        .expect("embedded footprint definition")
+        .items
+        .push(builders::pack_any(
+            &builders::board_segment("F.CrtYd", 0.05, 10.0, 20.0, 14.0, 23.0),
+            "kiapi.board.types.BoardGraphicShape",
+        ));
+    let footprint = Arc::new(footprint);
+    let footprint_in_mock = footprint.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        assert!(message.type_url.ends_with("GetItems"));
+        let command = kiapi::common::commands::GetItems::decode(message.value.as_slice())
+            .expect("decode GetItems");
+        assert_eq!(
+            command
+                .header
+                .as_ref()
+                .and_then(|header| header.document.as_ref()),
+            Some(&doc_for("target.kicad_pcb"))
+        );
+        Some(reply_with(builders::pack_any(
+            &kiapi::common::commands::GetItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                items: vec![builders::pack_any(
+                    footprint_in_mock.as_ref(),
+                    "kiapi.board.types.FootprintInstance",
+                )],
+            },
+            "kiapi.common.commands.GetItemsResponse",
+        )))
+    });
+
+    let courtyards = KiCadIpcClient::new(&mock.url)
+        .list_footprint_courtyards_in(doc_for("target.kicad_pcb"))
+        .expect("courtyard snapshot");
+
+    assert_eq!(courtyards.len(), 1);
+    assert_eq!(courtyards[0].reference, "H1");
+    assert_eq!(courtyards[0].layer, "F.CrtYd");
+    let bounds = courtyards[0].bounds.as_ref().expect("courtyard bounds");
+    assert_eq!(
+        (bounds.min.x, bounds.min.y, bounds.max.x, bounds.max.y),
+        (10.0, 20.0, 14.0, 23.0),
+        "KiCad already returns footprint children in board coordinates"
+    );
+}
+
+#[test]
 fn effective_routing_rules_preserve_complete_kicad_values() {
     let mock = spawn_mock(|request| {
         let message = request.message.expect("request must pack a command");

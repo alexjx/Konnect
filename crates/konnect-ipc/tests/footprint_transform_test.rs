@@ -442,3 +442,207 @@ fn placement_batch_moves_and_rotates_multiple_footprints_in_one_update() {
     assert_eq!(placements, vec![(50.0, 50.0, 90.0), (250.0, 150.0, 180.0)]);
     assert_eq!(pad_positions_mm(&sent[0]), vec![(50.0, 51.0), (50.0, 49.0)]);
 }
+
+fn board_document(filename: &str) -> kiapi::common::types::DocumentSpecifier {
+    kiapi::common::types::DocumentSpecifier {
+        r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+        project: None,
+        identifier: Some(
+            kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                filename.to_string(),
+            ),
+        ),
+    }
+}
+
+fn header_board_filename(header: &kiapi::common::types::ItemHeader) -> &str {
+    match header
+        .document
+        .as_ref()
+        .and_then(|document| document.identifier.as_ref())
+    {
+        Some(kiapi::common::types::document_specifier::Identifier::BoardFilename(filename)) => {
+            filename
+        }
+        other => panic!("expected board filename, got {other:?}"),
+    }
+}
+
+#[test]
+fn exact_document_placement_uses_one_commit_and_one_targeted_update() {
+    #[derive(Default)]
+    struct Counts {
+        begin: usize,
+        update: usize,
+        push: usize,
+    }
+
+    let current = Arc::new(Mutex::new(mk_footprint_r1()));
+    let current_in_mock = current.clone();
+    let counts = Arc::new(Mutex::new(Counts::default()));
+    let counts_in_mock = counts.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetItems") {
+            let command =
+                kiapi::common::commands::GetItems::decode(message.value.as_slice()).unwrap();
+            assert_eq!(
+                header_board_filename(command.header.as_ref().expect("GetItems header")),
+                "target.kicad_pcb"
+            );
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items: vec![builders::pack_any(
+                        &*current_in_mock.lock().unwrap(),
+                        "kiapi.board.types.FootprintInstance",
+                    )],
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("BeginCommit") {
+            counts_in_mock.lock().unwrap().begin += 1;
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::BeginCommitResponse {
+                    id: Some(kiapi::common::types::Kiid {
+                        value: "exact-placement".to_string(),
+                    }),
+                },
+                "kiapi.common.commands.BeginCommitResponse",
+            )));
+        }
+        if message.type_url.ends_with("UpdateItems") {
+            counts_in_mock.lock().unwrap().update += 1;
+            let command =
+                kiapi::common::commands::UpdateItems::decode(message.value.as_slice()).unwrap();
+            assert_eq!(
+                header_board_filename(command.header.as_ref().expect("UpdateItems header")),
+                "target.kicad_pcb"
+            );
+            let updated =
+                kiapi::board::types::FootprintInstance::decode(command.items[0].value.as_slice())
+                    .unwrap();
+            *current_in_mock.lock().unwrap() = updated;
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::UpdateItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    updated_items: command
+                        .items
+                        .into_iter()
+                        .map(|item| kiapi::common::commands::ItemUpdateResult {
+                            status: Some(kiapi::common::commands::ItemStatus {
+                                code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                error_message: String::new(),
+                            }),
+                            item: Some(item),
+                        })
+                        .collect(),
+                },
+                "kiapi.common.commands.UpdateItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("EndCommit") {
+            let command =
+                kiapi::common::commands::EndCommit::decode(message.value.as_slice()).unwrap();
+            assert_eq!(
+                command.action,
+                kiapi::common::commands::CommitAction::CmaCommit as i32
+            );
+            counts_in_mock.lock().unwrap().push += 1;
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::EndCommitResponse {},
+                "kiapi.common.commands.EndCommitResponse",
+            )));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let held = client
+        .set_footprint_placements_in(
+            board_document("target.kicad_pcb"),
+            &[konnect_ipc::types::IpcFootprintPlacement {
+                reference: "R1".to_string(),
+                x: 20.0,
+                y: 30.0,
+                rotation: 90.0,
+            }],
+        )
+        .unwrap();
+
+    assert_eq!((held[0].x, held[0].y, held[0].rotation), (20.0, 30.0, 90.0));
+    let counts = counts.lock().unwrap();
+    assert_eq!((counts.begin, counts.update, counts.push), (1, 1, 1));
+}
+
+#[test]
+fn missing_placement_target_fails_before_begin_commit() {
+    let begins = Arc::new(Mutex::new(0usize));
+    let begins_in_mock = begins.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetItems") {
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items: vec![builders::pack_any(
+                        &mk_footprint_r1(),
+                        "kiapi.board.types.FootprintInstance",
+                    )],
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("BeginCommit") {
+            *begins_in_mock.lock().unwrap() += 1;
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let error = KiCadIpcClient::new(&mock.url)
+        .set_footprint_placements_in(
+            board_document("target.kicad_pcb"),
+            &[konnect_ipc::types::IpcFootprintPlacement {
+                reference: "R404".to_string(),
+                x: 20.0,
+                y: 30.0,
+                rotation: 0.0,
+            }],
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("R404 not found"));
+    assert_eq!(*begins.lock().unwrap(), 0);
+}
+
+#[test]
+fn duplicate_placement_target_fails_before_any_ipc_request() {
+    let requests = Arc::new(Mutex::new(0usize));
+    let requests_in_mock = requests.clone();
+    let mock = spawn_mock(move |request| {
+        *requests_in_mock.lock().unwrap() += 1;
+        panic!("unexpected IPC request: {request:?}");
+    });
+    let duplicate = konnect_ipc::types::IpcFootprintPlacement {
+        reference: "R1".to_string(),
+        x: 20.0,
+        y: 30.0,
+        rotation: 0.0,
+    };
+
+    let error = KiCadIpcClient::new(&mock.url)
+        .set_footprint_placements_in(
+            board_document("target.kicad_pcb"),
+            &[duplicate.clone(), duplicate],
+        )
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("duplicate footprint reference 'R1'"));
+    assert_eq!(*requests.lock().unwrap(), 0);
+}

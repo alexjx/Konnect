@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpcVector2 {
     pub x: f64,
     pub y: f64,
@@ -53,6 +53,32 @@ pub struct IpcFootprintPlacement {
     pub x: f64,
     pub y: f64,
     pub rotation: f64,
+}
+
+/// Axis-aligned board-space bounds in millimetres.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcBounds {
+    pub min: IpcVector2,
+    pub max: IpcVector2,
+}
+
+/// One live courtyard outline primitive in board coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcCourtyardPrimitive {
+    pub kind: String,
+    pub layer: String,
+    /// Curves are tessellated for portable JSON output. Bounds are calculated
+    /// from the same points.
+    pub points: Vec<IpcVector2>,
+}
+
+/// Courtyard geometry for one footprint and one courtyard layer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcFootprintCourtyard {
+    pub reference: String,
+    pub layer: String,
+    pub bounds: Option<IpcBounds>,
+    pub primitives: Vec<IpcCourtyardPrimitive>,
 }
 
 #[derive(Debug, Clone)]
