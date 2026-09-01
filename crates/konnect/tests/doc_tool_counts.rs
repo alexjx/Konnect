@@ -160,7 +160,15 @@ fn no_file_quotes_a_stale_catalogue_total() {
 fn text_files(root: &Path) -> Vec<PathBuf> {
     // .claude holds agent worktrees — other checkouts whose docs answer to
     // their own commit, not this one.
-    const SKIP: &[&str] = &["target", "node_modules", ".git", ".claude", "dist", "build"];
+    const SKIP: &[&str] = &[
+        "target",
+        "node_modules",
+        ".git",
+        ".claude",
+        ".agents",
+        "dist",
+        "build",
+    ];
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {

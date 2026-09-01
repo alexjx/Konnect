@@ -13,14 +13,14 @@ use crate::tools::{
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     commit_command,
-    geometry::snap_point,
+    geometry::{snap_point, transform_pin},
     parse_sexp,
     schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
-        pin_outward_direction, read_schematic,
+        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, parse_subsymbol_unit,
+        pin_endpoint, pin_outward_direction, read_schematic,
     },
     writer::{apply_edits, read_consistent, write_atomic_if_unchanged, write_new_atomic, SexpEdit},
-    ItemId, SchematicCommand,
+    ItemId, SchematicCommand, SexpNode,
 };
 use serde_json::json;
 
@@ -270,6 +270,33 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "references"]
             }),
             |args, ctx| async move { handle_batch_get_pin_locations(args, ctx).await }
+        ),
+        tool!(
+            "get_schematic_symbol_bounds",
+            "Return the transformed symbol body bounds and estimated Reference/Value text bounds without modifying the schematic.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "reference": { "type": "string" }
+                },
+                "required": ["schematic", "reference"]
+            }),
+            |args, ctx| async move { handle_get_symbol_bounds(args, ctx).await }
+        ),
+        tool!(
+            "check_schematic_field_spacing",
+            "Audit Reference/Value spacing against transformed symbol body graphics. This tool is read-only.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "max_clearance": { "type": "number", "minimum": 0, "default": 1.27 },
+                    "min_clearance": { "type": "number", "minimum": 0, "default": 0.20 }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_check_field_spacing(args, ctx).await }
         ),
         tool!(
             "add_component_annotation",
@@ -1532,6 +1559,551 @@ async fn handle_batch_get_pin_locations(
         .collect();
 
     Ok(CallToolResult::json(&json!({ "components": results })))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SchBounds {
+    left: f64,
+    right: f64,
+    top: f64,
+    bottom: f64,
+}
+
+impl SchBounds {
+    fn empty() -> Self {
+        Self {
+            left: f64::INFINITY,
+            right: f64::NEG_INFINITY,
+            top: f64::INFINITY,
+            bottom: f64::NEG_INFINITY,
+        }
+    }
+
+    fn include(&mut self, x: f64, y: f64) {
+        self.left = self.left.min(x);
+        self.right = self.right.max(x);
+        self.top = self.top.min(y);
+        self.bottom = self.bottom.max(y);
+    }
+
+    fn valid(self) -> bool {
+        self.left.is_finite()
+            && self.right.is_finite()
+            && self.top.is_finite()
+            && self.bottom.is_finite()
+    }
+
+    fn json(self) -> serde_json::Value {
+        json!({
+            "left": self.left,
+            "right": self.right,
+            "top": self.top,
+            "bottom": self.bottom,
+            "width": self.right - self.left,
+            "height": self.bottom - self.top
+        })
+    }
+}
+
+/// Collect supported body primitives in embedded-library coordinates.
+/// Pins, fields, and free text are excluded because the caller audits them
+/// independently from the symbol body.
+fn collect_direct_graphic_points(node: &SexpNode, points: &mut Vec<(f64, f64)>) {
+    match node.head() {
+        Some("rectangle") => {
+            for tag in ["start", "end"] {
+                if let Some(point) = node.find(tag) {
+                    if let (Some(x), Some(y)) = (point.get_f64(1), point.get_f64(2)) {
+                        points.push((x, y));
+                    }
+                }
+            }
+        }
+        Some("circle") => {
+            if let (Some(center), Some(radius)) = (node.find("center"), node.find_f64("radius")) {
+                if let (Some(x), Some(y)) = (center.get_f64(1), center.get_f64(2)) {
+                    points.extend([
+                        (x - radius, y),
+                        (x + radius, y),
+                        (x, y - radius),
+                        (x, y + radius),
+                    ]);
+                }
+            }
+        }
+        Some("arc") => {
+            for tag in ["start", "mid", "end"] {
+                if let Some(point) = node.find(tag) {
+                    if let (Some(x), Some(y)) = (point.get_f64(1), point.get_f64(2)) {
+                        points.push((x, y));
+                    }
+                }
+            }
+        }
+        Some("polyline") | Some("bezier") => {
+            if let Some(vertices) = node.find("pts") {
+                for point in vertices.find_all("xy") {
+                    if let (Some(x), Some(y)) = (point.get_f64(1), point.get_f64(2)) {
+                        points.push((x, y));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(children) = node.children() {
+        for child in children {
+            if !matches!(
+                child.head(),
+                Some("symbol") | Some("pin") | Some("property") | Some("text")
+            ) {
+                collect_direct_graphic_points(child, points);
+            }
+        }
+    }
+}
+
+fn collect_graphic_points_recursive(node: &SexpNode, points: &mut Vec<(f64, f64)>) {
+    collect_direct_graphic_points(node, points);
+    for child in node.find_all("symbol") {
+        collect_graphic_points_recursive(child, points);
+    }
+}
+
+fn transformed_body_bounds(
+    symbol: &SexpNode,
+    instance: &konnect_sexp::schematic::SymbolInstance,
+) -> Option<SchBounds> {
+    let mut local_points = Vec::new();
+    // KiCad stores common graphics in `Name_0_M` and unit-specific graphics in
+    // `Name_N_M`. Match the upstream unit-aware pin/bounds selection instead of
+    // accidentally including the artwork of every unit in a multi-unit part.
+    collect_direct_graphic_points(symbol, &mut local_points);
+    for child in symbol.find_all("symbol") {
+        let child_unit = child
+            .get(1)
+            .and_then(SexpNode::as_str)
+            .and_then(parse_subsymbol_unit);
+        if !matches!(child_unit, Some(unit) if unit != 0 && unit != instance.unit) {
+            collect_graphic_points_recursive(child, &mut local_points);
+        }
+    }
+    let transform = instance.pin_transform();
+    let mut bounds = SchBounds::empty();
+    for (x, y) in local_points {
+        let (world_x, world_y) = transform_pin(x, y, transform);
+        bounds.include(world_x, world_y);
+    }
+    bounds.valid().then_some(bounds)
+}
+
+fn rendered_field_rotation(symbol_rotation: f64, stored_rotation: f64) -> f64 {
+    (symbol_rotation - stored_rotation).rem_euclid(180.0)
+}
+
+/// Return estimated rendered bounds plus the stored and rendered anchors.
+/// KiCad's variable-width stroke font is estimated at 0.65 em per character;
+/// the response exposes that limitation explicitly.
+fn property_bounds(
+    instance_node: &SexpNode,
+    name: &str,
+    symbol_rotation: f64,
+) -> Option<(SchBounds, f64, f64, f64, f64)> {
+    let property = instance_node
+        .find_all("property")
+        .into_iter()
+        .find(|node| node.get(1).and_then(SexpNode::as_str) == Some(name))?;
+    let at = property.find("at")?;
+    let x = at.get_f64(1)?;
+    let y = at.get_f64(2)?;
+    let rotation = at.get_f64(3).unwrap_or(0.0).rem_euclid(360.0);
+    let rendered_rotation = rendered_field_rotation(symbol_rotation, rotation);
+    let text = property.get(2).and_then(SexpNode::as_str).unwrap_or("");
+    let effects = property.find("effects");
+    let hidden = property
+        .find("hide")
+        .or_else(|| effects.and_then(|node| node.find("hide")))
+        .and_then(|node| node.get(1))
+        .and_then(SexpNode::as_str)
+        .is_some_and(|value| value == "yes");
+    if hidden {
+        return None;
+    }
+    let font_size = effects
+        .and_then(|node| node.find("font"))
+        .and_then(|font| font.find("size"));
+    let font_x = font_size.and_then(|size| size.get_f64(1)).unwrap_or(1.27);
+    let font_y = font_size.and_then(|size| size.get_f64(2)).unwrap_or(font_x);
+    let justify = effects
+        .and_then(|node| node.find("justify"))
+        .and_then(|node| node.get(1))
+        .and_then(SexpNode::as_str)
+        .unwrap_or("center");
+
+    let width = (text.chars().count().max(1) as f64) * font_x * 0.65;
+    let height = font_y;
+    let (local_left, local_right) = match justify {
+        "left" => (0.0, width),
+        "right" => (-width, 0.0),
+        _ => (-width / 2.0, width / 2.0),
+    };
+    let (sin, cos) = rendered_rotation.to_radians().sin_cos();
+    let mut bounds = SchBounds::empty();
+    for (local_x, local_y) in [
+        (local_left, -height / 2.0),
+        (local_right, -height / 2.0),
+        (local_left, height / 2.0),
+        (local_right, height / 2.0),
+    ] {
+        bounds.include(
+            x + local_x * cos - local_y * sin,
+            y + local_x * sin + local_y * cos,
+        );
+    }
+    Some((bounds, x, y, rotation, rendered_rotation))
+}
+
+fn bounds_gap(first: SchBounds, second: SchBounds) -> (f64, bool) {
+    let dx = if first.right < second.left {
+        second.left - first.right
+    } else if second.right < first.left {
+        first.left - second.right
+    } else {
+        0.0
+    };
+    let dy = if first.bottom < second.top {
+        second.top - first.bottom
+    } else if second.bottom < first.top {
+        first.top - second.bottom
+    } else {
+        0.0
+    };
+    let overlaps = dx == 0.0 && dy == 0.0;
+    ((dx * dx + dy * dy).sqrt(), overlaps)
+}
+
+fn edge_pin_corridor(body: SchBounds, pin_x: f64, pin_y: f64, clearance: f64) -> Option<SchBounds> {
+    if pin_y > body.bottom && pin_x >= body.left && pin_x <= body.right {
+        Some(SchBounds {
+            left: pin_x - clearance,
+            right: pin_x + clearance,
+            top: body.bottom,
+            bottom: pin_y,
+        })
+    } else if pin_y < body.top && pin_x >= body.left && pin_x <= body.right {
+        Some(SchBounds {
+            left: pin_x - clearance,
+            right: pin_x + clearance,
+            top: pin_y,
+            bottom: body.top,
+        })
+    } else if pin_x < body.left && pin_y >= body.top && pin_y <= body.bottom {
+        Some(SchBounds {
+            left: pin_x,
+            right: body.left,
+            top: pin_y - clearance,
+            bottom: pin_y + clearance,
+        })
+    } else if pin_x > body.right && pin_y >= body.top && pin_y <= body.bottom {
+        Some(SchBounds {
+            left: body.right,
+            right: pin_x,
+            top: pin_y - clearance,
+            bottom: pin_y + clearance,
+        })
+    } else {
+        None
+    }
+}
+
+fn find_instance_node<'a>(tree: &'a SexpNode, reference: &str) -> Option<&'a SexpNode> {
+    tree.find_all("symbol").into_iter().find(|node| {
+        node.find_all("property").into_iter().any(|property| {
+            property.get(1).and_then(SexpNode::as_str) == Some("Reference")
+                && property.get(2).and_then(SexpNode::as_str) == Some(reference)
+        })
+    })
+}
+
+fn symbol_bounds_result(tree: &SexpNode, reference: &str) -> anyhow::Result<serde_json::Value> {
+    let instances = extract_symbol_instances(tree);
+    let instance = instances
+        .iter()
+        .find(|instance| instance.reference == reference)
+        .ok_or_else(|| anyhow::anyhow!("Component '{}' not found", reference))?;
+    let lib_symbols = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    let library_symbol = find_lib_symbol(&lib_symbols, instance)
+        .ok_or_else(|| anyhow::anyhow!("Library symbol '{}' not found", instance.lib_id))?;
+    let body = transformed_body_bounds(library_symbol, instance)
+        .ok_or_else(|| anyhow::anyhow!("Symbol '{}' has no supported body graphics", reference))?;
+    let instance_node = find_instance_node(tree, reference)
+        .ok_or_else(|| anyhow::anyhow!("Instance node '{}' not found", reference))?;
+
+    let field_json = |name: &str| {
+        property_bounds(instance_node, name, instance.rotation).map(
+            |(bounds, x, y, rotation, rendered_rotation)| {
+                let (gap, overlaps) = bounds_gap(body, bounds);
+                json!({
+                    "anchor": {
+                        "x": x, "y": y, "rotation": rotation,
+                        "rendered_rotation": rendered_rotation
+                    },
+                    "bounds": bounds.json(),
+                    "body_clearance": gap,
+                    "overlaps_body": overlaps,
+                    "bounds_are_estimated": true
+                })
+            },
+        )
+    };
+    let field_to_field = match (
+        property_bounds(instance_node, "Reference", instance.rotation),
+        property_bounds(instance_node, "Value", instance.rotation),
+    ) {
+        (Some((reference_bounds, ..)), Some((value_bounds, ..))) => {
+            let (gap, overlaps) = bounds_gap(reference_bounds, value_bounds);
+            Some(json!({ "clearance": gap, "overlaps": overlaps }))
+        }
+        _ => None,
+    };
+
+    Ok(json!({
+        "reference": reference,
+        "lib_id": instance.lib_id,
+        "unit": instance.unit,
+        "origin": { "x": instance.x, "y": instance.y },
+        "rotation": instance.rotation,
+        "mirror_x": instance.mirror_x,
+        "mirror_y": instance.mirror_y,
+        "body": body.json(),
+        "reference_field": field_json("Reference"),
+        "value_field": field_json("Value"),
+        "field_to_field": field_to_field
+    }))
+}
+
+async fn handle_get_symbol_bounds(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let (_, tree) = read_schematic(&sch_path)?;
+    Ok(CallToolResult::json(&symbol_bounds_result(
+        &tree, reference,
+    )?))
+}
+
+async fn handle_check_field_spacing(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let max_clearance = args["max_clearance"].as_f64().unwrap_or(1.27);
+    let min_clearance = args["min_clearance"].as_f64().unwrap_or(0.20);
+    if !max_clearance.is_finite()
+        || !min_clearance.is_finite()
+        || min_clearance < 0.0
+        || max_clearance < min_clearance
+    {
+        return Ok(CallToolResult::error(
+            "min_clearance and max_clearance must be finite, non-negative, and min_clearance must not exceed max_clearance",
+        ));
+    }
+
+    let (_, tree) = read_schematic(&sch_path)?;
+    let instances = extract_symbol_instances(&tree);
+    let lib_symbols = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    let mut issues = Vec::new();
+    let mut checked = 0usize;
+
+    for instance in &instances {
+        let Ok(result) = symbol_bounds_result(&tree, &instance.reference) else {
+            continue;
+        };
+        checked += 1;
+        for field_name in ["reference_field", "value_field"] {
+            let Some(field) = result.get(field_name).filter(|field| !field.is_null()) else {
+                continue;
+            };
+            let clearance = field["body_clearance"].as_f64().unwrap_or(f64::INFINITY);
+            let overlaps = field["overlaps_body"].as_bool().unwrap_or(false);
+            if overlaps || clearance < min_clearance || clearance > max_clearance {
+                issues.push(json!({
+                    "reference": instance.reference,
+                    "field": if field_name == "reference_field" { "Reference" } else { "Value" },
+                    "body_clearance": clearance,
+                    "overlaps_body": overlaps,
+                    "reason": if overlaps || clearance < min_clearance { "too_close_or_overlapping" } else { "too_far" },
+                    "anchor": field["anchor"],
+                    "body": result["body"]
+                }));
+            }
+        }
+        if let Some(field_spacing) = result
+            .get("field_to_field")
+            .filter(|field| !field.is_null())
+        {
+            let clearance = field_spacing["clearance"].as_f64().unwrap_or(f64::INFINITY);
+            let overlaps = field_spacing["overlaps"].as_bool().unwrap_or(false);
+            if overlaps || clearance < min_clearance {
+                issues.push(json!({
+                    "reference": instance.reference,
+                    "field": "Reference+Value",
+                    "field_clearance": clearance,
+                    "fields_overlap": overlaps,
+                    "reason": "fields_too_close_or_overlapping",
+                    "reference_field": result["reference_field"],
+                    "value_field": result["value_field"],
+                    "body": result["body"]
+                }));
+            }
+        }
+
+        let body = &result["body"];
+        let is_horizontal_resistor = result["lib_id"].as_str() == Some("Device:R")
+            && body["width"].as_f64().unwrap_or(0.0)
+                > body["height"].as_f64().unwrap_or(f64::INFINITY);
+        if is_horizontal_resistor {
+            let body_left = body["left"].as_f64().unwrap_or(0.0);
+            let body_right = body["right"].as_f64().unwrap_or(0.0);
+            let body_top = body["top"].as_f64().unwrap_or(0.0);
+            let body_bottom = body["bottom"].as_f64().unwrap_or(0.0);
+            let body_center_x = (body_left + body_right) / 2.0;
+            for (field_name, expected_side) in
+                [("reference_field", "above"), ("value_field", "below")]
+            {
+                let Some(field) = result.get(field_name).filter(|field| !field.is_null()) else {
+                    continue;
+                };
+                let rendered_rotation = field["anchor"]["rendered_rotation"]
+                    .as_f64()
+                    .unwrap_or(f64::NAN);
+                let field_center_x = field["anchor"]["x"].as_f64().unwrap_or(f64::NAN);
+                let side_ok = if expected_side == "above" {
+                    field["bounds"]["bottom"].as_f64().unwrap_or(f64::INFINITY) < body_top
+                } else {
+                    field["bounds"]["top"].as_f64().unwrap_or(f64::NEG_INFINITY) > body_bottom
+                };
+                let rotation_ok = rendered_rotation.abs() < 1e-6;
+                let centered = (field_center_x - body_center_x).abs() <= 1.27;
+                if !rotation_ok || !side_ok || !centered {
+                    issues.push(json!({
+                        "reference": instance.reference,
+                        "field": if field_name == "reference_field" { "Reference" } else { "Value" },
+                        "reason": "horizontal_resistor_field_layout",
+                        "expected": { "rendered_rotation": 0, "side": expected_side, "center_x": body_center_x, "center_tolerance": 1.27 },
+                        "actual": field,
+                        "rotation_ok": rotation_ok,
+                        "side_ok": side_ok,
+                        "centered": centered,
+                        "body": body
+                    }));
+                }
+            }
+        }
+
+        let is_large_connector = result["lib_id"]
+            .as_str()
+            .is_some_and(|lib_id| lib_id.starts_with("Connector:"))
+            && body["width"].as_f64().unwrap_or(0.0) >= 10.0
+            && body["height"].as_f64().unwrap_or(0.0) >= 10.0;
+        if is_large_connector {
+            let body_left = body["left"].as_f64().unwrap_or(0.0);
+            let body_right = body["right"].as_f64().unwrap_or(0.0);
+            let body_top = body["top"].as_f64().unwrap_or(0.0);
+            let body_bottom = body["bottom"].as_f64().unwrap_or(0.0);
+            for (field_name, expected_side) in
+                [("reference_field", "upper_left"), ("value_field", "below")]
+            {
+                let Some(field) = result.get(field_name).filter(|field| !field.is_null()) else {
+                    continue;
+                };
+                let rotation_ok = field["anchor"]["rendered_rotation"]
+                    .as_f64()
+                    .is_some_and(|rotation| rotation.abs() < 1e-6);
+                let anchor_x = field["anchor"]["x"].as_f64().unwrap_or(f64::NAN);
+                let side_ok = if expected_side == "upper_left" {
+                    field["bounds"]["bottom"].as_f64().unwrap_or(f64::INFINITY) < body_top
+                        && anchor_x >= body_left
+                        && anchor_x <= body_left + 2.54
+                } else {
+                    field["bounds"]["top"].as_f64().unwrap_or(f64::NEG_INFINITY) > body_bottom
+                        && anchor_x >= body_left
+                        && anchor_x <= body_right
+                };
+                if !rotation_ok || !side_ok {
+                    issues.push(json!({
+                        "reference": instance.reference,
+                        "field": if field_name == "reference_field" { "Reference" } else { "Value" },
+                        "reason": "large_connector_field_layout",
+                        "expected": { "rendered_rotation": 0, "side": expected_side },
+                        "actual": field,
+                        "rotation_ok": rotation_ok,
+                        "side_ok": side_ok,
+                        "body": body
+                    }));
+                }
+            }
+        }
+
+        let Some(library_symbol) = find_lib_symbol(&lib_symbols, instance) else {
+            continue;
+        };
+        let Some(instance_node) = find_instance_node(&tree, &instance.reference) else {
+            continue;
+        };
+        let body_bounds = SchBounds {
+            left: body["left"].as_f64().unwrap_or(0.0),
+            right: body["right"].as_f64().unwrap_or(0.0),
+            top: body["top"].as_f64().unwrap_or(0.0),
+            bottom: body["bottom"].as_f64().unwrap_or(0.0),
+        };
+        for field_name in ["Reference", "Value"] {
+            let Some((field_bounds, ..)) =
+                property_bounds(instance_node, field_name, instance.rotation)
+            else {
+                continue;
+            };
+            for pin in extract_lib_pins_for_unit(library_symbol, instance.unit) {
+                let (pin_x, pin_y) = pin_endpoint(&pin, instance.pin_transform());
+                let Some(corridor) = edge_pin_corridor(body_bounds, pin_x, pin_y, min_clearance)
+                else {
+                    continue;
+                };
+                if bounds_gap(field_bounds, corridor).1 {
+                    issues.push(json!({
+                        "reference": instance.reference,
+                        "field": field_name,
+                        "reason": "field_overlaps_pin_corridor",
+                        "pin": { "number": pin.number, "name": pin.name, "x": pin_x, "y": pin_y },
+                        "field_bounds": field_bounds.json(),
+                        "corridor": corridor.json(),
+                        "body": body
+                    }));
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "checked_components": checked,
+        "issue_count": issues.len(),
+        "min_clearance": min_clearance,
+        "max_clearance": max_clearance,
+        "issues": issues
+    })))
 }
 
 /// A stable per-schematic directory under the system temp dir.
@@ -3608,6 +4180,141 @@ mod tests {
             detail.contains("pin 2") && detail.contains("removed"),
             "{detail}"
         );
+    }
+}
+
+#[cfg(test)]
+mod symbol_bounds_tests {
+    use super::{
+        bounds_gap, edge_pin_corridor, rendered_field_rotation, symbol_bounds_result, tools,
+        transformed_body_bounds, SchBounds,
+    };
+    use konnect_sexp::{parse_sexp, schematic::SymbolInstance};
+
+    #[test]
+    fn field_geometry_tools_are_registered_as_read_only_queries() {
+        let tools = tools();
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name == "get_schematic_symbol_bounds"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name == "check_schematic_field_spacing"));
+    }
+
+    #[test]
+    fn field_rotation_is_resolved_in_symbol_frame() {
+        assert_eq!(rendered_field_rotation(90.0, 0.0), 90.0);
+        assert_eq!(rendered_field_rotation(90.0, 90.0), 0.0);
+        assert_eq!(rendered_field_rotation(0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn body_bounds_exclude_pins_and_other_units() {
+        let symbol = parse_sexp(
+            r#"(symbol "Amplifier_Operational:Example"
+  (symbol "Example_1_1"
+    (rectangle (start -1 -2) (end 1 2))
+    (pin input line (at -5 0 0) (length 4)
+      (name "IN") (number "1")))
+  (symbol "Example_2_1"
+    (rectangle (start -20 -20) (end 20 20))))"#,
+        )
+        .unwrap();
+        let instance = SymbolInstance {
+            reference: "U1".into(),
+            value: "Example".into(),
+            footprint: String::new(),
+            lib_name: None,
+            lib_id: "Amplifier_Operational:Example".into(),
+            x: 10.0,
+            y: 20.0,
+            rotation: 0.0,
+            mirror_x: false,
+            mirror_y: false,
+            uuid: None,
+            unit: 1,
+        };
+
+        let bounds = transformed_body_bounds(&symbol, &instance).unwrap();
+        assert!((bounds.right - bounds.left - 2.0).abs() < 1e-9);
+        assert!((bounds.bottom - bounds.top - 4.0).abs() < 1e-9);
+        assert!(bounds.left > 5.0, "pin endpoint leaked into body bounds");
+    }
+
+    #[test]
+    fn symbol_bounds_result_reports_body_and_visible_fields() {
+        let tree = parse_sexp(
+            r#"(kicad_sch
+  (lib_symbols
+    (symbol "Device:R"
+      (symbol "R_0_1"
+        (rectangle (start -1.016 -2.54) (end 1.016 2.54)))
+      (symbol "R_1_1"
+        (pin passive line (at 0 3.81 270) (length 1.27)
+          (name "") (number "1")))))
+  (symbol
+    (lib_id "Device:R")
+    (at 50 60 0)
+    (unit 1)
+    (property "Reference" "R1" (at 50 56 0)
+      (effects (font (size 1.27 1.27))))
+    (property "Value" "10k" (at 50 64 0)
+      (effects (font (size 1.27 1.27))))))"#,
+        )
+        .unwrap();
+
+        let result = symbol_bounds_result(&tree, "R1").unwrap();
+        assert_eq!(result["reference"], "R1");
+        assert_eq!(result["unit"], 1);
+        assert!((result["body"]["width"].as_f64().unwrap() - 2.032).abs() < 1e-9);
+        assert_eq!(result["reference_field"]["bounds_are_estimated"], true);
+        assert_eq!(result["value_field"]["bounds_are_estimated"], true);
+        assert!(result["field_to_field"]["clearance"].as_f64().is_some());
+    }
+
+    #[test]
+    fn bottom_pin_corridor_runs_from_body_edge_to_endpoint() {
+        let body = SchBounds {
+            left: 10.0,
+            right: 30.0,
+            top: 10.0,
+            bottom: 20.0,
+        };
+        let corridor = edge_pin_corridor(body, 15.0, 25.0, 0.2).unwrap();
+        assert_eq!(corridor.left, 14.8);
+        assert_eq!(corridor.right, 15.2);
+        assert_eq!(corridor.top, 20.0);
+        assert_eq!(corridor.bottom, 25.0);
+    }
+
+    #[test]
+    fn bounds_gap_reports_disjoint_and_overlapping_boxes() {
+        let body = SchBounds {
+            left: 10.0,
+            top: 10.0,
+            right: 20.0,
+            bottom: 20.0,
+        };
+        let separated = SchBounds {
+            left: 21.27,
+            top: 12.0,
+            right: 24.0,
+            bottom: 14.0,
+        };
+        let (gap, overlaps) = bounds_gap(body, separated);
+        assert!(!overlaps);
+        assert!((gap - 1.27).abs() < 1e-9);
+
+        let overlapping = SchBounds {
+            left: 18.0,
+            top: 12.0,
+            right: 24.0,
+            bottom: 14.0,
+        };
+        let (gap, overlaps) = bounds_gap(body, overlapping);
+        assert!(overlaps);
+        assert_eq!(gap, 0.0);
     }
 }
 
