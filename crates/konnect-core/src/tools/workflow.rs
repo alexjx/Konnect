@@ -13,7 +13,7 @@ use crate::tools::sch_components::{
 use crate::tools::{
     invalid_arg, require_str, with_board_ipc_classified, BoardAccess, ToolContext, ToolDef,
 };
-use konnect_ipc::types::{IpcBounds, IpcFootprint, IpcFootprintCourtyard};
+use konnect_ipc::types::{IpcBounds, IpcFootprint, IpcFootprintCourtyard, IpcFootprintPlacement};
 use konnect_sexp::command::SchematicCommand;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -62,6 +62,20 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_get_change_set(args, ctx).await }
         ),
         tool!(
+            "apply_change_set",
+            "Apply a non-stale supported change set once, under a canonical resource lock.",
+            change_set_schema(),
+            |args, ctx| async move { handle_apply_change_set(args, ctx).await }
+        )
+        .with_board_access(BoardAccess::ApplyModeDependent),
+        tool!(
+            "verify_change_set",
+            "Verify an applied resource against its planned result, using the actual file or exact live board document.",
+            change_set_schema(),
+            |args, ctx| async move { handle_verify_change_set(args, ctx).await }
+        )
+        .with_board_access(BoardAccess::ApplyModeDependent),
+        tool!(
             "discard_change_set",
             "Discard a planned change set that has produced no effects.",
             change_set_schema(),
@@ -73,7 +87,9 @@ pub fn tools() -> Vec<ToolDef> {
 fn change_set_schema() -> Value {
     serde_json::json!({
         "type": "object",
-        "properties": { "change_set_id": { "type": "string", "minLength": 1 } },
+        "properties": {
+            "change_set_id": { "type": "string", "minLength": 1, "format": "uuid" }
+        },
         "required": ["change_set_id"],
         "additionalProperties": false
     })
@@ -629,6 +645,26 @@ impl WorkflowStore {
         })
     }
 
+    fn record_gate(&self, id: &str, gate: GateRecord) -> Result<WorkflowRun, WorkflowStoreError> {
+        let mut runs = self.runs.lock().expect("workflow store poisoned");
+        Self::purge_expired(&mut runs, unix_now());
+        let stored = runs
+            .get_mut(id)
+            .ok_or_else(|| WorkflowStoreError::NotFound(id.to_owned()))?;
+        if let Some(existing) = stored
+            .run
+            .plan
+            .validation_baseline
+            .iter_mut()
+            .find(|existing| existing.name == gate.name)
+        {
+            *existing = gate;
+        } else {
+            stored.run.plan.validation_baseline.push(gate);
+        }
+        Ok(stored.run.clone())
+    }
+
     pub fn len(&self) -> usize {
         let mut runs = self.runs.lock().expect("workflow store poisoned");
         Self::purge_expired(&mut runs, unix_now());
@@ -977,6 +1013,845 @@ async fn handle_get_change_set(args: &Value, ctx: &ToolContext) -> anyhow::Resul
         Some(run) => CallToolResult::json(&run),
         None => CallToolResult::error(format!("change set '{id}' was not found or expired")),
     })
+}
+
+fn workflow_error(code: &str, message: impl Into<String>, retryable: bool) -> WorkflowError {
+    WorkflowError {
+        code: code.into(),
+        message: message.into(),
+        retryable,
+    }
+}
+
+fn runtime_gate(name: &str, status: GateStatus, evidence: Value, details: Value) -> GateRecord {
+    GateRecord {
+        name: name.into(),
+        status,
+        evidence,
+        details,
+    }
+}
+
+fn workflow_placements(run: &WorkflowRun) -> anyhow::Result<Vec<IpcFootprintPlacement>> {
+    let mut placements = Vec::with_capacity(run.plan.operations.len());
+    let mut references = HashSet::new();
+    for operation in &run.plan.operations {
+        let WorkflowOperation::TransformFootprint {
+            reference,
+            x,
+            y,
+            rotation,
+        } = operation
+        else {
+            anyhow::bail!("PCB change set contains a non-PCB operation");
+        };
+        if reference.is_empty() || !references.insert(reference.as_str()) {
+            anyhow::bail!("PCB footprint references must be non-empty and unique");
+        }
+        if !x.is_finite() || !y.is_finite() || !rotation.is_finite() {
+            anyhow::bail!("PCB placement for '{reference}' contains a non-finite value");
+        }
+        placements.push(IpcFootprintPlacement {
+            reference: reference.clone(),
+            x: *x,
+            y: *y,
+            rotation: *rotation,
+        });
+    }
+    if placements.is_empty() {
+        anyhow::bail!("PCB change set contains no placements");
+    }
+    Ok(placements)
+}
+
+async fn handle_apply_change_set(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let id = match require_str(args, "change_set_id") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let Some(initial) = ctx.workflow_store.get(&id) else {
+        return Ok(CallToolResult::error(format!(
+            "change set '{id}' was not found or expired"
+        )));
+    };
+    if matches!(
+        initial.lifecycle,
+        LifecycleState::Applied | LifecycleState::Verified
+    ) {
+        return Ok(CallToolResult::json(&initial));
+    }
+    let resource = PathBuf::from(&initial.plan.resource);
+    let resource_lock = match ctx.workflow_store.resource_lock(&resource) {
+        Ok(lock) => lock,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
+    let _guard = resource_lock.lock().await;
+    let transition = match ctx.workflow_store.begin_apply(&id) {
+        Ok(transition) => transition,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
+    if transition.disposition == TransitionDisposition::Idempotent {
+        return Ok(CallToolResult::json(&transition.run));
+    }
+    let run = transition.run;
+    if !run.plan.gates_allow_apply() {
+        let blocking = run
+            .plan
+            .blocking_gates()
+            .map(|gate| gate.name.clone())
+            .collect::<Vec<_>>();
+        let status = run.plan.combined_gate_status();
+        ctx.workflow_store.record_gate(
+            &id,
+            runtime_gate(
+                "apply_preflight",
+                status,
+                serde_json::json!({ "blocking_gates": blocking }),
+                serde_json::json!({ "reason": "planning gates do not permit apply" }),
+            ),
+        )?;
+        let result = ctx.workflow_store.finish_apply(
+            &id,
+            ApplyOutcome::Rejected {
+                error: workflow_error("blocked_gates", "planning gates do not permit apply", false),
+            },
+        )?;
+        return Ok(CallToolResult::json(&result.run));
+    }
+    ctx.workflow_store.record_gate(
+        &id,
+        runtime_gate(
+            "apply_preflight",
+            GateStatus::Pass,
+            serde_json::json!({ "gate_count": run.plan.validation_baseline.len() }),
+            Value::Null,
+        ),
+    )?;
+
+    match run.domain {
+        WorkflowDomain::Schematic => apply_schematic_change_set(&id, run, resource, ctx),
+        WorkflowDomain::Pcb => apply_pcb_change_set(&id, run, resource, ctx).await,
+    }
+}
+
+fn apply_schematic_change_set(
+    id: &str,
+    run: WorkflowRun,
+    resource: PathBuf,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let current = match std::fs::read_to_string(&resource) {
+        Ok(current) => current,
+        Err(error) => {
+            ctx.workflow_store.record_gate(
+                id,
+                runtime_gate(
+                    "apply_revision",
+                    GateStatus::Blocked,
+                    Value::Null,
+                    serde_json::json!({ "error": error.to_string() }),
+                ),
+            )?;
+            let result = ctx.workflow_store.finish_apply(
+                id,
+                ApplyOutcome::Rejected {
+                    error: workflow_error(
+                        "apply_read_failed",
+                        format!("cannot read schematic before apply: {error}"),
+                        true,
+                    ),
+                },
+            )?;
+            return Ok(CallToolResult::json(&result.run));
+        }
+    };
+    let current_sha = sha256(current.as_bytes());
+    if current_sha != run.plan.base_sha256 {
+        ctx.workflow_store.record_gate(
+            id,
+            runtime_gate(
+                "apply_revision",
+                GateStatus::Fail,
+                serde_json::json!({
+                    "expected_sha256": run.plan.base_sha256,
+                    "actual_sha256": current_sha
+                }),
+                Value::Null,
+            ),
+        )?;
+        let result = ctx.workflow_store.finish_apply(
+            id,
+            ApplyOutcome::Stale {
+                error: workflow_error(
+                    "stale_revision",
+                    "schematic changed after planning; no workflow write was performed",
+                    false,
+                ),
+            },
+        )?;
+        return Ok(CallToolResult::json(&result.run));
+    }
+    let Some(expected) = run.plan.expected_diff.clone() else {
+        ctx.workflow_store.record_gate(
+            id,
+            runtime_gate(
+                "apply_effect",
+                GateStatus::Blocked,
+                Value::Null,
+                serde_json::json!({ "reason": "planned schematic has no expected diff" }),
+            ),
+        )?;
+        let result = ctx.workflow_store.finish_apply(
+            id,
+            ApplyOutcome::Rejected {
+                error: workflow_error(
+                    "invalid_plan",
+                    "planned schematic has no expected diff",
+                    false,
+                ),
+            },
+        )?;
+        return Ok(CallToolResult::json(&result.run));
+    };
+    let Some(command) = ctx.workflow_store.schematic_command(id) else {
+        ctx.workflow_store.record_gate(
+            id,
+            runtime_gate(
+                "apply_effect",
+                GateStatus::Blocked,
+                Value::Null,
+                serde_json::json!({ "reason": "immutable schematic command is unavailable" }),
+            ),
+        )?;
+        let result = ctx.workflow_store.finish_apply(
+            id,
+            ApplyOutcome::Rejected {
+                error: workflow_error(
+                    "invalid_plan",
+                    "immutable schematic command is unavailable",
+                    false,
+                ),
+            },
+        )?;
+        return Ok(CallToolResult::json(&result.run));
+    };
+    ctx.workflow_store.record_gate(
+        id,
+        runtime_gate(
+            "apply_revision",
+            GateStatus::Pass,
+            serde_json::json!({ "sha256": current_sha }),
+            Value::Null,
+        ),
+    )?;
+    if let Err(error) = konnect_sexp::commit_command(&resource, &command) {
+        let after_error_sha = std::fs::read(&resource).ok().map(|bytes| sha256(&bytes));
+        let stale = after_error_sha.as_deref() != Some(run.plan.base_sha256.as_str());
+        ctx.workflow_store.record_gate(
+            id,
+            runtime_gate(
+                "apply_effect",
+                GateStatus::Fail,
+                serde_json::json!({ "error": error.to_string() }),
+                Value::Null,
+            ),
+        )?;
+        let outcome = if stale {
+            ApplyOutcome::Stale {
+                error: workflow_error("stale_revision", error.to_string(), false),
+            }
+        } else {
+            ApplyOutcome::Failed {
+                effect_state: EffectState::None,
+                error: workflow_error("apply_failed", error.to_string(), true),
+            }
+        };
+        let result = ctx.workflow_store.finish_apply(id, outcome)?;
+        return Ok(CallToolResult::json(&result.run));
+    }
+    let after = match std::fs::read(&resource) {
+        Ok(after) => after,
+        Err(error) => {
+            ctx.workflow_store.record_gate(
+                id,
+                runtime_gate(
+                    "apply_effect",
+                    GateStatus::Blocked,
+                    Value::Null,
+                    serde_json::json!({ "error": error.to_string() }),
+                ),
+            )?;
+            let result = ctx.workflow_store.finish_apply(
+                id,
+                ApplyOutcome::Failed {
+                    effect_state: EffectState::Unknown,
+                    error: workflow_error(
+                        "partial_apply",
+                        format!("schematic was changed but cannot be read back: {error}"),
+                        false,
+                    ),
+                },
+            )?;
+            return Ok(CallToolResult::json(&result.run));
+        }
+    };
+    let after_sha = sha256(&after);
+    if after_sha != expected.after_sha256 {
+        ctx.workflow_store.record_gate(
+            id,
+            runtime_gate(
+                "apply_effect",
+                GateStatus::Fail,
+                serde_json::json!({
+                    "expected_sha256": expected.after_sha256,
+                    "actual_sha256": after_sha
+                }),
+                serde_json::json!({ "reason": "post-commit readback differs from the plan" }),
+            ),
+        )?;
+        let result = ctx.workflow_store.finish_apply(
+            id,
+            ApplyOutcome::Failed {
+                effect_state: EffectState::PersistedToDisk,
+                error: workflow_error(
+                    "partial_apply",
+                    "schematic post-commit readback differs from the planned revision",
+                    false,
+                ),
+            },
+        )?;
+        return Ok(CallToolResult::json(&result.run));
+    }
+    ctx.workflow_store.record_gate(
+        id,
+        runtime_gate(
+            "apply_effect",
+            GateStatus::Pass,
+            serde_json::json!({ "sha256": after_sha }),
+            Value::Null,
+        ),
+    )?;
+    let result = ctx.workflow_store.finish_apply(
+        id,
+        ApplyOutcome::Applied {
+            effect_state: EffectState::PersistedToDisk,
+            actual_diff: DesignDiff {
+                before_sha256: current_sha,
+                after_sha256: after_sha,
+                changes: expected.changes,
+            },
+        },
+    )?;
+    Ok(CallToolResult::json(&result.run))
+}
+
+enum PcbApplyAttempt {
+    Stale {
+        actual_sha256: String,
+    },
+    Applied {
+        before_sha256: String,
+        after_sha256: String,
+        placements: Vec<IpcFootprintPlacement>,
+    },
+}
+
+async fn apply_pcb_change_set(
+    id: &str,
+    run: WorkflowRun,
+    resource: PathBuf,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let placements = match workflow_placements(&run) {
+        Ok(placements) => placements,
+        Err(error) => {
+            ctx.workflow_store.record_gate(
+                id,
+                runtime_gate(
+                    "apply_effect",
+                    GateStatus::Fail,
+                    Value::Null,
+                    serde_json::json!({ "error": error.to_string() }),
+                ),
+            )?;
+            let result = ctx.workflow_store.finish_apply(
+                id,
+                ApplyOutcome::Rejected {
+                    error: workflow_error("invalid_plan", error.to_string(), false),
+                },
+            )?;
+            return Ok(CallToolResult::json(&result.run));
+        }
+    };
+    let requested = resource.clone();
+    let base_sha256 = run.plan.base_sha256.clone();
+    let mutation = with_board_ipc_classified(ctx, &resource, move |client| {
+        let document = client.find_open_board(&requested)?;
+        let before = client.save_document_to_string_in(document.clone())?;
+        let before_sha256 = sha256(before.as_bytes());
+        if before_sha256 != base_sha256 {
+            return Ok(PcbApplyAttempt::Stale {
+                actual_sha256: before_sha256,
+            });
+        }
+        let placements = client.set_footprint_placements_in(document.clone(), &placements)?;
+        let after = client.save_document_to_string_in(document)?;
+        Ok(PcbApplyAttempt::Applied {
+            before_sha256,
+            after_sha256: sha256(after.as_bytes()),
+            placements,
+        })
+    })
+    .await?;
+    let attempt = match mutation {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            ctx.workflow_store.record_gate(
+                id,
+                runtime_gate(
+                    "apply_revision",
+                    GateStatus::Blocked,
+                    Value::Null,
+                    serde_json::json!({
+                        "reason": "exact live revision could not be proven through the mutation boundary",
+                        "error": error.message()
+                    }),
+                ),
+            )?;
+            ctx.workflow_store.record_gate(
+                id,
+                runtime_gate(
+                    "apply_effect",
+                    GateStatus::Blocked,
+                    Value::Null,
+                    serde_json::json!({ "error": error.message() }),
+                ),
+            )?;
+            let result = ctx.workflow_store.finish_apply(
+                id,
+                ApplyOutcome::Failed {
+                    effect_state: EffectState::Unknown,
+                    error: workflow_error(
+                        "partial_apply",
+                        format!("live PCB apply outcome is unknown: {}", error.message()),
+                        false,
+                    ),
+                },
+            )?;
+            return Ok(CallToolResult::json(&result.run));
+        }
+    };
+    match attempt {
+        PcbApplyAttempt::Stale { actual_sha256 } => {
+            ctx.workflow_store.record_gate(
+                id,
+                runtime_gate(
+                    "apply_revision",
+                    GateStatus::Fail,
+                    serde_json::json!({
+                        "expected_sha256": run.plan.base_sha256,
+                        "actual_sha256": actual_sha256
+                    }),
+                    Value::Null,
+                ),
+            )?;
+            let result = ctx.workflow_store.finish_apply(
+                id,
+                ApplyOutcome::Stale {
+                    error: workflow_error(
+                        "stale_revision",
+                        "live PCB changed after planning; no workflow transaction was opened",
+                        false,
+                    ),
+                },
+            )?;
+            Ok(CallToolResult::json(&result.run))
+        }
+        PcbApplyAttempt::Applied {
+            before_sha256,
+            after_sha256,
+            placements,
+        } => {
+            ctx.workflow_store.record_gate(
+                id,
+                runtime_gate(
+                    "apply_revision",
+                    GateStatus::Pass,
+                    serde_json::json!({ "sha256": before_sha256 }),
+                    Value::Null,
+                ),
+            )?;
+            ctx.workflow_store.record_gate(
+                id,
+                runtime_gate(
+                    "apply_effect",
+                    GateStatus::Pass,
+                    serde_json::json!({
+                        "sha256": after_sha256,
+                        "placements": placements
+                    }),
+                    Value::Null,
+                ),
+            )?;
+            let changes = placements
+                .iter()
+                .map(|placement| {
+                    serde_json::json!({
+                        "kind": "footprint_transformed",
+                        "reference": placement.reference,
+                        "after": placement
+                    })
+                })
+                .collect();
+            let result = ctx.workflow_store.finish_apply(
+                id,
+                ApplyOutcome::Applied {
+                    effect_state: EffectState::LiveDocument,
+                    actual_diff: DesignDiff {
+                        before_sha256,
+                        after_sha256,
+                        changes,
+                    },
+                },
+            )?;
+            Ok(CallToolResult::json(&result.run))
+        }
+    }
+}
+
+async fn handle_verify_change_set(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let id = match require_str(args, "change_set_id") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let Some(initial) = ctx.workflow_store.get(&id) else {
+        return Ok(CallToolResult::error(format!(
+            "change set '{id}' was not found or expired"
+        )));
+    };
+    if initial.lifecycle == LifecycleState::Verified {
+        return Ok(CallToolResult::json(&initial));
+    }
+    let resource = PathBuf::from(&initial.plan.resource);
+    let resource_lock = match ctx.workflow_store.resource_lock(&resource) {
+        Ok(lock) => lock,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
+    let _guard = resource_lock.lock().await;
+    let transition = match ctx.workflow_store.begin_verify(&id) {
+        Ok(transition) => transition,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
+    if transition.disposition == TransitionDisposition::Idempotent {
+        return Ok(CallToolResult::json(&transition.run));
+    }
+    match transition.run.domain {
+        WorkflowDomain::Schematic => {
+            verify_schematic_change_set(&id, transition.run, resource, ctx)
+        }
+        WorkflowDomain::Pcb => verify_pcb_change_set(&id, transition.run, resource, ctx).await,
+    }
+}
+
+fn verify_schematic_change_set(
+    id: &str,
+    run: WorkflowRun,
+    resource: PathBuf,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let expected_sha256 = run
+        .actual_diff
+        .as_ref()
+        .map(|diff| diff.after_sha256.as_str())
+        .or_else(|| {
+            run.plan
+                .expected_diff
+                .as_ref()
+                .map(|diff| diff.after_sha256.as_str())
+        });
+    let content = match std::fs::read_to_string(&resource) {
+        Ok(content) => content,
+        Err(error) => {
+            ctx.workflow_store.record_gate(
+                id,
+                runtime_gate(
+                    "verify_revision",
+                    GateStatus::Blocked,
+                    Value::Null,
+                    serde_json::json!({ "error": error.to_string() }),
+                ),
+            )?;
+            let result = ctx.workflow_store.finish_verify(
+                id,
+                VerificationOutcome::Failed {
+                    effect_state: EffectState::PersistedToDisk,
+                    error: workflow_error(
+                        "verification_failed",
+                        format!("cannot read schematic for verification: {error}"),
+                        true,
+                    ),
+                },
+            )?;
+            return Ok(CallToolResult::json(&result.run));
+        }
+    };
+    let actual_sha256 = sha256(content.as_bytes());
+    let parse_ok = konnect_sexp::parser::parse_sexp(&content)
+        .map(|root| root.head() == Some("kicad_sch"))
+        .unwrap_or(false);
+    let revision_ok = expected_sha256 == Some(actual_sha256.as_str());
+    ctx.workflow_store.record_gate(
+        id,
+        runtime_gate(
+            "verify_revision",
+            if revision_ok {
+                GateStatus::Pass
+            } else {
+                GateStatus::Fail
+            },
+            serde_json::json!({
+                "expected_sha256": expected_sha256,
+                "actual_sha256": actual_sha256
+            }),
+            Value::Null,
+        ),
+    )?;
+    ctx.workflow_store.record_gate(
+        id,
+        runtime_gate(
+            "verify_effect",
+            if parse_ok && revision_ok {
+                GateStatus::Pass
+            } else {
+                GateStatus::Fail
+            },
+            serde_json::json!({ "parseable": parse_ok, "revision_matches": revision_ok }),
+            Value::Null,
+        ),
+    )?;
+    let outcome = if parse_ok && revision_ok {
+        VerificationOutcome::Verified {
+            effect_state: EffectState::PersistedToDisk,
+        }
+    } else {
+        VerificationOutcome::Failed {
+            effect_state: EffectState::PersistedToDisk,
+            error: workflow_error(
+                "verification_failed",
+                if !parse_ok {
+                    "schematic is not a parseable kicad_sch document".to_string()
+                } else {
+                    format!(
+                        "schematic revision mismatch: expected {}, found {actual_sha256}",
+                        expected_sha256.unwrap_or("<none>")
+                    )
+                },
+                false,
+            ),
+        }
+    };
+    let result = ctx.workflow_store.finish_verify(id, outcome)?;
+    Ok(CallToolResult::json(&result.run))
+}
+
+struct PcbVerificationReadback {
+    source_sha256: String,
+    placements: Vec<IpcFootprintPlacement>,
+}
+
+async fn verify_pcb_change_set(
+    id: &str,
+    run: WorkflowRun,
+    resource: PathBuf,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let expected_placements = workflow_placements(&run)?;
+    let expected_sha256 = run
+        .actual_diff
+        .as_ref()
+        .map(|diff| diff.after_sha256.clone());
+    let requested = resource.clone();
+    let expected_for_ipc = expected_placements.clone();
+    let readback = with_board_ipc_classified(ctx, &resource, move |client| {
+        let document = client.find_open_board(&requested)?;
+        let source = client.save_document_to_string_in(document.clone())?;
+        let footprints = client.list_footprints_in(document.clone())?;
+        let mut by_reference = HashMap::<String, Vec<IpcFootprint>>::new();
+        for footprint in footprints {
+            by_reference
+                .entry(footprint.reference.clone())
+                .or_default()
+                .push(footprint);
+        }
+        let mut observed = Vec::with_capacity(expected_for_ipc.len());
+        for expected in &expected_for_ipc {
+            let matches = by_reference.remove(&expected.reference).unwrap_or_default();
+            if matches.len() != 1 {
+                anyhow::bail!(
+                    "footprint '{}' resolved {} time(s) during verification",
+                    expected.reference,
+                    matches.len()
+                );
+            }
+            let footprint = &matches[0];
+            observed.push(IpcFootprintPlacement {
+                reference: footprint.reference.clone(),
+                x: footprint.position.x,
+                y: footprint.position.y,
+                rotation: footprint.rotation,
+            });
+        }
+        Ok((
+            document,
+            PcbVerificationReadback {
+                source_sha256: sha256(source.as_bytes()),
+                placements: observed,
+            },
+        ))
+    })
+    .await?;
+    let (document, readback) = match readback {
+        Ok(readback) => readback,
+        Err(error) => {
+            ctx.workflow_store.record_gate(
+                id,
+                runtime_gate(
+                    "verify_effect",
+                    GateStatus::Blocked,
+                    Value::Null,
+                    serde_json::json!({ "error": error.message() }),
+                ),
+            )?;
+            let result = ctx.workflow_store.finish_verify(
+                id,
+                VerificationOutcome::Failed {
+                    effect_state: EffectState::LiveDocument,
+                    error: workflow_error(
+                        "verification_failed",
+                        format!(
+                            "cannot read exact live PCB for verification: {}",
+                            error.message()
+                        ),
+                        true,
+                    ),
+                },
+            )?;
+            return Ok(CallToolResult::json(&result.run));
+        }
+    };
+    let revision_ok = expected_sha256.as_deref() == Some(readback.source_sha256.as_str());
+    let placements_ok =
+        expected_placements
+            .iter()
+            .zip(&readback.placements)
+            .all(|(expected, actual)| {
+                expected.reference == actual.reference
+                    && (expected.x - actual.x).abs() <= 0.000_001
+                    && (expected.y - actual.y).abs() <= 0.000_001
+                    && (expected.rotation - actual.rotation).abs() <= 0.000_001
+            });
+    ctx.workflow_store.record_gate(
+        id,
+        runtime_gate(
+            "verify_revision",
+            if revision_ok {
+                GateStatus::Pass
+            } else {
+                GateStatus::Fail
+            },
+            serde_json::json!({
+                "expected_sha256": expected_sha256,
+                "actual_sha256": readback.source_sha256
+            }),
+            Value::Null,
+        ),
+    )?;
+    ctx.workflow_store.record_gate(
+        id,
+        runtime_gate(
+            "verify_effect",
+            if placements_ok {
+                GateStatus::Pass
+            } else {
+                GateStatus::Fail
+            },
+            serde_json::json!({
+                "expected": expected_placements,
+                "actual": readback.placements
+            }),
+            Value::Null,
+        ),
+    )?;
+    if !revision_ok || !placements_ok {
+        let result = ctx.workflow_store.finish_verify(
+            id,
+            VerificationOutcome::Failed {
+                effect_state: EffectState::LiveDocument,
+                error: workflow_error(
+                    "verification_failed",
+                    if !revision_ok {
+                        "live PCB revision changed after apply"
+                    } else {
+                        "one or more live footprint placements differ from the plan"
+                    },
+                    false,
+                ),
+            },
+        )?;
+        return Ok(CallToolResult::json(&result.run));
+    }
+
+    let save =
+        with_board_ipc_classified(ctx, &resource, move |client| client.save_board_in(document))
+            .await?;
+    if let Err(error) = save {
+        ctx.workflow_store.record_gate(
+            id,
+            runtime_gate(
+                "verify_save",
+                GateStatus::Blocked,
+                Value::Null,
+                serde_json::json!({ "error": error.message() }),
+            ),
+        )?;
+        let result = ctx.workflow_store.finish_verify(
+            id,
+            VerificationOutcome::Failed {
+                effect_state: EffectState::Unknown,
+                error: workflow_error(
+                    "save_failed",
+                    format!(
+                        "PCB verified but save outcome is unknown: {}",
+                        error.message()
+                    ),
+                    false,
+                ),
+            },
+        )?;
+        return Ok(CallToolResult::json(&result.run));
+    }
+    ctx.workflow_store.record_gate(
+        id,
+        runtime_gate(
+            "verify_save",
+            GateStatus::Pass,
+            serde_json::json!({ "path": resource }),
+            Value::Null,
+        ),
+    )?;
+    let result = ctx.workflow_store.finish_verify(
+        id,
+        VerificationOutcome::Verified {
+            effect_state: EffectState::PersistedToDisk,
+        },
+    )?;
+    Ok(CallToolResult::json(&result.run))
 }
 
 async fn handle_discard_change_set(
@@ -1479,6 +2354,216 @@ mod tests {
         }
     }
 
+    fn workflow_footprint_item(reference: &str, x: f64, y: f64, rotation: f64) -> prost_types::Any {
+        konnect_ipc::builders::pack_any(
+            &kiapi::board::types::FootprintInstance {
+                id: Some(kiapi::common::types::Kiid {
+                    value: format!("uuid-{reference}"),
+                }),
+                position: Some(konnect_ipc::builders::vec2(x, y)),
+                orientation: Some(kiapi::common::types::Angle {
+                    value_degrees: rotation,
+                }),
+                reference_field: Some(kiapi::board::types::Field {
+                    name: "Reference".into(),
+                    text: Some(kiapi::board::types::BoardText {
+                        text: Some(kiapi::common::types::Text {
+                            text: reference.into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                definition: Some(kiapi::board::types::Footprint::default()),
+                ..Default::default()
+            },
+            "kiapi.board.types.FootprintInstance",
+        )
+    }
+
+    fn spawn_workflow_board(
+        board: &Path,
+        source: Arc<Mutex<String>>,
+        items: Arc<Mutex<Vec<prost_types::Any>>>,
+        commands: Arc<Mutex<Vec<String>>>,
+    ) -> String {
+        use nng::options::Options;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("tcp://127.0.0.1:{port}");
+        let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(10)))
+            .unwrap();
+        socket.listen(&url).unwrap();
+        let board_name = board.display().to_string();
+        std::thread::spawn(move || {
+            while let Ok(message) = socket.recv() {
+                let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
+                let message = request.message.expect("workflow IPC command");
+                let response_message = if message.type_url.ends_with("GetOpenDocuments") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![kiapi::common::types::DocumentSpecifier {
+                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                                project: None,
+                                identifier: Some(
+                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                        board_name.clone(),
+                                    ),
+                                ),
+                            }],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ))
+                } else if message.type_url.ends_with("SaveDocumentToString") {
+                    let command = kiapi::common::commands::SaveDocumentToString::decode(
+                        message.value.as_slice(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        command
+                            .document
+                            .as_ref()
+                            .and_then(|document| document.identifier.as_ref()),
+                        Some(
+                            &kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                board_name.clone()
+                            )
+                        )
+                    );
+                    commands.lock().unwrap().push("snapshot".into());
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            document: command.document,
+                            contents: source.lock().unwrap().clone(),
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    ))
+                } else if message.type_url.ends_with("GetItems") {
+                    let command =
+                        kiapi::common::commands::GetItems::decode(message.value.as_slice())
+                            .unwrap();
+                    assert_eq!(
+                        command
+                            .header
+                            .as_ref()
+                            .and_then(|header| header.document.as_ref())
+                            .and_then(|document| document.identifier.as_ref()),
+                        Some(
+                            &kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                board_name.clone()
+                            )
+                        )
+                    );
+                    commands.lock().unwrap().push("get".into());
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: items.lock().unwrap().clone(),
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ))
+                } else if message.type_url.ends_with("BeginCommit") {
+                    commands.lock().unwrap().push("begin".into());
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::BeginCommitResponse {
+                            id: Some(kiapi::common::types::Kiid {
+                                value: "workflow-commit".into(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    ))
+                } else if message.type_url.ends_with("UpdateItems") {
+                    let command =
+                        kiapi::common::commands::UpdateItems::decode(message.value.as_slice())
+                            .unwrap();
+                    assert_eq!(
+                        command
+                            .header
+                            .as_ref()
+                            .and_then(|header| header.document.as_ref())
+                            .and_then(|document| document.identifier.as_ref()),
+                        Some(
+                            &kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                board_name.clone()
+                            )
+                        )
+                    );
+                    assert_eq!(command.items.len(), 1);
+                    *items.lock().unwrap() = command.items.clone();
+                    *source.lock().unwrap() = "(kicad_pcb (placement U1 10 11 20))\n".into();
+                    commands.lock().unwrap().push("update".into());
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::UpdateItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            updated_items: vec![kiapi::common::commands::ItemUpdateResult {
+                                status: Some(kiapi::common::commands::ItemStatus {
+                                    code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                    error_message: String::new(),
+                                }),
+                                item: None,
+                            }],
+                        },
+                        "kiapi.common.commands.UpdateItemsResponse",
+                    ))
+                } else if message.type_url.ends_with("EndCommit") {
+                    let command =
+                        kiapi::common::commands::EndCommit::decode(message.value.as_slice())
+                            .unwrap();
+                    assert_eq!(
+                        command.action(),
+                        kiapi::common::commands::CommitAction::CmaCommit
+                    );
+                    commands.lock().unwrap().push("push".into());
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    ))
+                } else if message.type_url.ends_with("SaveDocument") {
+                    let command =
+                        kiapi::common::commands::SaveDocument::decode(message.value.as_slice())
+                            .unwrap();
+                    assert_eq!(
+                        command
+                            .document
+                            .as_ref()
+                            .and_then(|document| document.identifier.as_ref()),
+                        Some(
+                            &kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                board_name.clone()
+                            )
+                        )
+                    );
+                    commands.lock().unwrap().push("save".into());
+                    None
+                } else {
+                    panic!("unexpected workflow command {}", message.type_url)
+                };
+                let response = kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: response_message,
+                };
+                if socket
+                    .send(nng::Message::from(response.encode_to_vec().as_slice()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        url
+    }
+
     fn gate<'a>(run: &'a WorkflowRun, name: &str) -> &'a GateRecord {
         run.plan
             .validation_baseline
@@ -1512,6 +2597,8 @@ mod tests {
         assert_eq!(access["plan_schematic_edit"], BoardAccess::None);
         assert_eq!(access["plan_pcb_edit"], BoardAccess::LiveOnly);
         assert_eq!(access["get_change_set"], BoardAccess::None);
+        assert_eq!(access["apply_change_set"], BoardAccess::ApplyModeDependent);
+        assert_eq!(access["verify_change_set"], BoardAccess::ApplyModeDependent);
         assert_eq!(access["discard_change_set"], BoardAccess::None);
         for definition in definitions {
             assert!(definition.input_schema["required"]
@@ -1561,6 +2648,210 @@ mod tests {
         assert!(run.plan.gates_allow_apply());
         assert!(context.workflow_store.schematic_command(&run.id).is_some());
         assert!(value.get("command").is_none());
+    }
+
+    #[tokio::test]
+    async fn schematic_apply_and_verify_use_the_retained_command_and_are_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let schematic = directory.path().join("design.kicad_sch");
+        std::fs::write(&schematic, SCHEMATIC).unwrap();
+        let context = context();
+        let planned = handle_plan_schematic_edit(
+            &serde_json::json!({
+                "schematic": schematic,
+                "operations": [{
+                    "kind": "edit_components",
+                    "edits": [{ "reference": "R1", "value": "47k" }]
+                }]
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let id = body(&planned)["id"].as_str().unwrap().to_string();
+
+        let applied =
+            handle_apply_change_set(&serde_json::json!({ "change_set_id": id }), &context)
+                .await
+                .unwrap();
+        let applied: WorkflowRun = serde_json::from_value(body(&applied)).unwrap();
+        assert_eq!(applied.lifecycle, LifecycleState::Applied);
+        assert_eq!(applied.effect_state, EffectState::PersistedToDisk);
+        assert_eq!(gate(&applied, "apply_preflight").status, GateStatus::Pass);
+        assert_eq!(gate(&applied, "apply_revision").status, GateStatus::Pass);
+        assert_eq!(gate(&applied, "apply_effect").status, GateStatus::Pass);
+        let after_apply = std::fs::read(&schematic).unwrap();
+        assert!(String::from_utf8_lossy(&after_apply).contains("47k"));
+
+        let retry = handle_apply_change_set(&serde_json::json!({ "change_set_id": id }), &context)
+            .await
+            .unwrap();
+        assert_eq!(body(&retry)["lifecycle"], "applied");
+        assert_eq!(std::fs::read(&schematic).unwrap(), after_apply);
+
+        let verified =
+            handle_verify_change_set(&serde_json::json!({ "change_set_id": id }), &context)
+                .await
+                .unwrap();
+        let verified: WorkflowRun = serde_json::from_value(body(&verified)).unwrap();
+        assert_eq!(verified.lifecycle, LifecycleState::Verified);
+        assert_eq!(verified.effect_state, EffectState::PersistedToDisk);
+        assert_eq!(gate(&verified, "verify_revision").status, GateStatus::Pass);
+        assert_eq!(gate(&verified, "verify_effect").status, GateStatus::Pass);
+
+        let retry = handle_verify_change_set(&serde_json::json!({ "change_set_id": id }), &context)
+            .await
+            .unwrap();
+        assert_eq!(body(&retry)["lifecycle"], "verified");
+    }
+
+    #[tokio::test]
+    async fn schematic_apply_fails_closed_on_blocked_gates_or_a_stale_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let schematic = directory.path().join("design.kicad_sch");
+        std::fs::write(&schematic, SCHEMATIC).unwrap();
+        let context = context();
+
+        let blocked = handle_plan_schematic_edit(
+            &serde_json::json!({
+                "schematic": schematic,
+                "operations": [{
+                    "kind": "edit_components",
+                    "edits": [{ "reference": "MISSING", "value": "47k" }]
+                }]
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let blocked_id = body(&blocked)["id"].as_str().unwrap().to_string();
+        let before = std::fs::read(&schematic).unwrap();
+        let blocked = handle_apply_change_set(
+            &serde_json::json!({ "change_set_id": blocked_id }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let blocked: WorkflowRun = serde_json::from_value(body(&blocked)).unwrap();
+        assert_eq!(blocked.lifecycle, LifecycleState::Rejected);
+        assert_eq!(blocked.effect_state, EffectState::None);
+        assert!(gate(&blocked, "apply_preflight").is_blocking());
+        assert_eq!(std::fs::read(&schematic).unwrap(), before);
+
+        let planned = handle_plan_schematic_edit(
+            &serde_json::json!({
+                "schematic": schematic,
+                "operations": [{
+                    "kind": "edit_components",
+                    "edits": [{ "reference": "R1", "value": "47k" }]
+                }]
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let id = body(&planned)["id"].as_str().unwrap().to_string();
+        let external = format!("{SCHEMATIC}\n");
+        std::fs::write(&schematic, &external).unwrap();
+        let stale = handle_apply_change_set(&serde_json::json!({ "change_set_id": id }), &context)
+            .await
+            .unwrap();
+        let stale: WorkflowRun = serde_json::from_value(body(&stale)).unwrap();
+        assert_eq!(stale.lifecycle, LifecycleState::Stale);
+        assert_eq!(stale.effect_state, EffectState::None);
+        assert_eq!(gate(&stale, "apply_revision").status, GateStatus::Fail);
+        assert_eq!(std::fs::read_to_string(&schematic).unwrap(), external);
+    }
+
+    #[tokio::test]
+    async fn pcb_apply_and_verify_use_the_exact_live_document_and_one_full_placement_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb)\n").unwrap();
+        let source = Arc::new(Mutex::new("(kicad_pcb)\n".to_string()));
+        let items = Arc::new(Mutex::new(vec![workflow_footprint_item(
+            "U1", 1.0, 2.0, 0.0,
+        )]));
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let address = spawn_workflow_board(
+            &board,
+            Arc::clone(&source),
+            Arc::clone(&items),
+            Arc::clone(&commands),
+        );
+        let context = context_with_ipc(address);
+        let mut run = WorkflowRun::planned(
+            "pcb-apply",
+            WorkflowDomain::Pcb,
+            board.display().to_string(),
+            sha256(b"(kicad_pcb)\n"),
+            vec![WorkflowOperation::TransformFootprint {
+                reference: "U1".into(),
+                x: 10.0,
+                y: 11.0,
+                rotation: 20.0,
+            }],
+        );
+        run.plan.validation_baseline.push(pass_gate(
+            "revision",
+            serde_json::json!({ "sha256": run.plan.base_sha256 }),
+        ));
+        context.workflow_store.insert(run, None).unwrap();
+
+        let applied = handle_apply_change_set(
+            &serde_json::json!({ "change_set_id": "pcb-apply" }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let applied: WorkflowRun = serde_json::from_value(body(&applied)).unwrap();
+        assert_eq!(applied.lifecycle, LifecycleState::Applied);
+        assert_eq!(applied.effect_state, EffectState::LiveDocument);
+        assert_eq!(
+            commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|command| command.as_str() == "begin")
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|command| command.as_str() == "update")
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|command| command.as_str() == "push")
+                .count(),
+            1
+        );
+
+        let verified = handle_verify_change_set(
+            &serde_json::json!({ "change_set_id": "pcb-apply" }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let verified: WorkflowRun = serde_json::from_value(body(&verified)).unwrap();
+        assert_eq!(verified.lifecycle, LifecycleState::Verified);
+        assert_eq!(verified.effect_state, EffectState::PersistedToDisk);
+        assert_eq!(gate(&verified, "verify_revision").status, GateStatus::Pass);
+        assert_eq!(gate(&verified, "verify_effect").status, GateStatus::Pass);
+        assert_eq!(gate(&verified, "verify_save").status, GateStatus::Pass);
+        assert!(commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| command == "save"));
     }
 
     #[tokio::test]
