@@ -19,10 +19,14 @@ use konnect_sexp::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, parse_subsymbol_unit,
         pin_endpoint, pin_outward_direction, read_schematic,
     },
-    writer::{apply_edits, read_consistent, write_atomic_if_unchanged, write_new_atomic, SexpEdit},
+    writer::{
+        apply_edits, find_direct_child_blocks, read_consistent, write_atomic_if_unchanged,
+        write_new_atomic, SexpEdit,
+    },
     ItemId, SchematicCommand, SexpNode,
 };
 use serde_json::json;
+use std::collections::{BTreeMap, HashSet};
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -113,7 +117,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_schematic_component",
-            "Update fields (Reference, Value, Footprint, custom properties) consistently across every placed unit of a component.",
+            "Update fields (Reference, Value, Footprint, BOM/DNP state, custom properties) consistently across every placed unit of a component.",
             json!({
                 "type": "object",
                 "properties": {
@@ -123,6 +127,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "value": { "type": "string", "description": "New value (optional)" },
                     "footprint": { "type": "string", "description": "New footprint (optional)" },
                     "datasheet": { "type": "string", "description": "New datasheet URL (optional)" },
+                    "in_bom": { "type": "boolean", "description": "Include the component in the BOM" },
+                    "dnp": { "type": "boolean", "description": "Mark the component do-not-populate" },
                     "fields": {
                         "type": "object",
                         "description": "Additional property fields to set as key:value pairs"
@@ -763,7 +769,32 @@ async fn handle_delete_schematic_component(
 /// with different values, and for Reference it would skip the instances-path
 /// rewrite entirely — a rename that the netlist ignores (#157).
 fn is_reserved_property(name: &str) -> bool {
-    matches!(name, "Reference" | "Value" | "Footprint" | "Datasheet")
+    matches!(
+        name,
+        "Reference" | "Value" | "Footprint" | "Datasheet" | "in_bom" | "dnp"
+    )
+}
+
+/// One pure, workflow-safe component edit. Every requested value is applied to
+/// every placed unit carrying `reference`, or the complete plan is rejected.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SchematicComponentEdit {
+    pub reference: String,
+    pub new_reference: Option<String>,
+    pub value: Option<String>,
+    pub footprint: Option<String>,
+    pub datasheet: Option<String>,
+    pub in_bom: Option<bool>,
+    pub dnp: Option<bool>,
+    pub fields: BTreeMap<String, String>,
+}
+
+/// Candidate text plus the exact immutable command that can later persist it.
+#[derive(Debug)]
+pub(crate) struct PlannedSchematicComponentEdits {
+    pub candidate: String,
+    pub command: SchematicCommand,
+    pub changes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -947,6 +978,198 @@ fn rewrite_instance_references(
     Ok((apply_edits(content.to_string(), edits), count))
 }
 
+/// Set a direct scalar child such as `(in_bom yes)` on every placed unit.
+fn set_symbol_scalar_value(
+    content: &str,
+    reference: &str,
+    field: &str,
+    value: bool,
+) -> anyhow::Result<(String, usize)> {
+    let blocks = find_all_symbol_instance_blocks(content, reference);
+    if blocks.is_empty() {
+        anyhow::bail!("symbol '{reference}' not found in this schematic");
+    }
+    let replacement = format!("({field} {})", if value { "yes" } else { "no" });
+    let mut edits = Vec::with_capacity(blocks.len());
+    for (start, end) in blocks {
+        let block = &content[start..end];
+        let matches: Vec<_> = find_direct_child_blocks(block, "symbol")
+            .into_iter()
+            .filter(|(child_start, child_end)| {
+                parse_sexp(&block[*child_start..*child_end])
+                    .ok()
+                    .is_some_and(|child| child.head() == Some(field))
+            })
+            .collect();
+        match matches.as_slice() {
+            [(child_start, child_end)] => edits.push(SexpEdit::replace(
+                start + child_start,
+                start + child_end,
+                replacement.clone(),
+            )),
+            [] => anyhow::bail!(
+                "'{reference}' is missing the shared '{field}' scalar on one of its placed units"
+            ),
+            _ => anyhow::bail!(
+                "'{reference}' has duplicate '{field}' scalars on one of its placed units"
+            ),
+        }
+    }
+    let count = edits.len();
+    Ok((apply_edits(content.to_string(), edits), count))
+}
+
+/// Build a zero-write component-edit candidate and a revision-aware command.
+///
+/// The command deliberately requires the complete document revision to remain
+/// unchanged: workflow validation is a document-wide promise, so rebasing it
+/// over an unrelated edit would invalidate the reviewed candidate.
+pub(crate) fn plan_schematic_component_edits(
+    source: &str,
+    requested: &[SchematicComponentEdit],
+) -> anyhow::Result<PlannedSchematicComponentEdits> {
+    if requested.is_empty() {
+        anyhow::bail!("component edit plan contains no edits");
+    }
+    let mut references = HashSet::new();
+    for edit in requested {
+        if edit.reference.trim().is_empty() {
+            anyhow::bail!("component edit reference cannot be empty");
+        }
+        if !references.insert(edit.reference.as_str()) {
+            anyhow::bail!(
+                "component edit plan contains duplicate reference '{}'",
+                edit.reference
+            );
+        }
+        for field in edit.fields.keys() {
+            if is_reserved_property(field) {
+                anyhow::bail!(
+                    "reserved property '{field}' must use its typed component-edit field"
+                );
+            }
+        }
+        if edit.new_reference.is_none()
+            && edit.value.is_none()
+            && edit.footprint.is_none()
+            && edit.datasheet.is_none()
+            && edit.in_bom.is_none()
+            && edit.dnp.is_none()
+            && edit.fields.is_empty()
+        {
+            anyhow::bail!(
+                "component edit for '{}' contains no changes",
+                edit.reference
+            );
+        }
+    }
+
+    // Resolve target identities before touching the candidate. Without this,
+    // a batch such as R1 -> R2 followed by an edit of R2 would silently apply
+    // the second edit to both components after the rename.
+    let mut target_references = HashSet::new();
+    for edit in requested {
+        let target = edit.new_reference.as_deref().unwrap_or(&edit.reference);
+        if !target_references.insert(target) {
+            anyhow::bail!(
+                "component edit plan produces duplicate reference '{}'",
+                target
+            );
+        }
+        if target != edit.reference
+            && (references.contains(target)
+                || !find_all_symbol_instance_blocks(source, target).is_empty())
+        {
+            anyhow::bail!(
+                "cannot rename '{}' to '{}': target reference already exists",
+                edit.reference,
+                target
+            );
+        }
+    }
+
+    let mut item_ids = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for edit in requested {
+        for id in symbol_item_ids(source, &edit.reference)? {
+            if seen_ids.insert(id.as_str().to_owned()) {
+                item_ids.push(id);
+            }
+        }
+    }
+
+    let mut candidate = source.to_string();
+    let mut changes = Vec::new();
+    for edit in requested {
+        let mut active_reference = edit.reference.as_str();
+        if let Some(new_reference) = edit.new_reference.as_deref() {
+            let (updated, counts) = set_property_value(
+                &candidate,
+                active_reference,
+                "Reference",
+                new_reference,
+                false,
+            )
+            .map_err(anyhow::Error::msg)?;
+            candidate = updated;
+            let (updated, instance_count) =
+                rewrite_instance_references(&candidate, active_reference, new_reference)
+                    .map_err(anyhow::Error::msg)?;
+            candidate = updated;
+            changes.push(format!(
+                "Reference → {new_reference} ({} unit(s), {instance_count} instance path(s))",
+                counts.updated
+            ));
+            active_reference = new_reference;
+        }
+
+        for (field, value) in [
+            ("Value", edit.value.as_deref()),
+            ("Footprint", edit.footprint.as_deref()),
+            ("Datasheet", edit.datasheet.as_deref()),
+        ] {
+            let Some(value) = value else { continue };
+            let (updated, counts) =
+                set_property_value(&candidate, active_reference, field, value, false)
+                    .map_err(anyhow::Error::msg)?;
+            candidate = updated;
+            changes.push(format!("{field} → {value} ({} unit(s))", counts.updated));
+        }
+
+        for (field, value) in [("in_bom", edit.in_bom), ("dnp", edit.dnp)] {
+            let Some(value) = value else { continue };
+            let (updated, units) =
+                set_symbol_scalar_value(&candidate, active_reference, field, value)?;
+            candidate = updated;
+            changes.push(format!("{field} → {value} ({units} unit(s))"));
+        }
+
+        for (field, value) in &edit.fields {
+            let (updated, counts) =
+                set_property_value(&candidate, active_reference, field, value, true)
+                    .map_err(anyhow::Error::msg)?;
+            candidate = updated;
+            changes.push(format!(
+                "{field} → {value} ({} updated, {} added)",
+                counts.updated, counts.added
+            ));
+        }
+    }
+
+    let command = SchematicCommand::replace_items_from_document(
+        source,
+        &candidate,
+        item_ids,
+        "Edit schematic components",
+    )?
+    .requiring_unchanged_document();
+    Ok(PlannedSchematicComponentEdits {
+        candidate,
+        command,
+        changes,
+    })
+}
+
 async fn handle_edit_schematic_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -957,121 +1180,69 @@ async fn handle_edit_schematic_component(
         Err(e) => return Ok(e),
     };
 
-    let mut content = read_consistent(&sch_path)?;
-    let expected = content.clone();
-    let mut changed = Vec::new();
-
-    let mut errors: Vec<String> = Vec::new();
-    // A macro rather than a closure: the body also needs `changed`/`errors`
-    // between calls (the instances rewrite below, and the custom-field loop),
-    // and a closure capturing them mutably would lock both for its lifetime.
-    macro_rules! apply {
-        ($field:expr, $new_val:expr) => {
-            match set_property_value(&content, &reference, $field, $new_val, false) {
-                Ok((updated, counts)) => {
-                    content = updated;
-                    changed.push(format!(
-                        "{} → {} ({} unit(s))",
-                        $field, $new_val, counts.updated
-                    ));
-                }
-                Err(why) => errors.push(format!("{}: {}", $field, why)),
+    let fields = match args["fields"].as_object() {
+        Some(fields) => {
+            let mut parsed = BTreeMap::new();
+            for (name, value) in fields {
+                let Some(value) = value.as_str() else {
+                    return Ok(CallToolResult::error(format!(
+                        "{name}: field values must be strings"
+                    )));
+                };
+                parsed.insert(name.clone(), value.to_string());
             }
-        };
-    }
-
-    if let Some(new_ref) = opt_str(args, "new_reference") {
-        apply!("Reference", new_ref);
-        // A designator lives in TWO places. The (property "Reference" …) is
-        // what renders; the (reference …) inside (instances …) is what KiCad
-        // reads when it builds the netlist. Rewriting only the property leaves
-        // the netlist on the old designator, so the rename appears to work in
-        // eeschema and is ignored everywhere it matters (#157).
-        match rewrite_instance_references(&content, &reference, new_ref) {
-            Ok((updated, count)) => {
-                content = updated;
-                changed.push(format!("instances reference → {new_ref} ({count})"));
-            }
-            Err(why) => errors.push(format!("instances reference: {why}")),
+            parsed
         }
-    }
-    if let Some(val) = opt_str(args, "value") {
-        apply!("Value", val);
-    }
-    if let Some(fp) = opt_str(args, "footprint") {
-        apply!("Footprint", fp);
-    }
-    if let Some(ds) = opt_str(args, "datasheet") {
-        apply!("Datasheet", ds);
-    }
-
-    // `fields` has been in this tool's schema since it shipped and the handler
-    // never read it, so custom properties were dropped and the call still
-    // reported success (#158). An existing property is updated in place; a new
-    // one is appended to the symbol block.
-    let custom_fields = args["fields"].as_object();
-    if let Some(fields) = custom_fields {
-        for (name, value) in fields {
-            let Some(value) = value.as_str() else {
-                errors.push(format!("{name}: field values must be strings"));
-                continue;
-            };
-            if is_reserved_property(name) {
-                errors.push(format!(
-                    "{name}: set this through the '{}' parameter, not 'fields'",
-                    name.to_ascii_lowercase()
-                ));
-                continue;
-            }
-            match set_property_value(&content, &reference, name, value, true) {
-                Ok((updated, counts)) => {
-                    content = updated;
-                    changed.push(format!(
-                        "{name} → {value} ({} updated, {} added)",
-                        counts.updated, counts.added
-                    ));
-                }
-                Err(why) => errors.push(format!("{name}: {why}")),
-            }
+        None => BTreeMap::new(),
+    };
+    let boolean = |name: &str| -> Result<Option<bool>, CallToolResult> {
+        match args.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => value.as_bool().map(Some).ok_or_else(|| {
+                CallToolResult::error(format!("'{name}' must be a boolean when supplied"))
+            }),
         }
+    };
+    let edit = SchematicComponentEdit {
+        reference: reference.clone(),
+        new_reference: opt_str(args, "new_reference").map(str::to_owned),
+        value: opt_str(args, "value").map(str::to_owned),
+        footprint: opt_str(args, "footprint").map(str::to_owned),
+        datasheet: opt_str(args, "datasheet").map(str::to_owned),
+        in_bom: match boolean("in_bom") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        },
+        dnp: match boolean("dnp") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        },
+        fields,
+    };
+    if edit
+        == (SchematicComponentEdit {
+            reference: reference.clone(),
+            ..Default::default()
+        })
+    {
+        return Ok(CallToolResult::json(&json!({
+            "reference": reference,
+            "changes": []
+        })));
     }
 
-    // A request that changed nothing is a failure, not a success — silently
-    // reporting `"changes": []` is what let the tab-indentation bug hide, and
-    // what made a fields-only call report success while dropping every field
-    // (#158): with `fields` unread, both `changed` and `errors` came back
-    // empty and this guard never fired.
-    if changed.is_empty() && custom_fields.is_some_and(|f| !f.is_empty()) && errors.is_empty() {
-        return Ok(CallToolResult::error(format!(
-            "No fields were updated on '{reference}'"
-        )));
-    }
-    if changed.is_empty() && !errors.is_empty() {
-        return Ok(CallToolResult::error(format!(
-            "No fields were updated on '{}': {}",
-            reference,
-            errors.join("; ")
-        )));
-    }
+    let source = read_consistent(&sch_path)?;
+    let planned = match plan_schematic_component_edits(&source, &[edit]) {
+        Ok(planned) => planned,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
+    debug_assert_ne!(planned.candidate, source);
+    commit_command(&sch_path, &planned.command)?;
 
-    if !changed.is_empty() {
-        let item_ids = symbol_item_ids(&expected, &reference)?;
-        let command = SchematicCommand::replace_items_from_document(
-            &expected,
-            &content,
-            item_ids,
-            format!("Edit {reference}"),
-        )?;
-        commit_command(&sch_path, &command)?;
-    }
-
-    let mut result = json!({
+    let result = json!({
         "reference": reference,
-        "changes": changed
+        "changes": planned.changes
     });
-    if !errors.is_empty() {
-        result["errors"] = json!(errors);
-    }
     Ok(CallToolResult::json(&result))
 }
 
@@ -1121,6 +1292,8 @@ async fn handle_get_schematic_component(
         "reference": anchor.reference().unwrap_or("?"),
         "value": anchor.value_str().unwrap_or(""),
         "footprint": anchor.footprint().unwrap_or(""),
+        "in_bom": anchor.in_bom,
+        "dnp": anchor.dnp,
         "lib_id": anchor.lib_id,
         "x": x,
         "y": y,
@@ -1151,6 +1324,8 @@ async fn handle_list_schematic_components(
                 "reference": sym.reference().unwrap_or("?"),
                 "value": sym.value_str().unwrap_or(""),
                 "footprint": sym.footprint().unwrap_or(""),
+                "in_bom": sym.in_bom,
+                "dnp": sym.dnp,
                 "lib_id": sym.lib_id,
                 "x": x,
                 "y": y,
@@ -4715,6 +4890,8 @@ mod multi_unit_component_tests {
     (lib_id "Test:DUAL")
     (at 100 100 0)
     (unit 1)
+    (in_bom yes)
+    (dnp no)
     (uuid "22222222-2222-4222-8222-222222222222")
     (property "Reference" "U1" (at 100 98 0))
     (property "Value" "OLD" (at 100 102 0))
@@ -4734,6 +4911,8 @@ mod multi_unit_component_tests {
     (lib_id "Test:DUAL")
     (at 100 120 180)
     (unit 2)
+    (in_bom yes)
+    (dnp no)
     (uuid "33333333-3333-4333-8333-333333333333")
     (property "Reference" "U1" (at 100 118 0))
     (property "Value" "OLD" (at 100 122 0))
@@ -4772,6 +4951,113 @@ mod multi_unit_component_tests {
         let path = directory.path().join("multi.kicad_sch");
         std::fs::write(&path, SCHEMATIC).unwrap();
         (directory, path)
+    }
+
+    #[test]
+    fn pure_component_plan_updates_every_unit_and_builds_an_immutable_command() {
+        let edit = SchematicComponentEdit {
+            reference: "U1".to_string(),
+            value: Some("NEW".to_string()),
+            footprint: Some("Package_SO:SOIC-8".to_string()),
+            in_bom: Some(false),
+            dnp: Some(true),
+            fields: std::collections::BTreeMap::from([("MPN".to_string(), "ABC-123".to_string())]),
+            ..Default::default()
+        };
+
+        let planned = plan_schematic_component_edits(SCHEMATIC, &[edit]).unwrap();
+
+        assert_eq!(SCHEMATIC.matches("(in_bom yes)").count(), 2);
+        assert_eq!(planned.candidate.matches("(in_bom no)").count(), 2);
+        assert_eq!(planned.candidate.matches("(dnp yes)").count(), 2);
+        assert_eq!(
+            planned
+                .candidate
+                .matches("(property \"Value\" \"NEW\"")
+                .count(),
+            2
+        );
+        assert_eq!(
+            planned
+                .candidate
+                .matches("(property \"Footprint\" \"Package_SO:SOIC-8\"")
+                .count(),
+            2
+        );
+        assert_eq!(
+            planned
+                .candidate
+                .matches("(property \"MPN\" \"ABC-123\"")
+                .count(),
+            2
+        );
+        assert!(planned.command.require_unchanged_document);
+        assert_eq!(planned.command.changes.len(), 2);
+    }
+
+    #[test]
+    fn pure_component_plan_rejects_reserved_custom_fields_without_a_candidate() {
+        let edit = SchematicComponentEdit {
+            reference: "U1".to_string(),
+            fields: std::collections::BTreeMap::from([("Value".to_string(), "bypass".to_string())]),
+            ..Default::default()
+        };
+
+        let error = plan_schematic_component_edits(SCHEMATIC, &[edit]).unwrap_err();
+        assert!(error.to_string().contains("reserved property 'Value'"));
+    }
+
+    #[test]
+    fn pure_component_plan_rejects_a_reference_collision_before_editing() {
+        let source = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+        let edit = SchematicComponentEdit {
+            reference: "R1".to_string(),
+            new_reference: Some("R2".to_string()),
+            ..Default::default()
+        };
+
+        let error = plan_schematic_component_edits(source, &[edit]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("target reference already exists"));
+    }
+
+    #[test]
+    fn immutable_component_plan_rejects_an_unrelated_intervening_change() {
+        let (_directory, path) = fixture();
+        let planned = plan_schematic_component_edits(
+            SCHEMATIC,
+            &[SchematicComponentEdit {
+                reference: "U1".to_string(),
+                value: Some("NEW".to_string()),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let intervening = SCHEMATIC.replace("(page \"1\")", "(page \"2\")");
+        std::fs::write(&path, &intervening).unwrap();
+
+        assert!(konnect_sexp::commit_command(&path, &planned.command).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), intervening);
+    }
+
+    #[test]
+    fn immutable_component_plan_obeys_the_kicad_editor_lock() {
+        let (_directory, path) = fixture();
+        let planned = plan_schematic_component_edits(
+            SCHEMATIC,
+            &[SchematicComponentEdit {
+                reference: "U1".to_string(),
+                dnp: Some(true),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let lock = path.with_file_name("~multi.kicad_sch.lck");
+        std::fs::write(lock, "{}\n").unwrap();
+
+        assert!(konnect_sexp::commit_command(&path, &planned.command).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), SCHEMATIC);
     }
 
     /// A real eeschema save (KiCad's ecc83 demo): tabs, CRLF, and U1 placed
@@ -4970,6 +5256,8 @@ mod multi_unit_component_tests {
                     "schematic": path,
                     "reference": "U1",
                     "value": "NEW",
+                    "in_bom": false,
+                    "dnp": true,
                     "fields": { "MPN": "A\\\"B" }
                 }),
                 &context(),
@@ -4979,6 +5267,8 @@ mod multi_unit_component_tests {
         );
         let source = std::fs::read_to_string(&path).unwrap();
         assert_eq!(source.matches("(property \"Value\" \"NEW\"").count(), 2);
+        assert_eq!(source.matches("(in_bom no)").count(), 2);
+        assert_eq!(source.matches("(dnp yes)").count(), 2);
         assert_eq!(
             source.matches("(property \"MPN\" \"A\\\\\\\"B\"").count(),
             2
