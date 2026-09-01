@@ -25,6 +25,12 @@ cd crates/schematic-viewer
 cargo build --release
 ```
 
+## Maintenance runbooks
+
+- [Upstream integration workflow](docs/UPSTREAM_INTEGRATION.md) — repeatably
+  adopt parent-repository changes while preserving fork policy and intentional
+  removals.
+
 Schematic-viewer build notes (Windows):
 
 - If `cargo` is not recognized in a fresh shell, add it to the session PATH first:

@@ -1,0 +1,10 @@
+interface:
+  display_name: "Konnect KiCad Layout Review"
+  short_description: "Review PCB layout, buck loops, and ground paths"
+  default_prompt: "Use $konnect-kicad-layout-review to audit this KiCad PCB layout and prioritize evidence-backed findings."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "konnect"
+      description: "Konnect KiCad MCP server"

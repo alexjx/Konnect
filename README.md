@@ -15,8 +15,8 @@ through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
 **221 tools across 20 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, reference
-circuits, and a full manufacturing export pipeline — with bundled skills and agents
-that teach Claude KiCAD conventions out of the box.
+circuits, and a full manufacturing export pipeline — with bundled namespaced
+skills and safety hooks that teach supported KiCAD conventions out of the box.
 
 > **Status: beta.** The core toolchain is tested and working, but this is a young
 > release and it wants real-world mileage and review. Issues and PRs are welcome —
@@ -158,18 +158,25 @@ cargo build --release -p konnect
 
 ### Install guidance for your AI client
 
-Konnect bundles shared KiCad skills for Claude and Codex. Select the client when
-installing, checking, or removing that guidance:
+This fork bundles four namespaced KiCad skills for Claude and Codex. Select the
+client when installing, checking, or removing that guidance:
 
 ```bash
-# Existing behavior remains the default: Claude skills, agents, and hooks
+# Existing behavior remains the default: Claude skills and safety hooks
 konnect init
 
-# Codex installs only the shared skills under ~/.agents/skills
+# Codex uses $CODEX_HOME/skills when CODEX_HOME is set; otherwise ~/.agents/skills
 konnect init --client codex
 konnect status --client codex
 konnect uninstall --client codex
 ```
+
+The installed skills are `konnect-kicad-schematic`,
+`konnect-kicad-pcb-layout`, `konnect-kicad-layout-review`, and
+`konnect-kicad-package-audit`. Installation removes only legacy Konnect-owned
+skill names and preserves unrelated user skills. A Codex install also removes
+stale Konnect-owned copies from the old canonical `~/.codex/skills` location
+when that directory is not the active `CODEX_HOME` target.
 
 MCP server startup never installs or restores guidance. Run `konnect init`
 explicitly when you want those files installed; after `konnect uninstall`,

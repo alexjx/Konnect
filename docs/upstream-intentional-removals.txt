@@ -1,0 +1,17 @@
+crates/konnect/assets/agents/kicad-design-review-agent.md
+crates/konnect/assets/agents/kicad-schematic-build-agent.md
+crates/konnect/assets/skills/kicad-library/SKILL.md
+crates/konnect/assets/skills/kicad-manufacture/SKILL.md
+crates/konnect/assets/skills/kicad-manufacture/references/gerber-layers.md
+crates/konnect/assets/skills/kicad-manufacture/references/jlcpcb-rules.md
+crates/konnect/assets/skills/kicad-pcb/SKILL.md
+crates/konnect/assets/skills/kicad-pcb/references/design-rules.md
+crates/konnect/assets/skills/kicad-pcb/references/layer-reference.md
+crates/konnect/assets/skills/kicad-pcb/references/trace-width-table.md
+crates/konnect/assets/skills/kicad-review/SKILL.md
+crates/konnect/assets/skills/kicad-review/references/design-checklist.md
+crates/konnect/assets/skills/kicad-review/references/error-taxonomy.md
+crates/konnect/assets/skills/kicad-schematic/SKILL.md
+crates/konnect/assets/skills/kicad-schematic/references/common-lib-ids.md
+crates/konnect/assets/skills/kicad-schematic/references/wiring-patterns.md
+crates/konnect/assets/skills/konnect/SKILL.md

@@ -1,4 +1,5 @@
 /target/
+/target-codex/
 /result
 /result-*
 crates/*/target/

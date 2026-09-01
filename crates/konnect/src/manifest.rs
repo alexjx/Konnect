@@ -1,21 +1,12 @@
-//! Skill and agent manifests embedded at compile time.
+//! Skill and hook manifests embedded at compile time.
 //!
-//! The client-aware `init` subcommand installs shared skills for Claude or Codex.
-//! Claude-specific agents and hooks remain scoped to Claude's directories.
-//! Hook skills are also patched into `~/.claude/settings.json`.
+//! The client-aware `init` subcommand installs the same namespaced skills for
+//! Claude or Codex. Claude-specific hooks remain scoped to Claude's settings.
 
-/// A skill to install to `~/.claude/skills/<name>/SKILL.md`.
-/// Optional reference files go into `~/.claude/skills/<name>/references/`.
+/// A skill and every file bundled below its installation directory.
 pub struct SkillManifest {
     pub name: &'static str,
-    pub content: &'static str,
-    pub references: &'static [(&'static str, &'static str)],
-}
-
-/// An agent to install to `~/.claude/agents/<filename>`.
-pub struct AgentManifest {
-    pub filename: &'static str,
-    pub content: &'static str,
+    pub files: &'static [(&'static str, &'static str)],
 }
 
 /// A hook-bound skill: triggers before/after specific MCP tool calls.
@@ -28,95 +19,108 @@ pub struct HookSkillManifest {
     pub event: &'static str, // "PreToolUse" or "PostToolUse"
 }
 
-// ─── Skills ──────────────────────────────────────────────────────────────────
-
 pub const SKILLS: &[SkillManifest] = &[
     SkillManifest {
-        name: "konnect",
-        content: include_str!("../assets/skills/konnect/SKILL.md"),
-        references: &[],
-    },
-    SkillManifest {
-        name: "kicad-schematic",
-        content: include_str!("../assets/skills/kicad-schematic/SKILL.md"),
-        references: &[
+        name: "konnect-kicad-layout-review",
+        files: &[
             (
-                "common-lib-ids.md",
-                include_str!("../assets/skills/kicad-schematic/references/common-lib-ids.md"),
+                "SKILL.md",
+                include_str!("../assets/skills/konnect-kicad-layout-review/SKILL.md"),
             ),
             (
-                "wiring-patterns.md",
-                include_str!("../assets/skills/kicad-schematic/references/wiring-patterns.md"),
-            ),
-        ],
-    },
-    SkillManifest {
-        name: "kicad-pcb",
-        content: include_str!("../assets/skills/kicad-pcb/SKILL.md"),
-        references: &[
-            (
-                "layer-reference.md",
-                include_str!("../assets/skills/kicad-pcb/references/layer-reference.md"),
+                "agents/openai.yaml",
+                include_str!("../assets/skills/konnect-kicad-layout-review/agents/openai.yaml"),
             ),
             (
-                "trace-width-table.md",
-                include_str!("../assets/skills/kicad-pcb/references/trace-width-table.md"),
+                "references/general-and-two-layer.md",
+                include_str!(
+                    "../assets/skills/konnect-kicad-layout-review/references/general-and-two-layer.md"
+                ),
             ),
             (
-                "design-rules.md",
-                include_str!("../assets/skills/kicad-pcb/references/design-rules.md"),
+                "references/buck-converter.md",
+                include_str!(
+                    "../assets/skills/konnect-kicad-layout-review/references/buck-converter.md"
+                ),
             ),
         ],
     },
     SkillManifest {
-        name: "kicad-manufacture",
-        content: include_str!("../assets/skills/kicad-manufacture/SKILL.md"),
-        references: &[
+        name: "konnect-kicad-schematic",
+        files: &[
             (
-                "jlcpcb-rules.md",
-                include_str!("../assets/skills/kicad-manufacture/references/jlcpcb-rules.md"),
+                "SKILL.md",
+                include_str!("../assets/skills/konnect-kicad-schematic/SKILL.md"),
             ),
             (
-                "gerber-layers.md",
-                include_str!("../assets/skills/kicad-manufacture/references/gerber-layers.md"),
-            ),
-        ],
-    },
-    SkillManifest {
-        name: "kicad-review",
-        content: include_str!("../assets/skills/kicad-review/SKILL.md"),
-        references: &[
-            (
-                "error-taxonomy.md",
-                include_str!("../assets/skills/kicad-review/references/error-taxonomy.md"),
-            ),
-            (
-                "design-checklist.md",
-                include_str!("../assets/skills/kicad-review/references/design-checklist.md"),
+                "agents/openai.yaml",
+                include_str!("../assets/skills/konnect-kicad-schematic/agents/openai.yaml"),
             ),
         ],
     },
     SkillManifest {
-        name: "kicad-library",
-        content: include_str!("../assets/skills/kicad-library/SKILL.md"),
-        references: &[],
+        name: "konnect-kicad-package-audit",
+        files: &[
+            (
+                "SKILL.md",
+                include_str!("../assets/skills/konnect-kicad-package-audit/SKILL.md"),
+            ),
+            (
+                "agents/openai.yaml",
+                include_str!("../assets/skills/konnect-kicad-package-audit/agents/openai.yaml"),
+            ),
+            (
+                "references/configuration.md",
+                include_str!(
+                    "../assets/skills/konnect-kicad-package-audit/references/configuration.md"
+                ),
+            ),
+            (
+                "scripts/generate_package_audit.py",
+                include_str!(
+                    "../assets/skills/konnect-kicad-package-audit/scripts/generate_package_audit.py"
+                ),
+            ),
+            (
+                "scripts/review_markdown.py",
+                include_str!(
+                    "../assets/skills/konnect-kicad-package-audit/scripts/review_markdown.py"
+                ),
+            ),
+        ],
+    },
+    SkillManifest {
+        name: "konnect-kicad-pcb-layout",
+        files: &[
+            (
+                "SKILL.md",
+                include_str!("../assets/skills/konnect-kicad-pcb-layout/SKILL.md"),
+            ),
+            (
+                "agents/openai.yaml",
+                include_str!("../assets/skills/konnect-kicad-pcb-layout/agents/openai.yaml"),
+            ),
+            (
+                "references/design-document-contract.md",
+                include_str!(
+                    "../assets/skills/konnect-kicad-pcb-layout/references/design-document-contract.md"
+                ),
+            ),
+            (
+                "references/pcb-completion.md",
+                include_str!(
+                    "../assets/skills/konnect-kicad-pcb-layout/references/pcb-completion.md"
+                ),
+            ),
+            (
+                "references/layout-rules.md",
+                include_str!(
+                    "../assets/skills/konnect-kicad-pcb-layout/references/layout-rules.md"
+                ),
+            ),
+        ],
     },
 ];
-
-// ─── Agents ──────────────────────────────────────────────────────────────────
-
-pub const AGENTS: &[AgentManifest] = &[
-    AgentManifest {
-        filename: "kicad-design-review-agent.md",
-        content: include_str!("../assets/agents/kicad-design-review-agent.md"),
-    },
-    AgentManifest {
-        filename: "kicad-schematic-build-agent.md",
-        content: include_str!("../assets/agents/kicad-schematic-build-agent.md"),
-    },
-];
-
-// ─── Hook Skills ─────────────────────────────────────────────────────────────
 
 pub const HOOK_SKILLS: &[HookSkillManifest] = &[
     HookSkillManifest {
@@ -144,3 +148,96 @@ pub const HOOK_SKILLS: &[HookSkillManifest] = &[
         event: "PreToolUse",
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Component, Path};
+
+    #[test]
+    fn namespaced_skill_manifests_are_complete_and_safe() {
+        let expected = BTreeMap::from([
+            (
+                "konnect-kicad-layout-review",
+                BTreeSet::from([
+                    "SKILL.md",
+                    "agents/openai.yaml",
+                    "references/buck-converter.md",
+                    "references/general-and-two-layer.md",
+                ]),
+            ),
+            (
+                "konnect-kicad-schematic",
+                BTreeSet::from(["SKILL.md", "agents/openai.yaml"]),
+            ),
+            (
+                "konnect-kicad-package-audit",
+                BTreeSet::from([
+                    "SKILL.md",
+                    "agents/openai.yaml",
+                    "references/configuration.md",
+                    "scripts/generate_package_audit.py",
+                    "scripts/review_markdown.py",
+                ]),
+            ),
+            (
+                "konnect-kicad-pcb-layout",
+                BTreeSet::from([
+                    "SKILL.md",
+                    "agents/openai.yaml",
+                    "references/design-document-contract.md",
+                    "references/layout-rules.md",
+                    "references/pcb-completion.md",
+                ]),
+            ),
+        ]);
+
+        assert_eq!(SKILLS.len(), expected.len());
+        let mut names = BTreeSet::new();
+        for skill in SKILLS {
+            assert!(names.insert(skill.name), "duplicate skill: {}", skill.name);
+            let paths = skill
+                .files
+                .iter()
+                .map(|(path, _)| *path)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                paths.len(),
+                skill.files.len(),
+                "duplicate file in {}",
+                skill.name
+            );
+            assert_eq!(
+                Some(&paths),
+                expected.get(skill.name),
+                "files for {}",
+                skill.name
+            );
+
+            for path in &paths {
+                let path = Path::new(path);
+                assert!(!path.is_absolute(), "absolute path in {}", skill.name);
+                assert!(
+                    path.components()
+                        .all(|component| matches!(component, Component::Normal(_))),
+                    "unsafe path in {}: {}",
+                    skill.name,
+                    path.display()
+                );
+            }
+
+            let skill_md = skill
+                .files
+                .iter()
+                .find_map(|(path, content)| (*path == "SKILL.md").then_some(*content))
+                .expect("SKILL.md must be embedded");
+            assert!(
+                skill_md.contains(&format!("name: {}", skill.name)),
+                "frontmatter name for {}",
+                skill.name
+            );
+        }
+        assert_eq!(names, expected.keys().copied().collect());
+    }
+}

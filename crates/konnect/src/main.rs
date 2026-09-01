@@ -186,19 +186,19 @@ async fn main() -> Result<()> {
 fn print_help_for(subcommand: Option<&str>) {
     let clients = || {
         println!("\nCLIENTS:");
-        println!("  claude (default)         Skills, agents, and hooks under ~/.claude");
-        println!("  codex                    Skills under ~/.agents/skills");
+        println!("  claude (default)         Skills and hooks under ~/.claude");
+        println!("  codex                    Skills under $CODEX_HOME/skills or ~/.agents/skills");
     };
     match subcommand {
         Some("init") => {
             println!("konnect init [--client <claude|codex>]\n");
-            println!("Install Konnect's skills and agents for an AI client.");
+            println!("Install Konnect's skills and safety hooks for an AI client.");
             println!("Writes to that client's configuration directory.");
             clients();
         }
         Some("uninstall") => {
             println!("konnect uninstall [--client <claude|codex>]\n");
-            println!("Remove the skills and agents Konnect installed for a client.");
+            println!("Remove the skills and safety hooks Konnect installed for a client.");
             println!("Only Konnect's own named assets are removed.");
             clients();
         }

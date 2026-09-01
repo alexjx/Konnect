@@ -3,13 +3,29 @@
 //! Handles explicit client-scoped install, uninstall, status, and Claude hook
 //! integration without writing into another client's directories.
 
-use crate::manifest::{AGENTS, HOOK_SKILLS, SKILLS};
+use crate::manifest::{HOOK_SKILLS, SKILLS};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+
+const LEGACY_SKILL_NAMES: &[&str] = &[
+    "konnect",
+    "kicad-schematic",
+    "kicad-pcb",
+    "kicad-manufacture",
+    "kicad-review",
+    "kicad-library",
+    "kicad-layout-review",
+    "kicad-package-audit",
+];
+
+const LEGACY_AGENT_FILENAMES: &[&str] = &[
+    "kicad-design-review-agent.md",
+    "kicad-schematic-build-agent.md",
+];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum InstallClient {
@@ -114,8 +130,10 @@ pub fn print_skill_content(name: &str) -> Result<()> {
     }
     for skill in SKILLS {
         if skill.name == name {
-            print!("{}", skill.content);
-            return Ok(());
+            if let Some((_, content)) = skill.files.iter().find(|(path, _)| *path == "SKILL.md") {
+                print!("{content}");
+                return Ok(());
+            }
         }
     }
     eprintln!("Unknown skill: {}", name);
@@ -220,12 +238,16 @@ pub fn run_double_click_install() -> Result<()> {
 #[derive(Debug)]
 struct InstallPaths {
     home: PathBuf,
+    codex_home: Option<PathBuf>,
 }
 
 impl InstallPaths {
     fn for_current_user() -> Result<Self> {
         Ok(Self {
             home: dirs::home_dir().context("could not locate home directory")?,
+            codex_home: std::env::var_os("CODEX_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
         })
     }
 
@@ -236,8 +258,16 @@ impl InstallPaths {
     fn skills_dir(&self, client: InstallClient) -> PathBuf {
         match client {
             InstallClient::Claude => self.home.join(".claude").join("skills"),
-            InstallClient::Codex => self.home.join(".agents").join("skills"),
+            InstallClient::Codex => self
+                .codex_home
+                .as_ref()
+                .map(|root| root.join("skills"))
+                .unwrap_or_else(|| self.home.join(".agents").join("skills")),
         }
+    }
+
+    fn legacy_codex_skills_dir(&self) -> PathBuf {
+        self.home.join(".codex").join("skills")
     }
 
     fn claude_agents_dir(&self) -> PathBuf {
@@ -261,25 +291,26 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
     if verbose {
         match client {
             InstallClient::Claude => {
-                println!("Installing Konnect skills, agents, and hooks for Claude...\n")
+                println!("Installing Konnect skills and hooks for Claude...\n")
             }
             InstallClient::Codex => println!("Installing Konnect skills for Codex...\n"),
         }
     }
 
     let skill_count = install_skills(client, paths, verbose)?;
-    let mut agent_count = 0;
+    let skills_dir = paths.skills_dir(client);
+    remove_legacy_skill_dirs(&skills_dir, verbose)?;
+
+    if client == InstallClient::Codex {
+        let legacy_root = paths.legacy_codex_skills_dir();
+        if legacy_root != skills_dir {
+            remove_all_owned_skill_dirs(&legacy_root, verbose)?;
+        }
+    }
+
     let mut hook_count = 0;
     if client == InstallClient::Claude {
-        let agents_dir = paths.claude_agents_dir();
-        fs::create_dir_all(&agents_dir)?;
-        for agent in AGENTS {
-            fs::write(agents_dir.join(agent.filename), agent.content)?;
-            agent_count += 1;
-            if verbose {
-                println!("  [+] Agent: {}", agent.filename);
-            }
-        }
+        remove_legacy_agents(paths, verbose)?;
 
         let exe = std::env::current_exe()?;
         let settings_path = paths.claude_settings_path();
@@ -313,16 +344,14 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
     if verbose {
         match client {
             InstallClient::Claude => println!(
-                "\nDone: {skill_count} skills, {agent_count} agents, {hook_count} hooks installed for Claude."
+                "\nDone: {skill_count} skills and {hook_count} hooks installed for Claude."
             ),
             InstallClient::Codex => {
                 println!("\nDone: {skill_count} skills installed for Codex.")
             }
         }
     } else {
-        eprintln!(
-            "[konnect] Silent {client} install complete: {skill_count} skills, {agent_count} agents"
-        );
+        eprintln!("[konnect] Silent {client} install complete: {skill_count} skills");
     }
     Ok(())
 }
@@ -330,21 +359,81 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
 fn install_skills(client: InstallClient, paths: &InstallPaths, verbose: bool) -> Result<usize> {
     let skills_dir = paths.skills_dir(client);
     for skill in SKILLS {
-        let dest = skills_dir.join(skill.name);
-        fs::create_dir_all(&dest)?;
-        fs::write(dest.join("SKILL.md"), skill.content)?;
-        if !skill.references.is_empty() {
-            let refs_dir = dest.join("references");
-            fs::create_dir_all(&refs_dir)?;
-            for (filename, content) in skill.references {
-                fs::write(refs_dir.join(filename), content)?;
-            }
-        }
+        install_skill(&skills_dir, skill)?;
         if verbose {
             println!("  [+] Skill: {}", skill.name);
         }
     }
     Ok(SKILLS.len())
+}
+
+fn install_skill(skills_dir: &Path, skill: &crate::manifest::SkillManifest) -> Result<()> {
+    let skill_dir = skills_dir.join(skill.name);
+    for (relative, content) in skill.files {
+        let relative_path = Path::new(relative);
+        if relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            bail!("invalid bundled skill path: {relative}");
+        }
+        let destination = skill_dir.join(relative_path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(destination, content)?;
+    }
+    Ok(())
+}
+
+fn skill_is_installed(skills_dir: &Path, skill: &crate::manifest::SkillManifest) -> bool {
+    skill
+        .files
+        .iter()
+        .all(|(relative, _)| skills_dir.join(skill.name).join(relative).is_file())
+}
+
+fn remove_skill_dir(root: &Path, name: &str, verbose: bool) -> Result<()> {
+    let destination = root.join(name);
+    if destination.exists() {
+        fs::remove_dir_all(&destination)
+            .with_context(|| format!("failed to remove legacy skill {}", destination.display()))?;
+        if verbose {
+            println!("  [-] Removed skill: {name}");
+        }
+    }
+    Ok(())
+}
+
+fn remove_legacy_skill_dirs(root: &Path, verbose: bool) -> Result<()> {
+    for name in LEGACY_SKILL_NAMES {
+        remove_skill_dir(root, name, verbose)?;
+    }
+    Ok(())
+}
+
+fn remove_all_owned_skill_dirs(root: &Path, verbose: bool) -> Result<()> {
+    for skill in SKILLS {
+        remove_skill_dir(root, skill.name, verbose)?;
+    }
+    remove_legacy_skill_dirs(root, verbose)
+}
+
+fn remove_legacy_agents(paths: &InstallPaths, verbose: bool) -> Result<()> {
+    let agents_dir = paths.claude_agents_dir();
+    for filename in LEGACY_AGENT_FILENAMES {
+        let destination = agents_dir.join(filename);
+        if destination.exists() {
+            fs::remove_file(&destination).with_context(|| {
+                format!("failed to remove legacy agent {}", destination.display())
+            })?;
+            if verbose {
+                println!("  [-] Removed legacy agent: {filename}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) -> Result<()> {
@@ -353,27 +442,16 @@ fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) 
     }
 
     let skills_dir = paths.skills_dir(client);
-    for skill in SKILLS {
-        let dest = skills_dir.join(skill.name);
-        if dest.exists() {
-            fs::remove_dir_all(&dest)?;
-            if verbose {
-                println!("  [-] Removed skill: {}", skill.name);
-            }
+    remove_all_owned_skill_dirs(&skills_dir, verbose)?;
+    if client == InstallClient::Codex {
+        let legacy_root = paths.legacy_codex_skills_dir();
+        if legacy_root != skills_dir {
+            remove_all_owned_skill_dirs(&legacy_root, verbose)?;
         }
     }
 
     if client == InstallClient::Claude {
-        let agents_dir = paths.claude_agents_dir();
-        for agent in AGENTS {
-            let dest = agents_dir.join(agent.filename);
-            if dest.exists() {
-                fs::remove_file(&dest)?;
-                if verbose {
-                    println!("  [-] Removed agent: {}", agent.filename);
-                }
-            }
-        }
+        remove_legacy_agents(paths, verbose)?;
         let exe = std::env::current_exe()?;
         remove_hooks_from_settings(
             &paths.claude_settings_path(),
@@ -400,7 +478,7 @@ fn print_status_at(client: InstallClient, paths: &InstallPaths) -> Result<()> {
     let skills_dir = paths.skills_dir(client);
     println!("Skills ({}):", display_home_path(&skills_dir, &paths.home));
     for skill in SKILLS {
-        let marker = if skills_dir.join(skill.name).join("SKILL.md").exists() {
+        let marker = if skill_is_installed(&skills_dir, skill) {
             "+"
         } else {
             "-"
@@ -409,16 +487,6 @@ fn print_status_at(client: InstallClient, paths: &InstallPaths) -> Result<()> {
     }
 
     if client == InstallClient::Claude {
-        let agents_dir = paths.claude_agents_dir();
-        println!("\nAgents (~/.claude/agents/):");
-        for agent in AGENTS {
-            let marker = if agents_dir.join(agent.filename).exists() {
-                "+"
-            } else {
-                "-"
-            };
-            println!("  [{marker}] {}", agent.filename);
-        }
         println!("\nHooks (~/.claude/settings.json):");
         let raw = fs::read_to_string(paths.claude_settings_path()).unwrap_or_default();
         for hook in HOOK_SKILLS {
@@ -586,6 +654,37 @@ mod tests {
     fn test_paths(temp: &TempDir) -> InstallPaths {
         InstallPaths {
             home: temp.path().to_path_buf(),
+            codex_home: None,
+        }
+    }
+
+    fn assert_skill_files(root: &Path) {
+        for skill in SKILLS {
+            assert!(skill_is_installed(root, skill), "{} incomplete", skill.name);
+            for (relative, expected) in skill.files {
+                let installed = root.join(skill.name).join(relative);
+                assert_eq!(
+                    fs::read_to_string(&installed).unwrap(),
+                    *expected,
+                    "installed content mismatch: {}",
+                    installed.display()
+                );
+            }
+        }
+    }
+
+    fn seed_skill_dir(root: &Path, name: &str) {
+        let destination = root.join(name);
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("SKILL.md"), "old").unwrap();
+    }
+
+    fn seed_all_owned_skill_dirs(root: &Path) {
+        for skill in SKILLS {
+            seed_skill_dir(root, skill.name);
+        }
+        for name in LEGACY_SKILL_NAMES {
+            seed_skill_dir(root, name);
         }
     }
 
@@ -669,22 +768,83 @@ mod tests {
         let paths = test_paths(&temp);
         run_install_at(InstallClient::Codex, &paths, false).unwrap();
 
-        for skill in SKILLS {
-            let skill_dir = paths.skills_dir(InstallClient::Codex).join(skill.name);
-            assert_eq!(
-                fs::read_to_string(skill_dir.join("SKILL.md")).unwrap(),
-                skill.content
-            );
-            for (filename, content) in skill.references {
-                assert_eq!(
-                    fs::read_to_string(skill_dir.join("references").join(filename)).unwrap(),
-                    *content
-                );
-            }
-        }
+        assert_skill_files(&paths.skills_dir(InstallClient::Codex));
         assert!(!temp.path().join(".claude").exists());
         assert!(paths.marker(InstallClient::Codex).exists());
         assert!(!paths.marker(InstallClient::Claude).exists());
+    }
+
+    #[test]
+    fn explicit_codex_home_is_the_active_root_and_canonical_legacy_is_migrated() {
+        let temp = TempDir::new().unwrap();
+        let explicit_home = temp.path().join("custom-codex");
+        let paths = InstallPaths {
+            home: temp.path().to_path_buf(),
+            codex_home: Some(explicit_home.clone()),
+        };
+        let legacy_root = paths.legacy_codex_skills_dir();
+        seed_all_owned_skill_dirs(&legacy_root);
+        seed_skill_dir(&legacy_root, "unrelated");
+
+        run_install_at(InstallClient::Codex, &paths, false).unwrap();
+
+        let active_root = explicit_home.join("skills");
+        assert_skill_files(&active_root);
+        for skill in SKILLS {
+            assert!(!legacy_root.join(skill.name).exists());
+        }
+        for name in LEGACY_SKILL_NAMES {
+            assert!(!legacy_root.join(name).exists());
+        }
+        assert!(legacy_root.join("unrelated").join("SKILL.md").exists());
+        assert!(!temp.path().join(".claude").exists());
+    }
+
+    #[test]
+    fn canonical_dot_codex_active_root_retains_new_skills() {
+        let temp = TempDir::new().unwrap();
+        let canonical_home = temp.path().join(".codex");
+        let paths = InstallPaths {
+            home: temp.path().to_path_buf(),
+            codex_home: Some(canonical_home),
+        };
+        let active_root = paths.skills_dir(InstallClient::Codex);
+        for name in LEGACY_SKILL_NAMES {
+            seed_skill_dir(&active_root, name);
+        }
+        seed_skill_dir(&active_root, "unrelated");
+
+        run_install_at(InstallClient::Codex, &paths, false).unwrap();
+
+        assert_skill_files(&active_root);
+        for name in LEGACY_SKILL_NAMES {
+            assert!(!active_root.join(name).exists());
+        }
+        assert!(active_root.join("unrelated").join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn installer_rejects_unsafe_relative_paths() {
+        let temp = TempDir::new().unwrap();
+        let unsafe_skill = crate::manifest::SkillManifest {
+            name: "unsafe",
+            files: &[("../escape", "no")],
+        };
+        assert!(install_skill(temp.path(), &unsafe_skill).is_err());
+        assert!(!temp.path().join("escape").exists());
+    }
+
+    #[test]
+    fn installed_status_requires_every_auxiliary_file() {
+        let temp = TempDir::new().unwrap();
+        let skill = SKILLS
+            .iter()
+            .find(|skill| skill.files.len() > 1)
+            .expect("skill with auxiliary files");
+        install_skill(temp.path(), skill).unwrap();
+        assert!(skill_is_installed(temp.path(), skill));
+        fs::remove_file(temp.path().join(skill.name).join(skill.files[1].0)).unwrap();
+        assert!(!skill_is_installed(temp.path(), skill));
     }
 
     #[test]
@@ -698,16 +858,7 @@ mod tests {
         run_install_at(InstallClient::Claude, &paths, false).unwrap();
         run_install_at(InstallClient::Claude, &paths, false).unwrap();
 
-        for skill in SKILLS {
-            assert!(paths
-                .skills_dir(InstallClient::Claude)
-                .join(skill.name)
-                .join("SKILL.md")
-                .exists());
-        }
-        for agent in AGENTS {
-            assert!(paths.claude_agents_dir().join(agent.filename).exists());
-        }
+        assert_skill_files(&paths.skills_dir(InstallClient::Claude));
         let settings: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(settings_path).unwrap()).unwrap();
         assert_eq!(settings["theme"], "dark");
@@ -853,6 +1004,51 @@ mod tests {
     }
 
     #[test]
+    fn client_install_removes_only_selected_roots_legacy_skills() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        let codex_root = paths.skills_dir(InstallClient::Codex);
+        let claude_root = paths.skills_dir(InstallClient::Claude);
+        for name in LEGACY_SKILL_NAMES {
+            seed_skill_dir(&codex_root, name);
+            seed_skill_dir(&claude_root, name);
+        }
+        seed_skill_dir(&codex_root, "unrelated");
+        seed_skill_dir(&claude_root, "unrelated");
+
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+
+        for name in LEGACY_SKILL_NAMES {
+            assert!(!claude_root.join(name).exists());
+            assert!(codex_root.join(name).exists());
+        }
+        assert!(claude_root.join("unrelated").exists());
+        assert!(codex_root.join("unrelated").exists());
+    }
+
+    #[test]
+    fn claude_install_removes_exact_legacy_agents_only() {
+        let temp = TempDir::new().unwrap();
+        let paths = test_paths(&temp);
+        let agents_root = paths.claude_agents_dir();
+        fs::create_dir_all(&agents_root).unwrap();
+        for filename in LEGACY_AGENT_FILENAMES {
+            fs::write(agents_root.join(filename), "old").unwrap();
+        }
+        fs::write(agents_root.join("unrelated.md"), "keep").unwrap();
+
+        run_install_at(InstallClient::Claude, &paths, false).unwrap();
+
+        for filename in LEGACY_AGENT_FILENAMES {
+            assert!(!agents_root.join(filename).exists());
+        }
+        assert_eq!(
+            fs::read_to_string(agents_root.join("unrelated.md")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
     fn codex_uninstall_is_scoped() {
         let temp = TempDir::new().unwrap();
         let paths = test_paths(&temp);
@@ -861,9 +1057,19 @@ mod tests {
         let unrelated = paths.skills_dir(InstallClient::Codex).join("my-skill");
         fs::create_dir_all(&unrelated).unwrap();
         fs::write(unrelated.join("SKILL.md"), "keep me").unwrap();
+        let legacy_root = paths.legacy_codex_skills_dir();
+        seed_all_owned_skill_dirs(&legacy_root);
+        seed_skill_dir(&legacy_root, "legacy-unrelated");
 
         run_uninstall_at(InstallClient::Codex, &paths, false).unwrap();
         assert!(unrelated.join("SKILL.md").exists());
+        for skill in SKILLS {
+            assert!(!legacy_root.join(skill.name).exists());
+        }
+        for name in LEGACY_SKILL_NAMES {
+            assert!(!legacy_root.join(name).exists());
+        }
+        assert!(legacy_root.join("legacy-unrelated").exists());
         assert!(paths.marker(InstallClient::Claude).exists());
         assert!(!paths.marker(InstallClient::Codex).exists());
         assert!(paths.claude_settings_path().exists());

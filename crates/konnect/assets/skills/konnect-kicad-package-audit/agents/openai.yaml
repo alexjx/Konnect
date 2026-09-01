@@ -1,0 +1,10 @@
+interface:
+  display_name: "Konnect KiCad Package Audit"
+  short_description: "Audit symbols, footprints, BOM, and datasheets"
+  default_prompt: "Use $konnect-kicad-package-audit to generate a complete symbol, footprint, BOM, and datasheet comparison report for this KiCad project."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "konnect"
+      description: "Konnect KiCad MCP server"
