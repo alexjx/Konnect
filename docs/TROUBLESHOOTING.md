@@ -22,7 +22,7 @@ Step by step (based on the diagnostic guide contributed in
 
    Copy the whole address including the `ipc://` prefix — it is unique to
    your machine and user.
-3. In KiCAD, open **Tools → External Plugins → Konnect** to open the settings
+3. In KiCAD, open **Tools → External Plugins → Konnect Settings** to open the settings
    dialog.
 4. Paste the address into the **IPC Socket** field and click **Save**.
 5. Confirm your AI client (Claude Code, Claude Desktop, …) has the `konnect`

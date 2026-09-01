@@ -131,7 +131,7 @@ Konnect/
 ### Plugin Installation
 - **PCM zip** is the correct install method
 - KiCAD installs to: `C:\KiCad\10.0\share\kicad\scripting\plugins\konnect\`
-- Both `__init__.py` (SWIG ActionPlugin for PCB editor settings dialog) and `plugin.json` (IPC exec plugin) are included
+- Both `__init__.py` (the **Konnect Settings** SWIG ActionPlugin for the PCB editor settings dialog) and `plugin.json` (the **Konnect** IPC executable action) are included. Their names must remain distinct because KiCAD loads both registrations into the same menu.
 
 ## Structured Errors
 
