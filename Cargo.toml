@@ -15,7 +15,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.11.50001"
 edition = "2021"
 authors = ["Konnect contributors"]
 license = "AGPL-3.0-only"
@@ -23,6 +23,11 @@ license = "AGPL-3.0-only"
 # (rust-toolchain.toml) — the only version the gate actually verifies.
 # Lower it only after genuinely building and testing on the older compiler.
 rust-version = "1.96"
+
+[workspace.metadata.konnect-version]
+upstream_version = "0.11.0"
+upstream_commit = "e7aeaa6a1b353fa758c5246b58a18899275d13ef"
+fork_revision = 1
 
 [workspace.dependencies]
 # Serialization

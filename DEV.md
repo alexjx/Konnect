@@ -51,6 +51,9 @@ restoring removed skill paths by habit.
 - [Upstream integration workflow](docs/UPSTREAM_INTEGRATION.md) — repeatably
   adopt parent-repository changes while preserving fork policy and intentional
   removals.
+- [Versioning](docs/VERSIONING.md) — derive a numeric, SemVer-compatible fork
+  version from the integrated upstream release and keep product artifacts in
+  sync.
 
 Schematic-viewer build notes (Windows):
 

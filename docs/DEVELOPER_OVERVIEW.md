@@ -60,3 +60,5 @@ decision and its safety gates are described in
    paths and the gates between them.
 5. [Testing and release](TESTING_AND_RELEASE.md) maps changes to tests, CI, live
    KiCad validation, documentation, and packaging.
+6. [Versioning](VERSIONING.md) defines the fork version formula, exact upstream
+   provenance, and the artifacts that must remain synchronized.

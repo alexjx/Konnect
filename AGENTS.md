@@ -26,6 +26,8 @@ The main references are:
 - [`docs/KICAD_INTEGRATION.md`](docs/KICAD_INTEGRATION.md) for file, IPC, and
   `kicad-cli` boundaries;
 - [`docs/TESTING_AND_RELEASE.md`](docs/TESTING_AND_RELEASE.md) for validation;
+- [`docs/VERSIONING.md`](docs/VERSIONING.md) for fork version derivation and
+  release synchronization;
 - [`docs/NAMING_CONVENTIONS.md`](docs/NAMING_CONVENTIONS.md) for public names.
 
 ## Code ownership and data flow
