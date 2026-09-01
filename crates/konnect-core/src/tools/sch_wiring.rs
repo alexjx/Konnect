@@ -1567,6 +1567,63 @@ fn next_pwr_number(sch: &cse::Schematic) -> u32 {
     (1u32..).find(|n| !used.contains(n)).unwrap_or(1)
 }
 
+/// Pin numbers from the library definition embedded in this schematic.
+///
+/// KiCad nests pins inside unit sub-symbols, so walk the definition recursively.
+/// A placed symbol carries one `(pin "N" (uuid "..."))` node per distinct pin
+/// number; duplicate library graphics for the same electrical pin must not
+/// create duplicate placed-pin records.
+fn embedded_symbol_pin_numbers(sch: &cse::Schematic, lib_id: &str) -> Vec<String> {
+    fn collect(
+        node: &cse::sexp::SexpNode,
+        seen: &mut std::collections::HashSet<String>,
+        numbers: &mut Vec<String>,
+    ) {
+        for child in node.children() {
+            if child.tag() == Some("pin") {
+                if let Some(number) = child.get_value("number") {
+                    let number = number.to_string();
+                    if !number.is_empty() && seen.insert(number.clone()) {
+                        numbers.push(number);
+                    }
+                }
+            }
+            collect(child, seen, numbers);
+        }
+    }
+
+    let Some(symbol) = sch
+        .raw_other
+        .iter()
+        .find(|node| node.tag() == Some("lib_symbols"))
+        .and_then(|library| {
+            library
+                .find_all("symbol")
+                .into_iter()
+                .find(|symbol| symbol.value() == Some(lib_id))
+        })
+    else {
+        return Vec::new();
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut numbers = Vec::new();
+    collect(symbol, &mut seen, &mut numbers);
+    numbers
+}
+
+fn append_placed_pin_kiids(sym: &mut cse::Symbol, pin_numbers: &[String]) {
+    use cse::sexp::{atom, qstr, SexpNode};
+
+    for number in pin_numbers {
+        sym.raw_sub_nodes.push(SexpNode::List(vec![
+            atom("pin"),
+            qstr(number),
+            SexpNode::List(vec![atom("uuid"), qstr(uuid::Uuid::new_v4().to_string())]),
+        ]));
+    }
+}
+
 async fn handle_add_power_symbol(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1667,6 +1724,18 @@ async fn handle_add_power_symbol(
         centred,
     ));
 
+    // Every placed pin needs its own non-null KIID. KiCad may load and render
+    // a symbol without these nodes, then crash later when autosave/history
+    // orders a null pin identifier.
+    let pin_numbers = embedded_symbol_pin_numbers(&sch, &lib_id);
+    if pin_numbers.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "Could not resolve any pins for power symbol '{}'; refusing to create an unsafe symbol instance",
+            lib_id
+        )));
+    }
+    append_placed_pin_kiids(&mut sym, &pin_numbers);
+
     // Instance entry, keyed to the root sheet UUID like eeschema writes it —
     // without a resolvable "/<root-uuid>" path KiCAD's netlister drops the
     // symbol from net formation.
@@ -1688,6 +1757,7 @@ async fn handle_add_power_symbol(
     Ok(CallToolResult::json(&json!({
         "added_power": power_net,
         "reference": pwr_ref,
+        "pin_uuid_count": pin_numbers.len(),
         "x": x, "y": y,
         "junctions_added": junctions_added.iter().map(|(x, y)| json!({"x": x, "y": y})).collect::<Vec<_>>()
     })))
@@ -3399,7 +3469,7 @@ mod power_symbol_tests {
             &path,
             // Anchors copied from KiCad 10's power.kicad_sym: GND points down,
             // so both fields anchor below the origin in Y-up library space.
-            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n    )\n  )\n)\n",
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n      (symbol \"GND_1_1\"\n        (pin power_in line (at 0 0 0) (length 0)\n          (name \"GND\" (effects (font (size 1.27 1.27))))\n          (number \"1\" (effects (font (size 1.27 1.27)))))\n      )\n    )\n  )\n)\n",
         )
         .unwrap();
 
@@ -3464,7 +3534,7 @@ mod power_symbol_tests {
         let path = dir.path().join("power-metadata.kicad_sch");
         std::fs::write(
             &path,
-            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n      (property \"Datasheet\" \"https://example.com/gnd.pdf\" (at 0 0 0))\n      (property \"Description\" \"Ground power symbol\" (at 0 0 0))\n    )\n  )\n)\n",
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n      (property \"Datasheet\" \"https://example.com/gnd.pdf\" (at 0 0 0))\n      (property \"Description\" \"Ground power symbol\" (at 0 0 0))\n      (symbol \"GND_1_1\"\n        (pin power_in line (at 0 0 0) (length 0)\n          (name \"GND\" (effects (font (size 1.27 1.27))))\n          (number \"1\" (effects (font (size 1.27 1.27)))))\n      )\n    )\n  )\n)\n",
         )
         .unwrap();
 
@@ -3503,6 +3573,92 @@ mod power_symbol_tests {
         );
     }
 
+    #[tokio::test]
+    async fn add_power_symbol_refuses_a_pinless_definition_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pinless-power.kicad_sch");
+        let before = "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:PINLESS\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"PINLESS\" (at 0 -3.81 0))\n    )\n  )\n)\n";
+        std::fs::write(&path, before).unwrap();
+
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": "PINLESS",
+                "x": 100.0,
+                "y": 80.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "pinless power symbol must fail closed");
+        assert!(
+            format!("{result:?}").contains("Could not resolve any pins"),
+            "error must identify the missing pin definition: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a rejected power symbol must not rewrite the schematic"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_power_symbol_assigns_an_independent_kiid_to_every_placed_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi-pin-power.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:MULTI\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"MULTI\" (at 0 -3.81 0))\n      (symbol \"MULTI_1_1\"\n        (pin power_in line (at 0 0 0) (length 0)\n          (name \"P1\" (effects (font (size 1.27 1.27))))\n          (number \"1\" (effects (font (size 1.27 1.27)))))\n        (pin power_in line (at 2.54 0 0) (length 0)\n          (name \"P2\" (effects (font (size 1.27 1.27))))\n          (number \"2\" (effects (font (size 1.27 1.27)))))\n      )\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": "MULTI",
+                "x": 100.0,
+                "y": 80.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected JSON text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["pin_uuid_count"], 2);
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let symbol = sch
+            .symbols
+            .iter()
+            .find(|symbol| symbol.reference() == Some("#PWR001"))
+            .expect("power symbol instance");
+        let symbol_uuid = uuid::Uuid::parse_str(&symbol.uuid).expect("symbol KIID");
+        let pin_uuids: Vec<_> = symbol
+            .raw_sub_nodes
+            .iter()
+            .filter(|node| node.tag() == Some("pin"))
+            .map(|pin| {
+                pin.get_value("uuid")
+                    .filter(|value| !value.is_empty())
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                    .expect("non-empty pin KIID")
+            })
+            .collect();
+
+        assert_eq!(pin_uuids.len(), 2, "one placed pin node per library pin");
+        assert_ne!(pin_uuids[0], pin_uuids[1], "pin KIIDs must be unique");
+        assert!(
+            pin_uuids.iter().all(|pin_uuid| *pin_uuid != symbol_uuid),
+            "pin KIIDs must differ from the placed symbol KIID"
+        );
+    }
+
     /// An up-pointing rail anchors its Value *above* the graphic, where a
     /// fixed +3.81 offset used to put it below (#101). VCC's library anchor is
     /// (0, +3.556) in Y-up space, so the sheet coordinate is y − 3.556.
@@ -3512,7 +3668,7 @@ mod power_symbol_tests {
         let path = dir.path().join("vcc.kicad_sch");
         std::fs::write(
             &path,
-            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:VCC\"\n      (property \"Reference\" \"#PWR\" (at 0 -3.81 0))\n      (property \"Value\" \"VCC\" (at 0 3.556 0))\n    )\n  )\n)\n",
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:VCC\"\n      (property \"Reference\" \"#PWR\" (at 0 -3.81 0))\n      (property \"Value\" \"VCC\" (at 0 3.556 0))\n      (symbol \"VCC_1_1\"\n        (pin power_in line (at 0 0 0) (length 0)\n          (name \"VCC\" (effects (font (size 1.27 1.27))))\n          (number \"1\" (effects (font (size 1.27 1.27)))))\n      )\n    )\n  )\n)\n",
         )
         .unwrap();
 
@@ -3551,7 +3707,7 @@ mod power_symbol_tests {
         let path = dir.path().join("gnd.kicad_sch");
         std::fs::write(
             &path,
-            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n    )\n  )\n)\n",
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n      (symbol \"GND_1_1\"\n        (pin power_in line (at 0 0 0) (length 0)\n          (name \"GND\" (effects (font (size 1.27 1.27))))\n          (number \"1\" (effects (font (size 1.27 1.27)))))\n      )\n    )\n  )\n)\n",
         )
         .unwrap();
 
