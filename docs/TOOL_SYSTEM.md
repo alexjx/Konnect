@@ -6,9 +6,11 @@ The implementation is split between `crates/konnect-core/src/mcp`, `router`, and
 
 ## Definitions And Context
 
-`ToolDef` in `crates/konnect-core/src/tools/mod.rs` is the unit exposed through
-MCP. It carries a public name, description, JSON input schema, and async handler.
-The `tool!` macro constructs definitions in each domain module.
+`ToolDef` in `crates/konnect-core/src/tools/mod.rs` is the unit used for MCP
+tools. It carries a public name, description, JSON input schema, and async
+handler. A definition is not necessarily exposed: `DISABLED_TOOLS` retains 33
+raw implementations outside discovery and dispatch, while the selected profile
+decides whether raw and workflow definitions are available.
 
 `ToolContext` carries `ServerConfig`, the shared `ToolRouter`, the call observer,
 and shared integration state. Public tool names and schema fields are API; apply
@@ -18,23 +20,39 @@ the naming and compatibility rules in `docs/NAMING_CONVENTIONS.md` and
 ## Toolsets And Meta-Tools
 
 `crates/konnect-core/src/router/registry.rs` declares `ALL_TOOLSETS`, the starter
-set, each toolset's metadata, and the `tools_for` mapping. Registry tests compare
-declared per-toolset counts with the definitions returned by the domain module.
+set, disabled raw policy, and the filtered `tools_for` mapping. Its 20 toolsets
+contain 227 raw implementations, of which 194 are exposed. Registry tests check
+both implementation and exposed counts.
 
 `router/meta_tools.rs` defines the always-visible discovery, load/unload, and
 observability surface. Meta-tools are outside `ALL_TOOLSETS`. `load_toolset`
 accepts either one name or an array; a successful change causes
 `mcp/handler.rs` to emit `notifications/tools/list_changed`.
 
+`tools/workflow.rs::tools()` separately defines seven guarded workflow tools.
+They are not a raw toolset and must not be added to `ALL_TOOLSETS` merely to
+make them discoverable.
+
+## Exposure Profiles
+
+`exposure_profile` is immutable for a server process:
+
+- `legacy`: exposed raw tools plus six meta-tools (18 starter, 200 full);
+- `expert`: Legacy plus seven workflows (25 starter, 207 full);
+- `workflow`: seven workflows plus two observability tools (9 fixed), with no
+  raw router or routing meta-tools.
+
 ## Dispatch
 
-`McpHandler` in `mcp/handler.rs` dispatches in this order:
+`McpHandler` first rejects tools outside the selected profile, then dispatches
+the applicable surface in this order:
 
 1. Handle a meta-tool.
-2. Handle a loaded domain tool.
-3. If `auto_load_toolsets` is enabled, load the owning toolset and retry.
-4. If a registered tool is not loaded, return `toolset_not_loaded`.
-5. Otherwise return `unknown_tool`.
+2. Handle a workflow tool.
+3. Handle a loaded raw domain tool.
+4. If `auto_load_toolsets` is enabled, load the owning raw toolset and retry.
+5. If an exposed raw tool is not loaded, return `toolset_not_loaded`.
+6. Otherwise return `unknown_tool`.
 
 This distinction lets a client recover from an unloaded tool without confusing
 it with a misspelled or removed public API.
@@ -88,8 +106,8 @@ kind in `mcp/error.rs` only when callers need a stable new classification; use
 
 ## Documentation Coupling
 
-When tools are added, removed, or renamed, update the domain `tools()` list,
-`router/registry.rs`, `tool-directory.md`, and the guarded count locations named
-by `CONTRIBUTING.md`. Do not repeat catalogue totals in these map documents;
-`crates/konnect/tests/doc_tool_counts.rs` enforces the designated sources and
-sweeps documentation for stale totals.
+When tools are implemented, exposed, disabled, or moved between surfaces,
+update the owning definitions, `router/registry.rs`, `tool-directory.md`, and
+the guarded count locations named by `CONTRIBUTING.md`.
+`crates/konnect/tests/doc_tool_counts.rs` independently enforces implementation,
+exposure, workflow, meta, profile-full, and starter counts.

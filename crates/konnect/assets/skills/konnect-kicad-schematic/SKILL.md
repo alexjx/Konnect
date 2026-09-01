@@ -1,6 +1,6 @@
 ---
 name: konnect-kicad-schematic
-description: Create, modify, or verify KiCad schematics through Konnect MCP. Use for schematic structure, symbols, wiring, component properties, placement, or electrical validation.
+description: Create, modify, or verify KiCad schematics through Konnect MCP. Use for schematic structure, symbols, wiring, component properties, placement, or electrical validation; use the guarded workflow whenever it supports the requested mutation.
 ---
 
 # Konnect KiCad Schematic
@@ -8,39 +8,43 @@ description: Create, modify, or verify KiCad schematics through Konnect MCP. Use
 Use Konnect for every schematic write. Never edit `.kicad_sch` text directly.
 Do not automate the KiCad GUI unless the user explicitly requests it.
 
-## Route by exposed capabilities
+## Prefer the guarded workflow
 
-- Start with `get_project_info` and the exact project or schematic path. Load
-  only the required raw toolsets with `list_toolboxes` and `load_toolset`, then
-  read the exact targets using `get_schematic_component`,
-  `list_schematic_components`, or `get_schematic_layout`.
-- Use `batch_edit_schematic_components` for existing Value, Footprint, or
-  custom-field edits. The upstream integration baseline does not expose a
-  guarded BOM/DNP field mutation; report that gap instead of forcing it through
-  a generic field edit.
-- Use `bulk_move_schematic_components` for one relative batch offset or
-  `move_schematic_component` for one absolute target. These operations move
-  symbols, not their attached wires and labels.
-- Use the specialized schematic, wiring, hierarchy, and library tools for other
-  supported work. Follow their server-side validation and refusal results; do
-  not bypass a rejected operation with text editing or GUI automation.
-- If one request mixes supported and unsupported mutations, do not apply only
-  the supported subset unless the user explicitly accepts partial completion.
+For existing-component property edits and relative component moves, use this
+complete lifecycle in Expert or Workflow:
 
-## Reviewable raw change lifecycle
+1. Call `inspect_design` with the exact schematic path. Establish the observed
+   resource revision and inspect the authorized references.
+2. Call `plan_schematic_edit` with the same exact path and the complete intended
+   operations. Planning is zero-write.
+3. Review the returned `change_set_id`, immutable operations, resource revision,
+   and every structured gate. Use `get_change_set` when the retained state must
+   be re-read. Do not apply a blocked, incomplete, or stale plan.
+4. Call `apply_change_set` once with that `change_set_id`. Treat a refusal or
+   ambiguous result as final until observed state is inspected; never create a
+   replacement plan just to bypass a gate.
+5. Call `verify_change_set` with the same ID. Completion requires its readback
+   against the actual schematic file and a verified effect state, not merely a
+   successful apply response.
 
-1. Inspect the exact file and target objects. Take a project snapshot before a
-   broad or difficult-to-reverse change.
-2. State the intended operation and authorized references before writing. Raw
-   tools do not create a stored plan or allow-list.
-3. Invoke the smallest suitable atomic or batch operation once, and retain its
-   exact response as evidence.
-4. Re-read the affected objects immediately. If the response is partial,
-   ambiguous, or reports an error, stop and recover from observed file state
-   instead of retrying blindly.
-5. Run the relevant connectivity, rendered-layout, and ERC checks before
-   declaring completion. Use the snapshot or version control for rollback;
-   there is no stored change set to discard.
+If the plan is no longer wanted and has produced no effect, call
+`discard_change_set`. Change sets are process-local and expire; never treat an
+ID from another server process as durable authorization.
+
+## Raw tools for unsupported operations
+
+The guarded schematic schema currently supports existing-component edits and
+relative moves. Wiring, hierarchy, symbol creation/deletion, and other
+unsupported mutations require exposed raw tools in Legacy or Expert. Workflow
+has no raw router; report the capability gap instead of changing profiles or
+using a hidden implementation without user direction.
+
+For a supported raw operation, load only its toolset, inspect the exact file and
+targets, take a snapshot when rollback matters, invoke the smallest atomic or
+batch write once, and immediately re-read the affected objects. Raw tools do
+not create a stored plan or allow-list. Stop on any refusal, partial result, or
+ambiguous effect. Do not apply only the supported subset of a mixed request
+unless the user explicitly accepts partial completion.
 
 ## Preserve design intent
 
@@ -69,12 +73,8 @@ Do not automate the KiCad GUI unless the user explicitly requests it.
 
 ## Verify
 
-After a write, inspect the exact targets and confirm unrelated content did not
+After guarded verification or raw readback, confirm unrelated content did not
 change. Export changed pages when geometry or presentation changed, and run
-connectivity/ERC checks when electrical connectivity could have changed. Scale
-verification to the mutation, but do not declare completion from a successful
-tool call alone. Before a raw write, identify the exact page and target objects;
-if it returns an error or partial/ambiguous outcome, inspect observed state and
-do not retry until the actual effect is known. If Konnect lacks the required
-surgical or verification operation, stop instead of rebuilding the page or
-using an unapproved fallback.
+connectivity/ERC checks when electrical connectivity could have changed. If
+Konnect lacks the required surgical or verification operation, stop instead of
+rebuilding the page or using an unapproved fallback.

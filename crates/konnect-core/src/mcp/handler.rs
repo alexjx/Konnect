@@ -15,6 +15,20 @@ use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
+/// Process-wide MCP capability surface. It is immutable after startup because
+/// stdio and HTTP share one handler and one router.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExposureProfile {
+    /// Preserve the historical raw toolset behavior.
+    #[default]
+    Legacy,
+    /// Expose guarded workflows alongside raw toolsets for migration and diagnostics.
+    Expert,
+    /// Expose only guarded workflows and observability.
+    Workflow,
+}
+
 /// Clone-able handle to the MCP request handler.
 /// Multiple transports (STDIO + HTTP) share the same handler.
 #[derive(Clone)]
@@ -28,10 +42,18 @@ pub struct McpHandler {
     /// silently dropped on stdio — the cause of issue #19.
     notif_sinks: Arc<RwLock<Vec<mpsc::Sender<String>>>>,
     observer: CallObserver,
+    exposure_profile: ExposureProfile,
 }
 
 impl McpHandler {
     pub async fn new(config: crate::tools::ServerConfig) -> anyhow::Result<Self> {
+        Self::new_with_profile(config, ExposureProfile::Legacy).await
+    }
+
+    pub async fn new_with_profile(
+        config: crate::tools::ServerConfig,
+        exposure_profile: ExposureProfile,
+    ) -> anyhow::Result<Self> {
         let router = Arc::new(ToolRouter::new());
 
         // Load only the starter kit at startup so baseline `tools/list` stays small
@@ -41,10 +63,12 @@ impl McpHandler {
         // tool list and ignore `notifications/tools/list_changed` — for those,
         // a tool missing from the first listing is permanently uncallable
         // (#134, #169). Costs ~25K tokens per listing, hence off by default.
-        if config.eager_toolsets {
-            router.load_all().await;
-        } else {
-            router.load_starter_kit().await;
+        if exposure_profile != ExposureProfile::Workflow {
+            if config.eager_toolsets {
+                router.load_all().await;
+            } else {
+                router.load_starter_kit().await;
+            }
         }
 
         let observer = CallObserver::new(Some(default_calls_log_path()));
@@ -59,6 +83,7 @@ impl McpHandler {
             sse_senders: Arc::new(RwLock::new(Vec::new())),
             notif_sinks: Arc::new(RwLock::new(Vec::new())),
             observer,
+            exposure_profile,
         })
     }
 
@@ -130,10 +155,32 @@ impl McpHandler {
 
             // ── Tool listing ───────────────────────────────────────────────
             "tools/list" => {
-                // Meta-tools (always visible) + all domain tools (pre-loaded at startup)
-                let mut tools = meta_tools::meta_tool_descriptions();
-                for def in self.ctx.router.active_tools().await {
-                    tools.push(def.to_mcp_description());
+                let mut tools = if self.exposure_profile == ExposureProfile::Workflow {
+                    meta_tools::meta_tool_descriptions()
+                        .into_iter()
+                        .filter(|tool| {
+                            matches!(tool.name.as_str(), "get_recent_calls" | "server_stats")
+                        })
+                        .collect()
+                } else {
+                    meta_tools::meta_tool_descriptions()
+                };
+                if self.exposure_profile != ExposureProfile::Legacy {
+                    tools.extend(
+                        crate::tools::workflow::tools()
+                            .into_iter()
+                            .map(|tool| tool.to_mcp_description()),
+                    );
+                }
+                if self.exposure_profile != ExposureProfile::Workflow {
+                    tools.extend(
+                        self.ctx
+                            .router
+                            .active_tools()
+                            .await
+                            .into_iter()
+                            .map(|tool| tool.to_mcp_description()),
+                    );
                 }
                 let result = ListToolsResult {
                     tools,
@@ -221,7 +268,23 @@ impl McpHandler {
         name: &str,
         args: &Value,
     ) -> (CallToolResult, CallStatus, Option<String>) {
-        // Meta-tools always win.
+        let routing_meta = matches!(
+            name,
+            "list_toolboxes" | "load_toolset" | "unload_toolset" | "get_active_toolsets"
+        );
+        let workflow_tool = crate::tools::workflow::tools()
+            .into_iter()
+            .find(|tool| tool.name == name);
+        let raw_tool = self.ctx.router.find_toolset_for_tool(name).is_some();
+
+        if (self.exposure_profile == ExposureProfile::Workflow && (routing_meta || raw_tool))
+            || (self.exposure_profile == ExposureProfile::Legacy && workflow_tool.is_some())
+        {
+            return capability_not_exposed(name, self.exposure_profile);
+        }
+
+        // Legacy and Expert retain every meta-tool. Workflow retains only the
+        // two observability tools; routing was rejected above.
         if let Some(result) = meta_tools::handle_meta_tool(name, args, &self.ctx).await {
             if name == "load_toolset" || name == "unload_toolset" {
                 self.notify_tools_list_changed().await;
@@ -232,6 +295,10 @@ impl McpHandler {
                 CallStatus::Ok
             };
             return (result, status, None);
+        }
+
+        if let Some(tool_def) = workflow_tool {
+            return execute_definition(name, args, tool_def, self.ctx.clone()).await;
         }
 
         // Loaded domain tool? If not and auto-load is enabled (opt-in, off by
@@ -247,96 +314,7 @@ impl McpHandler {
         }
 
         if let Some(tool_def) = tool_def {
-            // Nothing validated `required` before this: the schema is
-            // advertised to the client and was never enforced server-side, so
-            // a handler reading an absent argument with `unwrap_or` ran with a
-            // substituted value and reported success. 25 sites across 18 tools
-            // did exactly that (#218); each is now fixed in its own handler,
-            // and this stops the next one being written.
-            //
-            // Presence only. A wrong *type* still reaches the handler, which
-            // is where the `require_*` helpers name the field — this is a net
-            // beneath them, not a replacement for them.
-            if let Some(missing) = first_missing_required(&tool_def.input_schema, args) {
-                let reason = "missing".to_string();
-                return (
-                    CallToolResult::error_kind(
-                        ToolErrorKind::InvalidArgument {
-                            field: missing.clone(),
-                            reason: reason.clone(),
-                        },
-                        format!("Argument '{missing}' is invalid: {reason}"),
-                    ),
-                    CallStatus::Error,
-                    Some("invalid_argument".to_string()),
-                );
-            }
-            return match (tool_def.handler)(args, self.ctx.clone()).await {
-                Ok(result) => {
-                    let status = if result.is_error {
-                        CallStatus::Error
-                    } else {
-                        CallStatus::Ok
-                    };
-                    // Structured errors carry their own kind in the body; plain-text
-                    // errors fall back to "handler_error" via extract_error_kind.
-                    let error_kind = extract_error_kind(&result);
-                    (result, status, error_kind)
-                }
-                // A missing argument is the caller's mistake, not the tool
-                // failing, and the two call for different reactions: retry with
-                // the argument, versus conclude the operation is broken. The
-                // `require_*` helpers already draw that line; `get_path` could
-                // not, because returning a structured result would change 171
-                // call sites — so it carries the distinction in the error chain
-                // instead, and this is where it is read back out (#194).
-                Err(e) if crate::tools::MissingArgument::field_in(&e).is_some() => {
-                    let field = crate::tools::MissingArgument::field_in(&e)
-                        .expect("guard matched")
-                        .to_string();
-                    let reason = "missing or not a string".to_string();
-                    (
-                        CallToolResult::error_kind(
-                            ToolErrorKind::InvalidArgument {
-                                field: field.clone(),
-                                reason: reason.clone(),
-                            },
-                            format!("Argument '{field}' is invalid: {reason}"),
-                        ),
-                        CallStatus::Error,
-                        Some("invalid_argument".to_string()),
-                    )
-                }
-                Err(e) if kicad_editor_locked_path(&e).is_some() => {
-                    let path = kicad_editor_locked_path(&e)
-                        .expect("guard matched")
-                        .display()
-                        .to_string();
-                    (
-                        CallToolResult::error_kind(
-                            ToolErrorKind::Conflict {
-                                paths: vec![path.clone()],
-                            },
-                            format!(
-                                "Schematic '{path}' has a KiCad editor lock. Close Eeschema, or resolve a stale lock only after confirming no editor owns the file, then retry."
-                            ),
-                        ),
-                        CallStatus::Error,
-                        Some("conflict".to_string()),
-                    )
-                }
-                Err(e) => {
-                    warn!(tool = %name, error = %e, "tool handler returned anyhow::Error");
-                    let kind = ToolErrorKind::HandlerError {
-                        reason: e.to_string(),
-                    };
-                    (
-                        CallToolResult::error_kind(kind, format!("Tool error: {}", e)),
-                        CallStatus::Error,
-                        Some("handler_error".to_string()),
-                    )
-                }
-            };
+            return execute_definition(name, args, tool_def, self.ctx.clone()).await;
         }
 
         // Not loaded — try to give an actionable hint.
@@ -398,6 +376,107 @@ impl McpHandler {
     }
 }
 
+fn capability_not_exposed(
+    name: &str,
+    profile: ExposureProfile,
+) -> (CallToolResult, CallStatus, Option<String>) {
+    let kind = ToolErrorKind::CapabilityNotExposed {
+        tool: name.to_string(),
+        profile: format!("{profile:?}").to_lowercase(),
+    };
+    (
+        CallToolResult::error_kind(
+            kind,
+            format!("Tool '{name}' is not exposed by the active profile"),
+        ),
+        CallStatus::NotFound,
+        Some("capability_not_exposed".to_string()),
+    )
+}
+
+/// Apply the same schema and error taxonomy to raw and guarded tools. Profile
+/// selection decides which definition reaches this point; execution semantics
+/// stay identical once a capability is exposed.
+async fn execute_definition(
+    name: &str,
+    args: &Value,
+    tool_def: crate::tools::ToolDef,
+    ctx: Arc<crate::tools::ToolContext>,
+) -> (CallToolResult, CallStatus, Option<String>) {
+    if let Some(missing) = first_missing_required(&tool_def.input_schema, args) {
+        let reason = "missing".to_string();
+        return (
+            CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: missing.clone(),
+                    reason: reason.clone(),
+                },
+                format!("Argument '{missing}' is invalid: {reason}"),
+            ),
+            CallStatus::Error,
+            Some("invalid_argument".to_string()),
+        );
+    }
+
+    match (tool_def.handler)(args, ctx).await {
+        Ok(result) => {
+            let status = if result.is_error {
+                CallStatus::Error
+            } else {
+                CallStatus::Ok
+            };
+            let error_kind = extract_error_kind(&result);
+            (result, status, error_kind)
+        }
+        Err(error) if crate::tools::MissingArgument::field_in(&error).is_some() => {
+            let field = crate::tools::MissingArgument::field_in(&error)
+                .expect("guard matched")
+                .to_string();
+            let reason = "missing or not a string".to_string();
+            (
+                CallToolResult::error_kind(
+                    ToolErrorKind::InvalidArgument {
+                        field: field.clone(),
+                        reason: reason.clone(),
+                    },
+                    format!("Argument '{field}' is invalid: {reason}"),
+                ),
+                CallStatus::Error,
+                Some("invalid_argument".to_string()),
+            )
+        }
+        Err(error) if kicad_editor_locked_path(&error).is_some() => {
+            let path = kicad_editor_locked_path(&error)
+                .expect("guard matched")
+                .display()
+                .to_string();
+            (
+                CallToolResult::error_kind(
+                    ToolErrorKind::Conflict {
+                        paths: vec![path.clone()],
+                    },
+                    format!(
+                        "Schematic '{path}' has a KiCad editor lock. Close Eeschema, or resolve a stale lock only after confirming no editor owns the file, then retry."
+                    ),
+                ),
+                CallStatus::Error,
+                Some("conflict".to_string()),
+            )
+        }
+        Err(error) => {
+            warn!(tool = %name, error = %error, "tool handler returned anyhow::Error");
+            let kind = ToolErrorKind::HandlerError {
+                reason: error.to_string(),
+            };
+            (
+                CallToolResult::error_kind(kind, format!("Tool error: {error}")),
+                CallStatus::Error,
+                Some("handler_error".to_string()),
+            )
+        }
+    }
+}
+
 fn kicad_editor_locked_path(error: &anyhow::Error) -> Option<&std::path::Path> {
     for cause in error.chain() {
         if let Some(konnect_sexp::SexpError::KiCadEditorLocked { path, .. }) =
@@ -442,6 +521,222 @@ fn result_content_bytes(result: &CallToolResult) -> usize {
             ToolContent::Image { data, .. } => data.len(),
         })
         .sum()
+}
+
+#[cfg(test)]
+mod exposure_profile_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::collections::HashSet;
+
+    fn config(eager_toolsets: bool, auto_load_toolsets: bool) -> ServerConfig {
+        ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets,
+            eager_toolsets,
+        }
+    }
+
+    async fn handler(profile: ExposureProfile, eager: bool) -> McpHandler {
+        McpHandler::new_with_profile(config(eager, false), profile)
+            .await
+            .expect("handler builds")
+    }
+
+    async fn listed_names(handler: &McpHandler) -> HashSet<String> {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(json!({})),
+        };
+        let value = handler.dispatch(&request).await.unwrap().unwrap();
+        serde_json::from_value::<ListToolsResult>(value)
+            .unwrap()
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
+    }
+
+    fn error_kind(result: &CallToolResult) -> String {
+        let ToolContent::Text { text } = result.content.first().expect("text error") else {
+            panic!("expected text error")
+        };
+        serde_json::from_str::<Value>(text).unwrap()["error"]["kind"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn starter_profiles_have_exact_surfaces_and_set_relationships() {
+        let legacy = listed_names(&handler(ExposureProfile::Legacy, false).await).await;
+        let expert = listed_names(&handler(ExposureProfile::Expert, false).await).await;
+        let workflow = listed_names(&handler(ExposureProfile::Workflow, false).await).await;
+        let workflow_names: HashSet<String> = crate::tools::workflow::tools()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+
+        assert_eq!(legacy.len(), 18);
+        assert_eq!(expert.len(), 25);
+        assert_eq!(workflow.len(), 9);
+        assert!(workflow_names.is_disjoint(&legacy));
+        assert_eq!(
+            expert.difference(&legacy).cloned().collect::<HashSet<_>>(),
+            workflow_names
+        );
+        assert!(legacy.is_subset(&expert));
+        assert!(workflow_names.is_subset(&workflow));
+        assert_eq!(
+            workflow
+                .difference(&workflow_names)
+                .cloned()
+                .collect::<HashSet<_>>(),
+            HashSet::from(["get_recent_calls".to_string(), "server_stats".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn eager_profiles_have_exact_surfaces_and_workflow_ignores_eager() {
+        assert_eq!(
+            listed_names(&handler(ExposureProfile::Legacy, true).await)
+                .await
+                .len(),
+            200
+        );
+        assert_eq!(
+            listed_names(&handler(ExposureProfile::Expert, true).await)
+                .await
+                .len(),
+            207
+        );
+        assert_eq!(
+            listed_names(&handler(ExposureProfile::Workflow, true).await)
+                .await
+                .len(),
+            9
+        );
+    }
+
+    #[tokio::test]
+    async fn default_constructor_preserves_legacy_surface() {
+        let default = McpHandler::new(config(false, false)).await.unwrap();
+        assert_eq!(default.exposure_profile, ExposureProfile::Legacy);
+        assert_eq!(listed_names(&default).await.len(), 18);
+    }
+
+    #[tokio::test]
+    async fn profiles_reject_direct_dispatch_bypasses() {
+        let workflow = McpHandler::new_with_profile(config(false, true), ExposureProfile::Workflow)
+            .await
+            .unwrap();
+        for name in ["get_project_info", "place_component", "load_toolset"] {
+            let (result, status, kind) = workflow.dispatch_tool(name, &json!({})).await;
+            assert!(result.is_error, "{name}");
+            assert!(matches!(status, CallStatus::NotFound), "{name}");
+            assert_eq!(kind.as_deref(), Some("capability_not_exposed"), "{name}");
+            assert_eq!(error_kind(&result), "capability_not_exposed", "{name}");
+        }
+        assert!(workflow.ctx.router.active_names().await.is_empty());
+
+        let legacy = handler(ExposureProfile::Legacy, false).await;
+        let (result, _, kind) = legacy.dispatch_tool("inspect_design", &json!({})).await;
+        assert!(result.is_error);
+        assert_eq!(kind.as_deref(), Some("capability_not_exposed"));
+    }
+
+    #[tokio::test]
+    async fn expert_preserves_raw_auto_load_behavior() {
+        let expert = McpHandler::new_with_profile(config(false, true), ExposureProfile::Expert)
+            .await
+            .unwrap();
+        assert!(!expert
+            .ctx
+            .router
+            .active_names()
+            .await
+            .contains(&"pcb_components".to_string()));
+
+        let (_, _, kind) = expert.dispatch_tool("place_component", &json!({})).await;
+        assert_eq!(kind.as_deref(), Some("invalid_argument"));
+        assert!(expert
+            .ctx
+            .router
+            .active_names()
+            .await
+            .contains(&"pcb_components".to_string()));
+    }
+
+    #[tokio::test]
+    async fn workflow_definitions_receive_required_field_validation() {
+        for profile in [ExposureProfile::Expert, ExposureProfile::Workflow] {
+            let handler = handler(profile, false).await;
+            for definition in crate::tools::workflow::tools() {
+                let first_required = definition.input_schema["required"][0]
+                    .as_str()
+                    .expect("every workflow tool has a required field");
+                let (result, status, kind) =
+                    handler.dispatch_tool(definition.name, &json!({})).await;
+                assert!(result.is_error, "{} in {profile:?}", definition.name);
+                assert!(matches!(status, CallStatus::Error));
+                assert_eq!(kind.as_deref(), Some("invalid_argument"));
+                let ToolContent::Text { text } = &result.content[0] else {
+                    panic!("expected text error")
+                };
+                let body: Value = serde_json::from_str(text).unwrap();
+                assert_eq!(body["error"]["field"], first_required);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_clones_share_workflow_store_but_new_handlers_are_isolated() {
+        use crate::tools::workflow::{WorkflowDomain, WorkflowRun};
+
+        let first = handler(ExposureProfile::Expert, false).await;
+        let clone = first.clone();
+        let second = handler(ExposureProfile::Expert, false).await;
+
+        first
+            .ctx
+            .workflow_store
+            .insert(
+                WorkflowRun::planned(
+                    "handler-store-probe",
+                    WorkflowDomain::Schematic,
+                    "probe.kicad_sch",
+                    "sha256",
+                    Vec::new(),
+                ),
+                None,
+            )
+            .unwrap();
+
+        assert!(Arc::ptr_eq(
+            &first.ctx.workflow_store,
+            &clone.ctx.workflow_store
+        ));
+        assert!(!Arc::ptr_eq(
+            &first.ctx.workflow_store,
+            &second.ctx.workflow_store
+        ));
+        assert!(clone
+            .ctx
+            .workflow_store
+            .get("handler-store-probe")
+            .is_some());
+        assert!(second
+            .ctx
+            .workflow_store
+            .get("handler-store-probe")
+            .is_none());
+    }
 }
 
 /// A missing *path* argument must reach the caller as `invalid_argument`
@@ -576,18 +871,7 @@ mod required_argument_dispatch_tests {
         let cases: Vec<(&str, Value, &str)> = vec![
             ("search_symbols", json!({}), "query"),
             ("search_footprints", json!({}), "query"),
-            ("search_jlcpcb_parts", json!({}), "query"),
             ("search_templates", json!({}), "query"),
-            (
-                "suggest_jlcpcb_alternatives",
-                json!({ "footprint": "0402" }),
-                "value",
-            ),
-            (
-                "suggest_jlcpcb_alternatives",
-                json!({ "value": "10k" }),
-                "footprint",
-            ),
             (
                 "batch_delete_schematic_wire",
                 json!({ "schematic": s }),

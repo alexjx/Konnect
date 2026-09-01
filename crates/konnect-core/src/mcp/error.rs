@@ -40,6 +40,8 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolErrorKind {
+    /// The tool exists, but the process-wide exposure profile hides it.
+    CapabilityNotExposed { tool: String, profile: String },
     /// The tool exists in the registry but its toolset isn't loaded.
     /// Client recovers in one hop: `load_toolset(toolset)` then retry.
     ToolsetNotLoaded { toolset: String, tool: String },
@@ -65,6 +67,7 @@ impl ToolErrorKind {
     /// matter where the error originated.
     pub fn short_code(&self) -> &'static str {
         match self {
+            Self::CapabilityNotExposed { .. } => "capability_not_exposed",
             Self::ToolsetNotLoaded { .. } => "toolset_not_loaded",
             Self::UnknownTool { .. } => "unknown_tool",
             Self::InvalidArgument { .. } => "invalid_argument",
@@ -157,6 +160,10 @@ mod tests {
         // If these ever drift, clients that match on the `kind` string will
         // silently break. Pin them here.
         let kinds = [
+            ToolErrorKind::CapabilityNotExposed {
+                tool: "x".into(),
+                profile: "workflow".into(),
+            },
             ToolErrorKind::ToolsetNotLoaded {
                 toolset: "x".into(),
                 tool: "y".into(),

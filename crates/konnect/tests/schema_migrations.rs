@@ -17,9 +17,9 @@ const REMOVED: &[(&str, &str)] = &[
 fn tool(name: &str) -> konnect_core::tools::ToolDef {
     registry::ALL_TOOLSETS
         .iter()
-        .flat_map(|toolset| registry::tools_for(toolset.name).unwrap_or_default())
+        .flat_map(|toolset| registry::raw_tools_for(toolset.name).unwrap_or_default())
         .find(|tool| tool.name == name)
-        .unwrap_or_else(|| panic!("registered tool {name}"))
+        .unwrap_or_else(|| panic!("implemented tool {name}"))
 }
 
 #[test]

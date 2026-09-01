@@ -150,7 +150,7 @@ async fn main() -> Result<()> {
         auto_load_toolsets: config.auto_load_toolsets,
         eager_toolsets: config.eager_toolsets,
     };
-    let handler = McpHandler::new(server_config).await?;
+    let handler = McpHandler::new_with_profile(server_config, config.exposure_profile).await?;
 
     match config.transport {
         TransportMode::Stdio => {

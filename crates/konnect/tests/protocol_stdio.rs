@@ -181,6 +181,45 @@ fn handshake_baseline_and_full_registry_loads() {
 }
 
 #[test]
+fn exposure_profiles_are_enforced_by_the_real_stdio_process() {
+    for (profile, expected_count) in [("legacy", 18), ("expert", 25), ("workflow", 9)] {
+        let config_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_dir.path().join("settings.json"),
+            serde_json::to_vec(&json!({ "exposure_profile": profile })).unwrap(),
+        )
+        .unwrap();
+        let mut process = McpProcess::spawn_in_dir(Some(config_dir.path()));
+        let listed = process.request("tools/list", json!({}));
+        let names: std::collections::HashSet<&str> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(names.len(), expected_count, "{profile}");
+        assert_eq!(names.contains("inspect_design"), profile != "legacy");
+        assert_eq!(names.contains("get_project_info"), profile != "workflow");
+        assert_eq!(names.contains("load_toolset"), profile != "workflow");
+
+        let hidden = if profile == "workflow" {
+            "get_project_info"
+        } else if profile == "legacy" {
+            "inspect_design"
+        } else {
+            continue;
+        };
+        let result = process.call_tool(hidden, json!({}));
+        assert_eq!(
+            McpProcess::tool_body(&result)["error"]["kind"],
+            "capability_not_exposed",
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn file_based_tool_roundtrip_in_temp_project() {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proto_demo");
@@ -295,7 +334,15 @@ fn load_toolset_batch_form_loads_all_and_notifies_once() {
         .expect("expected a tools/call result")["result"]
         .clone();
     let body = McpProcess::tool_body(&r);
-    assert_eq!(body["tools_added"].as_u64(), Some(40));
+    let expected = ["sch_components", "sch_wiring"]
+        .into_iter()
+        .map(|name| {
+            konnect_core::router::registry::tools_for(name)
+                .expect("known toolset")
+                .len() as u64
+        })
+        .sum();
+    assert_eq!(body["tools_added"].as_u64(), Some(expected));
     // tools items are {name, description} objects, matching the legacy
     // single-name result shape -- not bare name strings.
     let tools = body["tools"].as_array().expect("tools array");

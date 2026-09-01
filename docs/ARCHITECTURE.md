@@ -21,14 +21,19 @@ inspection and recovery commands are owned by `transaction_cli.rs`.
 
 ### MCP and domain logic: `crates/konnect-core`
 
-`crates/konnect-core/src/mcp/handler.rs` handles MCP methods, enforces required
-argument presence, dispatches tool calls, emits tool-list notifications, and
-records calls through `observability.rs`.
+`crates/konnect-core/src/mcp/handler.rs` handles MCP methods, fixes one
+`exposure_profile` for the server process, enforces required argument presence,
+dispatches tool calls, emits tool-list notifications, and records calls through
+`observability.rs`.
 
-`crates/konnect-core/src/router/registry.rs` declares toolsets and resolves each
-toolset to its definitions. `router/mod.rs` tracks loaded definitions, and
+`crates/konnect-core/src/router/registry.rs` declares exposed raw toolsets and
+filters intentionally disabled implementations. `router/mod.rs` tracks loaded definitions, and
 `router/meta_tools.rs` implements the always-visible discovery, loading, and
 observability tools.
+
+`crates/konnect-core/src/tools/workflow.rs` owns a separate seven-tool guarded
+surface and its process-local change-set state. It is profile-selected, not a
+raw router toolset.
 
 `crates/konnect-core/src/tools/mod.rs` owns `ToolDef`, `ToolContext`,
 `ServerConfig`, the `tool!` macro, required-argument helpers, and shared path and
@@ -63,24 +68,25 @@ names.
 crates/konnect/src/main.rs
   -> classify invocation
   -> Config::load or Config::load_from
-  -> McpHandler::new
-  -> ToolRouter with starter toolsets (or every toolset when configured)
+  -> McpHandler::new_with_profile
+  -> selected raw/workflow/meta surface
+  -> ToolRouter with starter raw toolsets (or every exposed toolset when configured)
   -> stdio and/or HTTP transport
 ```
 
-`McpHandler::new` in `mcp/handler.rs` uses the `STARTER_KIT` declared by
-`router/registry.rs` unless `eager_toolsets` requests a complete initial list.
-The latter exists for clients that do not refresh after
-`notifications/tools/list_changed`; the configuration contract is documented
-beside the fields in `crates/konnect/src/config.rs`.
+Legacy and Expert use the `STARTER_KIT` declared by `router/registry.rs` unless
+`eager_toolsets` requests the complete exposed raw catalogue. Workflow bypasses
+the raw router and always exposes its seven guarded tools plus two observability
+tools. The `exposure_profile` values are `legacy`, `expert`, and `workflow`.
 
 ## Listing, Loading, And Calling Tools
 
 ```text
 tools/list
   -> McpHandler::dispatch
-  -> meta_tools::meta_tool_descriptions
-  -> ToolRouter::active_tools
+  -> filter meta-tools for the selected profile
+  -> workflow::tools when Expert or Workflow
+  -> ToolRouter::active_tools when Legacy or Expert
 
 tools/call load_toolset
   -> router/meta_tools.rs
@@ -89,7 +95,8 @@ tools/call load_toolset
 
 tools/call domain_tool
   -> McpHandler::execute_tool
-  -> meta-tool or loaded domain definition
+  -> profile gate
+  -> meta, workflow, or loaded raw definition
   -> required-field gate
   -> handler
   -> CallToolResult and observability record

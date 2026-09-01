@@ -99,40 +99,41 @@ Konnect/
 │   │   └── src/
 │   │       ├── mcp/
 │   │       │   ├── protocol.rs      # MCP JSON-RPC 2.0 types
-│   │       │   ├── handler.rs       # Dispatch: initialize, tools/list (all tools static), tools/call
+│   │       │   ├── handler.rs       # Profile-aware dispatch: tools/list and tools/call
 │   │       │   └── server.rs        # Session state machine
 │   │       ├── router/
 │   │       │   ├── mod.rs           # ToolRouter: load/unload toolsets
-│   │       │   ├── registry.rs      # Static toolset metadata + tools_for() dispatcher
+│   │       │   ├── registry.rs      # Exposed raw metadata, disabled policy, tools_for()
 │   │       │   └── meta_tools.rs    # 6 always-visible meta-tools
 │   │       └── tools/
 │   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir()
 │   │           ├── cli.rs            # kicad-cli v10 subprocess wrapper (verified against actual binary)
 │   │           ├── svg_import.rs     # SVG parsing + Bezier flattening for import_svg_logo (usvg-backed)
-│   │           ├── project.rs        # 7 tools (incl. open_schematic_viewer)
-│   │           ├── sch_components.rs # 20 tools (component placement with lib_symbols embedding)
-│   │           ├── sch_wiring.rs     # 20 tools (incl. connect_pins, power symbol embedding)
+│   │           ├── project.rs        # 6 exposed tools
+│   │           ├── sch_components.rs # 19 exposed tools (component placement with lib_symbols embedding)
+│   │           ├── sch_wiring.rs     # 19 exposed tools (incl. connect_pins)
 │   │           ├── sch_analysis.rs   # 15 tools (union-find net graph, connectivity)
 │   │           ├── sch_batch.rs      # 12 tools (single-read/single-write atomic operations)
-│   │           ├── sch_export.rs     # 7 tools (SVG/PDF/netlist/ERC/PCB sync)
+│   │           ├── sch_export.rs     # 10 tools (render/export/ERC/PCB sync)
 │   │           ├── sch_bus.rs        # 4 tools (buses, bus entries, pin fan-out)
 │   │           ├── pcb_sync.rs       # update_pcb_from_schematic: pure planner + one-commit IPC apply
 │   │           ├── sch_hierarchy.rs  # 12 tools (typed Sheet model, sheet CRUD + hierarchy/page queries + pin lifecycle)
-│   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
+│   │           ├── pcb_board.rs      # 8 exposed tools (S-expr file editing + IPC fallback)
 │   │           ├── pcb_components.rs # 20 tools (IPC real-time + safe headless single-placement fallback)
 │   │           ├── pcb_footprint_update.rs # library refresh planner + one-commit IPC apply
-│   │           ├── pcb_routing.rs    # 17 tools (traces, vias, nets, netclasses, SES import)
-│   │           ├── pcb_export.rs     # 14 tools (Gerber, PDF, 3D, Specctra DSN, DRC, DXF/GenCAD/IPC-2581/ODB++)
+│   │           ├── pcb_routing.rs    # 14 exposed tools (traces, vias, netclasses, SES import)
+│   │           ├── pcb_export.rs     # 8 exposed tools (Gerber, PDF, 3D, Specctra DSN, DRC)
 │   │           ├── library.rs        # 17 tools (symbol/footprint library management)
 │   │           ├── footprint_graphics.rs # footprint primitive validation, inspection, and atomic edits
 │   │           ├── footprint_metadata.rs # footprint description, tags, and attribute edits
 │   │           ├── footprint_models.rs # footprint 3D model validation and atomic edits
-│   │           ├── integration.rs    # 9 tools (JLCPCB SQLite, Freerouting MCP, datasheets)
-│   │           ├── verification.rs   # 10 tools (DRC, design rules, KiCAD UI)
-│   │           ├── config.rs         # 7 tools (user/project config, design rules)
-│   │           ├── design_review.rs  # 6 tools (decoupling/connection/power/DFM audits)
+│   │           ├── integration.rs    # 2 exposed tools (Freerouting MCP + datasheet lookup)
+│   │           ├── verification.rs   # 6 exposed tools (DRC, sizes, clearance, KiCAD status)
+│   │           ├── config.rs         # 6 exposed tools (user/project config, design rules)
+│   │           ├── design_review.rs  # 5 exposed tools (decoupling/connection/power/BOM audits)
 │   │           ├── templates.rs      # 4 tools (6 built-in reference circuit templates)
-│   │           └── manufacturing.rs  # 3 tools (export package, validate, cost estimate)
+│   │           ├── manufacturing.rs  # 2 exposed tools (export package + validation)
+│   │           └── workflow.rs       # 7 guarded workflow tools (separate from raw toolsets)
 │   │
 │   ├── konnect-sexp/                  # S-expression engine (no KiCAD dependency)
 │   │   └── src/
@@ -346,15 +347,25 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 227 tools (233 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The binary contains 227 raw implementations. Policy disables 33, leaving 194
+exposed raw tools; seven guarded workflow tools form a separate surface.
+`exposure_profile` selects the process-wide contract:
 
-- **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 6 meta-tools, baseline `tools/list` is 20 tools ≈ 2K tokens.
+- `legacy` (default): raw router + six meta-tools;
+- `expert`: Legacy + seven guarded workflow tools;
+- `workflow`: seven guarded workflow tools + the two observability meta-tools,
+  with no raw router.
+
+Legacy and Expert do not expose their full raw catalogue in `tools/list` by
+default. Instead:
+
+- **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Legacy starts with 18 tools; Expert adds seven workflows for 25. Workflow has a fixed nine-tool surface.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
 - **`tools/list_changed` notification**: sent on every load/unload so MCP clients refresh their local tool cache.
 - **Error recovery**: if the LLM calls an unloaded tool, `handler.rs` returns an actionable error naming the toolset that owns it (so the LLM can load it and retry in one hop — no extra `list_toolboxes` round-trip).
 - **`auto_load_toolsets` (config key, default `false`)**: when set, a miss in `dispatch_tool` loads the owning toolset and executes the call in the same hop instead of returning `toolset_not_loaded` -- fewer round trips, at the cost of toolsets accumulating monotonically for the rest of the session (`unload_toolset` still prunes, but a tool call reloads its toolset right back). Off by default because the router's whole point is keeping `tools/list` small; turn it on only if your client would rather eat the context growth than handle one recoverable error per miss. Set via `konnect.toml`/`settings.json` (`auto_load_toolsets = true`) or the equivalent `ServerConfig` field when embedding.
 
-- **`eager_toolsets` (config key, default `false`)**: pre-loads every toolset at startup via `ToolRouter::load_all`, so the *first* `tools/list` is the full catalogue. This is for MCP clients that cache the initial tool list and never act on `notifications/tools/list_changed` — for those, a tool absent from the first listing can never be called at all, because `load_toolset` reports the names it loaded but returns no schemas and the client has nothing to invoke (#134, #169). Note `auto_load_toolsets` does **not** cover this case: it fires on a tool *call*, so it only helps a caller that already knows the tool name. Costs ~25K tokens per listing against the ~2K baseline, which is the router's entire reason for existing — hence off by default.
+- **`eager_toolsets` (config key, default `false`)**: in Legacy or Expert, pre-loads every exposed raw toolset at startup via `ToolRouter::load_all`, so the *first* `tools/list` is complete for that profile (200 and 207 tools respectively). This is for MCP clients that cache the initial tool list and never act on `notifications/tools/list_changed`. It does not affect Workflow, which has no raw router.
 
 The router is defined in `crates/konnect-core/src/router/mod.rs`.
 
@@ -421,9 +432,10 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **20 toolsets, 227 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
-- Baseline `tools/list`: 20 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 233 tools (227 registered + 6 meta) / ~25K tokens
+- **227 raw implementations, 194 exposed raw tools** across 20 toolsets; 33 raw implementations are intentionally disabled
+- 7 guarded workflow tools + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
+- Starter `tools/list`: Legacy 18 tools; Expert 25 tools; Workflow 9 tools
+- Legacy full: 200 tools; Expert full: 207 tools; Workflow: 9 tools
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands.

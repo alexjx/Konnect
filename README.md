@@ -13,10 +13,11 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**227 tools across 20 on-demand toolsets.** Schematic capture, PCB layout and
-routing, ERC/DRC, design-review audits, JLCPCB part search, reference
-circuits, and a full manufacturing export pipeline — with bundled namespaced
-skills and safety hooks that teach supported KiCAD conventions out of the box.
+**227 raw implementations: 194 exposed across 20 on-demand toolsets, plus 7 guarded workflow tools.**
+Schematic capture, PCB layout and routing, ERC/DRC, design-review audits,
+reference circuits, and a manufacturing export pipeline — with bundled
+namespaced skills and safety hooks that teach supported KiCAD conventions out
+of the box.
 
 > **Status: beta.** The core toolchain is tested and working, but this is a young
 > release and it wants real-world mileage and review. Issues and PRs are welcome —
@@ -93,11 +94,13 @@ through its own S-expression engine with atomic writes (write, fsync, rename), U
 preservation, and round-trip tests — no third-party schematic library with known
 gaps, no text-manipulation workarounds.
 
-**Context economy is a feature.** Exposing all 227 tools to an LLM costs roughly 23K
-tokens of context on every listing. Konnect's router loads a starter kit (~2K
-tokens) and lets the model pull in toolsets on demand — plus built-in observability
-(`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
-own tool failures.
+**Context economy is a feature.** The 227 raw implementations include 33 that
+are intentionally disabled because they do not meet the fork's current safety
+or workflow policy. Of the 194 exposed raw tools, Konnect's router loads only a
+starter kit and lets the model pull in toolsets on demand. Guarded workflows
+add an explicit inspect → plan → apply → verify lifecycle, while built-in
+observability (`get_recent_calls`, `server_stats`, JSONL call logs) lets the
+model diagnose its own failures.
 
 The result is smaller, faster to install, aligned with where KiCAD is going, and
 built for production use rather than experimentation. The original project remains
@@ -115,13 +118,22 @@ directly:
 - **Run design checks** — ERC, DRC, connectivity validation, decoupling audits,
   power-rail review, BOM health checks
 - **Export production files** — Gerbers, drill, BOM, pick-and-place, 3D models, PDF
-- **Search JLCPCB parts** — find in-stock components in a local 2.5M-part catalog and
-  suggest alternatives
+- **Resolve datasheets** — retrieve a component datasheet URL by MPN or LCSC ID
 - **Start from reference circuits** — USB-C, LDO, buck converter, STM32, I2C, LED
   templates with verified component values
 - **Watch it happen** — a live schematic viewer auto-refreshes as the AI edits
 
 The full tool catalog is documented in [tool-directory.md](tool-directory.md).
+
+Choose the process-wide capability surface with `exposure_profile` in
+`konnect.toml` or `settings.json`:
+
+- `legacy` (default): exposed raw tools plus six meta-tools — 18 tools at
+  startup, 200 when every raw toolset is loaded;
+- `expert`: the Legacy surface plus seven guarded workflow tools — 25 at
+  startup, 207 when every raw toolset is loaded;
+- `workflow`: seven guarded workflow tools plus the two observability
+  meta-tools — 9 tools, with no raw-tool router.
 
 ## How it works
 
@@ -159,7 +171,7 @@ the KiCad 11 integration path. Konnect uses its Rust exporter by default;
 `native_bridge_mode: "prefer"` enables fallback to Rust when the bridge is
 unavailable, while `"require"` refuses instead.
 
-For end-to-end autorouting, run `check_freerouting`, then
+For end-to-end autorouting, use
 `export_specctra_dsn` → `route_specctra_dsn` →
 `plan_specctra_ses_import` / `apply_specctra_ses`. Readiness reports engine
 discovery, native-MCP compatibility, and complete bridge availability
@@ -308,8 +320,8 @@ too, with a depth-indented sheet selector in the toolbar. Edits saved from KiCAD
 made by the AI through the schematic tools) re-render only the sheets that changed
 and refresh the view live — rendering runs against temp-folder snapshots, so the
 viewer never blocks KiCAD from saving. Pan with click-drag, zoom with the wheel,
-`0` to fit, `R` to refresh, drag-and-drop to open a different file. Also launchable
-by the AI via the `open_schematic_viewer` tool.
+`0` to fit, `R` to refresh, and drag-and-drop to open a different file. Open it
+directly when a live visual companion is useful.
 
 Needs the WebView2 runtime (pre-installed on Windows 10/11) and a KiCAD install for
 `kicad-cli` (auto-discovered, or pass `--kicad-cli <path>`). Built separately from
@@ -353,7 +365,7 @@ the architecture it proved, rebuilt for production:
 | PCB backend | SWIG (deprecated by KiCAD) + experimental IPC | KiCAD 10 IPC API |
 | Schematic backend | kicad-skip + custom loaders | Native S-expression engine, atomic writes |
 | Context cost | Router pattern | Load/unload toolsets + observability |
-| Skills / agents | — | 6 skills + 2 agents bundled |
+| Skills / agents | — | 4 namespaced skills bundled |
 | License | MIT | AGPL-3.0 + commercial |
 
 ## Troubleshooting

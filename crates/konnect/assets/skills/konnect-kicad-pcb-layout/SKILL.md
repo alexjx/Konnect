@@ -9,38 +9,44 @@ Mutate PCB data only through Konnect and the formal live KiCad PCB Editor.
 Verify the exact requested board before writing; never edit `.kicad_pcb`
 directly or use an unbound/background document.
 
-## Route by exposed capabilities
+## Prefer the guarded workflow
 
-- Start with the exact project or board path. Use `open_project`,
-  `get_project_info`, and `get_board_info` to establish identity, then read the
-  authorized footprints with `get_component_list`.
-- Use `set_component_placements` for an atomic batch of existing-footprint
-  transforms. Supply the complete absolute `x`, `y`, and `rotation` for every
-  entry, even when only one value changes.
-- Discover and load only the raw toolsets needed. The server's board-access
-  classification decides whether an operation requires live IPC, permits a
-  revision-checked closed-board fallback, or must refuse. Do not bypass that
-  decision with direct file editing.
-- Use specialized tools for flips, creation/deletion, outlines, routing, vias,
-  zones, and netclasses. Do not infer support from a related placement tool.
-- Do not apply only the supported subset of a mixed request unless the user
-  explicitly accepts partial completion.
+For complete absolute transforms of existing footprints, use this lifecycle in
+Expert or Workflow:
 
-## Reviewable raw change lifecycle
+1. Open the exact board in the visible PCB Editor, then call `inspect_design`
+   with its exact path. Confirm the live document identity and authorized
+   footprint references.
+2. Call `plan_pcb_edit` with the same board and complete absolute placement for
+   every target. Planning is zero-write and must uniquely resolve every target.
+3. Review the returned `change_set_id`, immutable operations, exact resource
+   revision, courtyard/overlap evidence, and every structured gate. Use
+   `get_change_set` when retained state must be re-read. Do not apply a blocked,
+   incomplete, or stale plan.
+4. Call `apply_change_set` once with that ID. It must bind the exact live board
+   and commit the complete placement update as one KiCad undo step.
+5. Call `verify_change_set` with the same ID. Completion requires exact live
+   document readback and a verified effect state, not merely a successful apply.
 
-1. Prove the exact board identity and read every authorized target. Take a
-   project snapshot before a broad or difficult-to-reverse change.
-2. Present the complete intended transforms and target references before
-   writing. Raw tools do not create a stored plan, fingerprint, or courtyard
-   baseline.
-3. Apply one small batch. A live `set_component_placements` call is one KiCad
-   undo step; a closed-board fallback is one revision-checked file write.
-4. Re-read every affected footprint. If live IPC was used, save with
-   `save_project` only after the readback and applicable checks pass; the raw
-   placement call does not own the save.
-5. Stop on a refusal, error, or ambiguous result and inspect observed state
-   before another mutation. Use KiCad undo, the snapshot, or version control for
-   recovery; there is no stored change set to discard.
+If a zero-effect plan is no longer wanted, call `discard_change_set`. Change
+sets are process-local and expire; never treat an ID from another server
+process as durable authorization.
+
+## Raw tools for unsupported operations
+
+The guarded PCB schema currently supports existing-footprint transforms.
+Flips, pad angles, creation/deletion, outlines, routing, vias, zones, and
+netclasses require exposed raw tools in Legacy or Expert. Workflow has no raw
+router; report the capability gap instead of changing profiles or calling a
+hidden implementation without user direction.
+
+For a supported raw operation, establish the exact board identity, load only
+the required toolset, inspect every target, and invoke the smallest atomic or
+batch write once. The server's board-access classification decides whether an
+operation requires live IPC, permits a revision-checked closed-board fallback,
+or refuses. Re-read every affected object and stop on any refusal, partial
+result, or ambiguous effect. Do not apply only the supported subset of a mixed
+request unless the user explicitly accepts partial completion.
 
 ## Scope and evidence
 
@@ -53,7 +59,7 @@ directly or use an unbound/background document.
   when required evidence is missing or conflicting.
 - For placement or floorplanning, apply the maintained
   [layout rules](references/layout-rules.md) after project-specific requirements.
-- Raw placement does not provide the fork workflow's new-overlap courtyard
+- Raw placement does not provide the guarded workflow's new-overlap courtyard
   baseline. Check placement and courtyard evidence separately. Neither a clean
   origin-based move nor a screenshot proves assembly margin, board-edge
   clearance, keepouts, enclosure/access, copper clearance, thermal behavior, or
@@ -63,8 +69,8 @@ directly or use an unbound/background document.
 
 For raw writes, bind the exact live board, snapshot authorized targets, re-read
 affected state afterward, and save through IPC only after applicable checks
-pass. If a raw write returns an error or ambiguous outcome, stop, inspect the
-live board, and do not retry until the actual effect is known. Read
+pass. If a raw write returns an error or ambiguous outcome, stop and inspect
+the live board. Read
 [PCB completion](references/pcb-completion.md) only for routing, vias, zones,
 DRC, or fabrication outputs. Do not order or transmit fabrication without
 explicit user authorization.

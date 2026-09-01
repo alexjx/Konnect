@@ -176,7 +176,7 @@ mod tests {
         }
         assert_eq!(active.len(), registry::ALL_TOOLSETS.len());
 
-        // And the listing it produces is the full catalogue.
+        // And the listing it produces is the full exposed catalogue.
         let listed = router.active_tools().await.len();
         let registered: usize = registry::ALL_TOOLSETS.iter().map(|t| t.tool_count).sum();
         assert_eq!(
@@ -235,9 +235,83 @@ mod tests {
     }
 
     #[test]
+    fn implementation_and_exposed_catalogue_counts_are_stable() {
+        let implemented: usize = registry::ALL_TOOLSETS
+            .iter()
+            .map(|meta| registry::raw_tools_for(meta.name).unwrap().len())
+            .sum();
+        let exposed: usize = registry::ALL_TOOLSETS
+            .iter()
+            .map(|meta| registry::tools_for(meta.name).unwrap().len())
+            .sum();
+
+        assert_eq!(implemented, 227, "unexpected implementation catalogue size");
+        assert_eq!(exposed, 194, "unexpected exposed raw tool count");
+        assert_eq!(implemented - exposed, registry::DISABLED_TOOLS.len());
+    }
+
+    #[test]
+    fn every_intentionally_disabled_tool_is_implemented_but_not_exposed() {
+        assert_eq!(registry::DISABLED_TOOLS.len(), 33);
+
+        let implemented: std::collections::HashSet<&str> = registry::ALL_TOOLSETS
+            .iter()
+            .flat_map(|meta| registry::raw_tools_for(meta.name).unwrap())
+            .map(|def| def.name)
+            .collect();
+        let exposed: std::collections::HashSet<&str> = registry::ALL_TOOLSETS
+            .iter()
+            .flat_map(|meta| registry::tools_for(meta.name).unwrap())
+            .map(|def| def.name)
+            .collect();
+
+        for disabled in registry::DISABLED_TOOLS {
+            assert!(
+                implemented.contains(disabled.name),
+                "disabled tool '{}' no longer has an implementation; remove its tombstone",
+                disabled.name
+            );
+            assert!(
+                !exposed.contains(disabled.name),
+                "disabled tool '{}' leaked into the exposed catalogue",
+                disabled.name
+            );
+            assert!(
+                !disabled.reason.trim().is_empty(),
+                "disabled tool '{}' must document why it is hidden",
+                disabled.name
+            );
+        }
+    }
+
+    #[test]
+    fn starter_toolsets_each_expose_six_tools() {
+        assert_eq!(registry::tools_for("project").unwrap().len(), 6);
+        assert_eq!(registry::tools_for("config").unwrap().len(), 6);
+    }
+
+    #[test]
+    fn upstream_toolset_additions_remain_exposed() {
+        let sch_bus: std::collections::HashSet<&str> = registry::tools_for("sch_bus")
+            .unwrap()
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        let placement: std::collections::HashSet<&str> = registry::tools_for("placement")
+            .unwrap()
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+
+        assert_eq!(sch_bus.len(), 4);
+        assert_eq!(placement.len(), 5);
+        assert!(placement.contains("plan_bga_fanout"));
+    }
+
+    #[test]
     fn no_toolset_has_duplicate_tool_names() {
         for meta in registry::ALL_TOOLSETS {
-            let defs = registry::tools_for(meta.name).unwrap();
+            let defs = registry::raw_tools_for(meta.name).unwrap();
             let mut seen = std::collections::HashSet::new();
             for d in &defs {
                 assert!(
@@ -260,7 +334,7 @@ mod tests {
             std::collections::HashMap::new();
         let mut collisions = Vec::new();
         for meta in registry::ALL_TOOLSETS {
-            let defs = registry::tools_for(meta.name).unwrap();
+            let defs = registry::raw_tools_for(meta.name).unwrap();
             for d in &defs {
                 if let Some(prev) = owner.insert(d.name, meta.name) {
                     if prev != meta.name {

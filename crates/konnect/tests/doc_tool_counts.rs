@@ -30,37 +30,86 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {rel}: {e}"))
 }
 
-/// Ground truth: what the registry actually declares.
-fn counts() -> (usize, usize, usize) {
+#[derive(Debug, Clone, Copy)]
+struct Counts {
+    toolsets: usize,
+    implemented_raw: usize,
+    exposed_raw: usize,
+    workflow: usize,
+    meta: usize,
+    legacy_full: usize,
+    expert_full: usize,
+    workflow_full: usize,
+    legacy_starter: usize,
+    expert_starter: usize,
+}
+
+/// Ground truth: derive each public surface from its owning definitions.
+fn counts() -> Counts {
     let toolsets = registry::ALL_TOOLSETS.len();
-    let registered: usize = registry::ALL_TOOLSETS.iter().map(|t| t.tool_count).sum();
-    let meta = konnect_core::router::meta_tools::meta_tool_descriptions().len();
-    (toolsets, registered, meta)
+    let exposed_raw: usize = registry::ALL_TOOLSETS.iter().map(|t| t.tool_count).sum();
+    let implemented_raw = exposed_raw + registry::DISABLED_TOOLS.len();
+    let workflow = konnect_core::tools::workflow::tools().len();
+    let meta_defs = konnect_core::router::meta_tools::meta_tool_descriptions();
+    let meta = meta_defs.len();
+    let workflow_meta = meta_defs
+        .iter()
+        .filter(|tool| matches!(tool.name.as_str(), "get_recent_calls" | "server_stats"))
+        .count();
+    let starter_raw: usize = registry::STARTER_KIT
+        .iter()
+        .map(|name| {
+            registry::tools_for(name)
+                .expect("starter toolset resolves")
+                .len()
+        })
+        .sum();
+    Counts {
+        toolsets,
+        implemented_raw,
+        exposed_raw,
+        workflow,
+        meta,
+        legacy_full: exposed_raw + meta,
+        expert_full: exposed_raw + workflow + meta,
+        workflow_full: workflow + workflow_meta,
+        legacy_starter: starter_raw + meta,
+        expert_starter: starter_raw + workflow + meta,
+    }
 }
 
 /// Every number a document is required to quote, with the exact spelling to
 /// look for. Kept as whole phrases rather than bare integers so a coincidental
 /// "187" elsewhere in the file cannot satisfy the check.
 fn required_phrases() -> Vec<(&'static str, String)> {
-    let (toolsets, registered, meta) = counts();
-    let total = registered + meta;
+    let counts = counts();
     vec![
         (
             "README.md",
-            format!("**{registered} tools across {toolsets} on-demand toolsets.**"),
+            format!(
+                "**{} raw implementations: {} exposed across {} on-demand toolsets, plus {} guarded workflow tools.**",
+                counts.implemented_raw, counts.exposed_raw, counts.toolsets, counts.workflow
+            ),
         ),
         (
             "DEV.md",
-            format!("**{toolsets} toolsets, {registered} tools** + {meta} meta-tools"),
+            format!(
+                "**{} raw implementations, {} exposed raw tools** across {} toolsets",
+                counts.implemented_raw, counts.exposed_raw, counts.toolsets
+            ),
         ),
         (
             "DEV.md",
-            format!("{total} tools ({registered} registered + {meta} meta)"),
+            format!(
+                "Legacy full: {} tools; Expert full: {} tools; Workflow: {} tools",
+                counts.legacy_full, counts.expert_full, counts.workflow_full
+            ),
         ),
         (
             "tool-directory.md",
             format!(
-                "**{registered} registered tools** + **{meta} always-visible meta-tools** = **{total} total**"
+                "**{} exposed raw tools** + **{} guarded workflow tools** + **{} meta-tools**",
+                counts.exposed_raw, counts.workflow, counts.meta
             ),
         ),
     ]
@@ -122,8 +171,13 @@ fn tool_directory_lists_every_registered_tool() {
 /// unambiguously not catalogue totals and are left alone.
 #[test]
 fn no_file_quotes_a_stale_catalogue_total() {
-    let (_, registered, meta) = counts();
-    let total = registered + meta;
+    let counts = counts();
+    let supported = [
+        counts.implemented_raw,
+        counts.exposed_raw,
+        counts.legacy_full,
+        counts.expert_full,
+    ];
 
     let mut stale = Vec::new();
     for path in text_files(&repo_root()) {
@@ -132,7 +186,7 @@ fn no_file_quotes_a_stale_catalogue_total() {
         };
         for (lineno, line) in text.lines().enumerate() {
             for n in counts_in(line) {
-                if n >= 100 && n != registered && n != total {
+                if n >= 100 && !supported.contains(&n) {
                     let rel = path
                         .strip_prefix(repo_root())
                         .unwrap_or(&path)
@@ -140,9 +194,13 @@ fn no_file_quotes_a_stale_catalogue_total() {
                         .to_string()
                         .replace('\\', "/");
                     stale.push(format!(
-                        "{rel}:{}: says \"{n} tools\" — the registry has {registered} \
-                         registered, {total} with meta-tools",
-                        lineno + 1
+                        "{rel}:{}: says \"{n} tools\" — supported catalogue counts are \
+                         {} implemented raw, {} exposed raw, {} Legacy full, and {} Expert full",
+                        lineno + 1,
+                        counts.implemented_raw,
+                        counts.exposed_raw,
+                        counts.legacy_full,
+                        counts.expert_full
                     ));
                 }
             }
@@ -229,7 +287,7 @@ fn counts_in(line: &str) -> Vec<usize> {
 /// it from an unrelated number.
 #[test]
 fn no_file_quotes_a_stale_toolset_count() {
-    let (toolsets, _, _) = counts();
+    let toolsets = counts().toolsets;
 
     let mut stale = Vec::new();
 
@@ -293,12 +351,15 @@ fn tool_directory_section_headings_match_the_registry() {
         let claimed: Option<usize> = tail
             .split_whitespace()
             .find_map(|word| word.parse::<usize>().ok());
+        let exposed = registry::tools_for(meta.name)
+            .expect("documented toolset resolves")
+            .len();
         match claimed {
-            Some(n) if n == meta.tool_count => {}
+            Some(n) if n == exposed => {}
             Some(n) => wrong.push(format!(
-                "tool-directory.md:{}: `{name}` heading says {n} tools, registry says {}",
+                "tool-directory.md:{}: `{name}` heading says {n} tools, registry exposes {}",
                 lineno + 1,
-                meta.tool_count
+                exposed
             )),
             None => wrong.push(format!(
                 "tool-directory.md:{}: `{name}` heading states no tool count",
@@ -360,10 +421,52 @@ fn counts_before(line: &str, noun: &str) -> Vec<usize> {
 /// taking it from 6 to 7.
 #[test]
 fn docs_quote_the_meta_tool_count() {
-    let (_, _, meta) = counts();
+    let meta = counts().meta;
     let dev = read("DEV.md");
     assert!(
         dev.contains(&format!("{meta} meta-tools")),
         "DEV.md must state \"{meta} meta-tools\" — the registry defines {meta}"
     );
+}
+
+#[test]
+fn tool_directory_lists_workflows_but_not_disabled_raw_implementations() {
+    let directory = read("tool-directory.md");
+
+    let missing_workflows: Vec<_> = konnect_core::tools::workflow::tools()
+        .into_iter()
+        .filter(|def| !directory.contains(&format!("`{}`", def.name)))
+        .map(|def| def.name)
+        .collect();
+    assert!(
+        missing_workflows.is_empty(),
+        "tool-directory.md is missing workflow tools: {}",
+        missing_workflows.join(", ")
+    );
+
+    let advertised_disabled: Vec<_> = registry::DISABLED_TOOLS
+        .iter()
+        .filter(|disabled| directory.contains(&format!("`{}`", disabled.name)))
+        .map(|disabled| disabled.name)
+        .collect();
+    assert!(
+        advertised_disabled.is_empty(),
+        "tool-directory.md advertises disabled raw implementations: {}",
+        advertised_disabled.join(", ")
+    );
+}
+
+#[test]
+fn implementation_exposure_and_profile_counts_are_stable() {
+    let counts = counts();
+    assert_eq!(counts.implemented_raw, 227);
+    assert_eq!(counts.exposed_raw, 194);
+    assert_eq!(registry::DISABLED_TOOLS.len(), 33);
+    assert_eq!(counts.workflow, 7);
+    assert_eq!(counts.meta, 6);
+    assert_eq!(counts.legacy_full, 200);
+    assert_eq!(counts.expert_full, 207);
+    assert_eq!(counts.workflow_full, 9);
+    assert_eq!(counts.legacy_starter, 18);
+    assert_eq!(counts.expert_starter, 25);
 }

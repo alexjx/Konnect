@@ -1,7 +1,7 @@
 {
   "identifier": "com.github.mixelpixx.konnect",
   "name": "Konnect",
-  "description": "AI-assisted PCB design via the Model Context Protocol. 227 tools for schematic editing, PCB layout, routing, design review, and manufacturing export.",
+  "description": "AI-assisted PCB design via MCP with 194 exposed raw tools, 7 guarded workflow tools, and selectable capability profiles.",
   "runtime": {
     "type": "exec"
   },

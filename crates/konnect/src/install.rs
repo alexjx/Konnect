@@ -161,6 +161,9 @@ pub fn print_hook_output(name: &str) -> Result<()> {
 
 fn hook_tool_names(board_access: konnect_core::tools::BoardAccess) -> Vec<&'static str> {
     let mut names = BTreeSet::new();
+    // Registry toolsets expose their intentionally filtered MCP surface via
+    // `tools_for`; raw implementations listed in DISABLED_TOOLS must never
+    // leak into client guidance.
     for toolset in konnect_core::router::registry::ALL_TOOLSETS {
         if let Some(tools) = konnect_core::router::registry::tools_for(toolset.name) {
             for tool in tools {
@@ -170,15 +173,24 @@ fn hook_tool_names(board_access: konnect_core::tools::BoardAccess) -> Vec<&'stat
             }
         }
     }
+    // Guarded workflow tools are intentionally independent of ALL_TOOLSETS.
+    // Include their board-state contracts without registering a synthetic
+    // toolset or exposing disabled raw tools. The set also makes a future
+    // overlap deterministic and duplicate-free.
+    for tool in konnect_core::tools::workflow::tools() {
+        if tool.board_access == board_access {
+            names.insert(tool.name);
+        }
+    }
     names.into_iter().collect()
 }
 
-fn hook_matcher(hook: &crate::manifest::HookSkillManifest) -> Result<String> {
+fn hook_matcher(hook: &crate::manifest::HookSkillManifest) -> Option<String> {
     let names = hook_tool_names(hook.board_access);
     if names.is_empty() {
-        anyhow::bail!("hook '{}' has no registered tool targets", hook.name);
+        return None;
     }
-    Ok(format!("mcp__konnect__({})", names.join("|")))
+    Some(format!("mcp__konnect__({})", names.join("|")))
 }
 
 fn quote_command_arg(argument: &str) -> String {
@@ -555,6 +567,9 @@ fn patch_claude_settings(path: &Path, exe_str: &str) -> Result<usize> {
 
     let mut added = 0;
     for hook in HOOK_SKILLS {
+        let Some(matcher) = hook_matcher(hook) else {
+            continue;
+        };
         let command = hook_command(exe_str, "hook", hook.name);
         let legacy_command = legacy_hook_command(exe_str, hook.name);
         let event_arr = hooks_obj
@@ -581,7 +596,7 @@ fn patch_claude_settings(path: &Path, exe_str: &str) -> Result<usize> {
         });
         if !already_exists {
             event_arr.push(serde_json::json!({
-                "matcher": hook_matcher(hook)?,
+                "matcher": matcher,
                 "hooks": [{
                     "type": "command",
                     "command": command
@@ -863,32 +878,44 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(settings_path).unwrap()).unwrap();
         assert_eq!(settings["theme"], "dark");
         let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(entries.len(), HOOK_SKILLS.len());
+        assert_eq!(
+            entries.len(),
+            HOOK_SKILLS
+                .iter()
+                .filter(|hook| hook_matcher(hook).is_some())
+                .count()
+        );
         for hook in HOOK_SKILLS {
+            let Some(matcher) = hook_matcher(hook) else {
+                continue;
+            };
             let expected_command = hook_command(
                 std::env::current_exe().unwrap().to_string_lossy().as_ref(),
                 "hook",
                 hook.name,
             );
             assert!(entries.iter().any(|entry| {
-                entry["matcher"] == hook_matcher(hook).unwrap()
-                    && entry["hooks"][0]["command"] == expected_command
+                entry["matcher"] == matcher && entry["hooks"][0]["command"] == expected_command
             }));
         }
     }
 
     #[test]
-    fn hook_matchers_are_derived_from_registered_board_contracts() {
+    fn hook_matchers_include_filtered_registry_and_independent_workflow_contracts_once() {
         let registered = konnect_core::router::registry::ALL_TOOLSETS
             .iter()
             .flat_map(|toolset| {
                 konnect_core::router::registry::tools_for(toolset.name).unwrap_or_default()
             })
+            .chain(konnect_core::tools::workflow::tools())
             .map(|tool| (tool.name, tool.board_access))
             .collect::<std::collections::HashMap<_, _>>();
 
+        let mut occurrences = std::collections::HashMap::new();
         for hook in HOOK_SKILLS {
-            let matcher = hook_matcher(hook).unwrap();
+            let Some(matcher) = hook_matcher(hook) else {
+                continue;
+            };
             let targets = matcher
                 .strip_prefix("mcp__konnect__(")
                 .and_then(|value| value.strip_suffix(')'))
@@ -898,11 +925,38 @@ mod tests {
             assert!(!targets.is_empty());
             for target in targets {
                 assert_eq!(registered.get(target), Some(&hook.board_access), "{target}");
+                *occurrences.entry(target.to_string()).or_insert(0usize) += 1;
             }
         }
-        assert!(!HOOK_SKILLS
-            .iter()
-            .any(|hook| hook_matcher(hook).unwrap().contains("refill_zones")));
+        assert!(occurrences.values().all(|count| *count == 1));
+
+        assert_eq!(
+            registered.get("plan_pcb_edit"),
+            Some(&konnect_core::tools::BoardAccess::LiveOnly)
+        );
+        assert_eq!(occurrences.get("plan_pcb_edit"), Some(&1));
+        for tool_name in ["apply_change_set", "verify_change_set"] {
+            assert_eq!(
+                registered.get(tool_name),
+                Some(&konnect_core::tools::BoardAccess::ApplyModeDependent)
+            );
+            assert_eq!(occurrences.get(tool_name), Some(&1), "{tool_name}");
+        }
+
+        assert_eq!(
+            konnect_core::router::registry::DISABLED_TOOLS.len(),
+            33,
+            "update this assertion when the intentional disabled surface changes"
+        );
+        for disabled in konnect_core::router::registry::DISABLED_TOOLS {
+            assert_eq!(
+                occurrences.get(disabled.name),
+                None,
+                "disabled raw tool '{}' leaked into a Claude hook matcher",
+                disabled.name
+            );
+        }
+
         assert_eq!(
             registered.get("route_trace"),
             Some(&konnect_core::tools::BoardAccess::LiveOnly)
@@ -920,7 +974,7 @@ mod tests {
         );
         assert_eq!(
             registered.get("flip_component"),
-            Some(&konnect_core::tools::BoardAccess::ClosedBoardOnly)
+            Some(&konnect_core::tools::BoardAccess::LiveOnly)
         );
         assert_eq!(
             registered.get("plan_bga_fanout"),
@@ -946,6 +1000,9 @@ mod tests {
             .collect::<Vec<_>>();
 
         for hook in HOOK_SKILLS {
+            if hook_matcher(hook).is_none() {
+                continue;
+            }
             assert!(commands.contains(&hook_command(exe, "hook", hook.name).as_str()));
         }
         #[cfg(windows)]

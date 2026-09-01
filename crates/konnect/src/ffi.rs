@@ -51,7 +51,7 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             auto_load_toolsets: config.auto_load_toolsets,
             eager_toolsets: config.eager_toolsets,
         };
-        match McpHandler::new(server_config).await {
+        match McpHandler::new_with_profile(server_config, config.exposure_profile).await {
             Ok(handler) => match config.transport {
                 TransportMode::Stdio => {
                     let _ = crate::transport::stdio::run_stdio(handler).await;

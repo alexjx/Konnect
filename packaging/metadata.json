@@ -1,8 +1,8 @@
 {
   "$schema": "https://go.kicad.org/pcm/schemas/v1",
   "name": "Konnect",
-  "description": "AI-assisted PCB design via the Model Context Protocol. Enables Claude and other AI assistants to design schematics and PCBs with 227 tools organized into on-demand toolsets.",
-  "description_full": "Konnect exposes a complete set of KiCAD design tools to AI assistants via the Model Context Protocol (MCP). It supports schematic editing, PCB layout, local Freerouting MCP routing, library management, JLCPCB part search, ERC/DRC, design review audits, and full export pipelines. Tools are organized into 20 toolsets loaded on demand so the AI only sees relevant tools at once.",
+  "description": "AI-assisted PCB design via MCP with 194 exposed raw tools and 7 guarded workflow tools across selectable capability profiles.",
+  "description_full": "Konnect exposes KiCAD design capabilities to AI assistants through the Model Context Protocol (MCP). It supports schematic editing, PCB layout, local Freerouting MCP routing, library management, ERC/DRC, design review audits, and export pipelines. Choose Legacy for 194 raw tools across 20 on-demand toolsets, Expert to add 7 guarded workflow tools, or Workflow for a compact 9-tool inspect-plan-apply-verify surface.",
   "identifier": "com.github.mixelpixx.konnect",
   "type": "plugin",
   "author": {

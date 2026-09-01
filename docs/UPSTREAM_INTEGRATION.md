@@ -34,15 +34,19 @@ separate documentation change.
    [`upstream-intentional-removals.txt`](upstream-intentional-removals.txt) must
    be absent from the final tree. Useful upstream guidance may be adapted into
    the fork's namespaced replacements, but the removed paths are not restored.
-4. Preserve behavior, tests, and data contracts—not old implementation text.
+4. Removal policy applies to the callable capability surface as well as files.
+   Every name in `router::registry::DISABLED_TOOLS` must remain absent from MCP
+   discovery, dispatch, Claude hook matchers, skills, and the public tool
+   directory unless an explicit product decision re-enables it.
+5. Preserve behavior, tests, and data contracts—not old implementation text.
    Prefer a newer upstream implementation when it satisfies the same contract.
-5. Integrate one cohesive behavior slice at a time. Each slice must be reviewable
+6. Integrate one cohesive behavior slice at a time. Each slice must be reviewable
    and independently tested before the next begins.
-6. Do not resolve broad conflicts using repository-wide `ours` or `theirs`.
-7. Do not carry fork-only version bumps or `.agents/` bookkeeping into the new
+7. Do not resolve broad conflicts using repository-wide `ours` or `theirs`.
+8. Do not carry fork-only version bumps or `.agents/` bookkeeping into the new
    product history.
-8. Keep the old fork tip recoverable until the integrated release is verified.
-9. Do not declare the run complete until the full validation ladder and the
+9. Keep the old fork tip recoverable until the integrated release is verified.
+10. Do not declare the run complete until the full validation ladder and the
    intentional-removal assertion pass.
 
 ## What may be optimized experimentally
@@ -213,6 +217,10 @@ The first product slice makes the intended final policy visible:
    installer model. Do not transplant the old installer wholesale.
 4. Import relevant upstream safety or tool-signature corrections into the
    namespaced skills without recreating the removed directories.
+5. Compare the fork's callable tool surface with the upstream implementation
+   catalog. Restore explicit disabled-name tombstones before registering new
+   workflow or profile surfaces; an implementation may remain for controlled
+   migration without becoming discoverable or dispatchable.
 
 After the slice, this command must produce no output:
 
@@ -261,7 +269,8 @@ by the earlier ones:
 3. document/session binding and typed IPC primitives;
 4. live PCB geometry operations not already supplied upstream;
 5. the guarded inspect-plan-apply-verify workflow layer;
-6. plugin naming, packaging validation, tailored README, and contributor docs.
+6. raw capability filtering, workflow exposure profiles, and hook isolation;
+7. plugin naming, packaging validation, tailored README, and contributor docs.
 
 For each slice:
 
@@ -388,6 +397,9 @@ marker.
 - Divergence: 36 fork-only commits and 666 upstream-only commits
 - Trial merge: 46 content conflicts and 15 delete/modify conflicts
 - Intentional removals: 17 paths; all exist upstream, 15 were modified upstream
+- Capability removals: 37 raw tool names in the old fork; 33 implementations
+  still exist upstream and must be explicitly filtered rather than silently
+  re-exposed
 - Decision: use semantic replay from upstream; do not direct-merge or replay all
   36 commits mechanically
 - Confidence: 0.94 against direct merge; 0.88 for semantic replay; 0.80 for

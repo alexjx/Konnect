@@ -4,6 +4,10 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// MCP capability exposure: legacy, expert, or workflow.
+    #[serde(default)]
+    pub exposure_profile: konnect_core::mcp::handler::ExposureProfile,
+
     /// Path to the kicad-cli binary
     #[serde(default = "default_kicad_cli")]
     pub kicad_cli: String,
@@ -154,6 +158,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            exposure_profile: Default::default(),
             kicad_cli: default_kicad_cli(),
             kicad_binary: default_kicad_binary(),
             project_dir: None,
@@ -241,6 +246,7 @@ mod tests {
         for bad in [
             r#"{"transport": 42}"#,
             r#"{"transport": "carrier-pigeon"}"#,
+            r#"{"exposure_profile": "unsafe"}"#,
             r#"{"kicad_cli": ["a", "b"]}"#,
             r#"{"log_level": {"nested": true}}"#,
         ] {
@@ -273,6 +279,10 @@ mod tests {
         assert_eq!(c.http_address, d.http_address);
         assert_eq!(c.log_level, d.log_level);
         assert!(matches!(c.transport, TransportMode::Stdio));
+        assert!(matches!(
+            c.exposure_profile,
+            konnect_core::mcp::handler::ExposureProfile::Legacy
+        ));
     }
 
     #[test]
@@ -280,6 +290,33 @@ mod tests {
         let f = write_temp("toml", "");
         let c = Config::load_from(f.path()).unwrap();
         assert_eq!(c.log_level, "info");
+        assert!(matches!(
+            c.exposure_profile,
+            konnect_core::mcp::handler::ExposureProfile::Legacy
+        ));
+    }
+
+    #[test]
+    fn every_exposure_profile_parses_from_json_and_toml() {
+        use konnect_core::mcp::handler::ExposureProfile;
+
+        for (name, expected) in [
+            ("legacy", ExposureProfile::Legacy),
+            ("expert", ExposureProfile::Expert),
+            ("workflow", ExposureProfile::Workflow),
+        ] {
+            let json = write_temp("json", &format!(r#"{{"exposure_profile":"{name}"}}"#));
+            assert_eq!(
+                Config::load_from(json.path()).unwrap().exposure_profile,
+                expected
+            );
+
+            let toml = write_temp("toml", &format!("exposure_profile = \"{name}\"\n"));
+            assert_eq!(
+                Config::load_from(toml.path()).unwrap().exposure_profile,
+                expected
+            );
+        }
     }
 
     #[test]

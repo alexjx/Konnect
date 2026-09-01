@@ -404,6 +404,11 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         .flat_map(|ts| registry::tools_for(ts.name).unwrap_or_default())
         .map(|d| d.name.to_string())
         .chain(
+            konnect_core::tools::workflow::tools()
+                .into_iter()
+                .map(|d| d.name.to_string()),
+        )
+        .chain(
             ToolRouter::new()
                 .all_toolsets()
                 .iter()
@@ -414,6 +419,7 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
     let parameters: BTreeSet<String> = registry::ALL_TOOLSETS
         .iter()
         .flat_map(|ts| registry::tools_for(ts.name).unwrap_or_default())
+        .chain(konnect_core::tools::workflow::tools())
         .filter_map(|d| {
             d.input_schema
                 .get("properties")

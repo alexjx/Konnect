@@ -216,6 +216,12 @@ back to project-local sidecars.
 
 ## Tools don't appear after `load_toolset`
 
+First check `exposure_profile`. `load_toolset` applies only to the raw router in
+`legacy` and `expert`. The `workflow` profile intentionally has no raw toolsets;
+it exposes a fixed nine-tool surface (seven guarded workflow tools plus
+`get_recent_calls` and `server_stats`). Restart with `legacy` or `expert` if the
+task requires raw tools.
+
 After a successful `load_toolset` call the server sends a
 `notifications/tools/list_changed` notification, and MCP clients are expected to
 re-fetch `tools/list` in response. If newly loaded tools never show up:
@@ -245,11 +251,13 @@ callable tools, the fix is to make the *first* listing complete:
 { "eager_toolsets": true }
 ```
 
-in `konnect.toml` in the working directory, or a `settings.json` beside the binary. Every toolset is then loaded at
-startup, so `tools/list` carries all 233 tools from the first call.
+in `konnect.toml` in the working directory, or a `settings.json` beside the
+binary. Every exposed raw toolset is then loaded at startup, so the first
+`tools/list` carries 200 tools in Legacy or 207 in Expert.
 
 It is off by default because it costs what the router exists to save: roughly
-25K tokens per listing instead of ~2K. Turn it on only if your client needs it.
+the full catalogue instead of the 18-tool Legacy or 25-tool Expert starter.
+Turn it on only if your client needs it. It has no effect in Workflow.
 
 Note that `auto_load_toolsets` does **not** solve this. It loads a toolset when
 a tool from it is *called*, which helps only a client that already knows the
