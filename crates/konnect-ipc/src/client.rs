@@ -292,6 +292,101 @@ fn ensure_item_request_ok(status: i32, operation: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_via_dimension(name: &str, value: Option<f64>) -> Result<()> {
+    if let Some(value) = value {
+        if !value.is_finite() {
+            anyhow::bail!("via {name} must be finite");
+        }
+        if value <= 0.0 {
+            anyhow::bail!("via {name} must be greater than zero");
+        }
+    }
+    Ok(())
+}
+
+fn update_via_dimensions(
+    via: &mut kiapi::board::types::Via,
+    drill: Option<f64>,
+    pad_size: Option<f64>,
+) -> Result<()> {
+    let stack = via.pad_stack.as_mut().context("via has no pad stack")?;
+    let current_drill = stack
+        .drill
+        .as_ref()
+        .and_then(|drill| drill.diameter.as_ref())
+        .map(|diameter| crate::builders::nm_to_mm(diameter.x_nm))
+        .context("via has no drill diameter")?;
+    let current_pad_size = stack
+        .copper_layers
+        .first()
+        .and_then(|layer| layer.size.as_ref())
+        .map(|size| crate::builders::nm_to_mm(size.x_nm))
+        .context("via has no copper diameter")?;
+    let target_drill = drill.unwrap_or(current_drill);
+    let target_pad_size = pad_size.unwrap_or(current_pad_size);
+    validate_via_dimension("drill", Some(target_drill))?;
+    validate_via_dimension("pad_size", Some(target_pad_size))?;
+    if target_pad_size <= target_drill {
+        anyhow::bail!(
+            "via pad_size ({target_pad_size}) must be greater than drill ({target_drill}) to preserve a positive annular ring"
+        );
+    }
+
+    if let Some(drill) = drill {
+        let properties = stack
+            .drill
+            .as_mut()
+            .context("via has no drill properties")?;
+        properties.diameter = Some(crate::builders::vec2(drill, drill));
+    }
+    if let Some(pad_size) = pad_size {
+        if stack.copper_layers.is_empty() {
+            anyhow::bail!("via has no copper layers");
+        }
+        for layer in &mut stack.copper_layers {
+            layer.size = Some(crate::builders::vec2(pad_size, pad_size));
+        }
+    }
+    Ok(())
+}
+
+fn ipc_via(via: kiapi::board::types::Via) -> Result<IpcVia> {
+    let uuid = via.id.context("via has no KIID")?.value;
+    if uuid.is_empty() {
+        anyhow::bail!("via has an empty KIID");
+    }
+    let stack = via.pad_stack.as_ref().context("via has no pad stack")?;
+    let pad_size = stack
+        .copper_layers
+        .first()
+        .and_then(|layer| layer.size.as_ref())
+        .map(|size| crate::builders::nm_to_mm(size.x_nm))
+        .context("via has no copper diameter")?;
+    let drill = stack
+        .drill
+        .as_ref()
+        .and_then(|drill| drill.diameter.as_ref())
+        .map(|diameter| crate::builders::nm_to_mm(diameter.x_nm))
+        .context("via has no drill diameter")?;
+    let position = via.position.unwrap_or_default();
+    Ok(IpcVia {
+        uuid,
+        net_name: via.net.map(|net| net.name).unwrap_or_default(),
+        position: IpcVector2 {
+            x: nm_to_mm(position.x_nm),
+            y: nm_to_mm(position.y_nm),
+        },
+        pad_size,
+        drill,
+        layers: stack
+            .layers
+            .iter()
+            .map(|layer| layer_enum_to_name(*layer).to_string())
+            .collect(),
+        locked: via.locked == kiapi::common::types::LockedState::LsLocked as i32,
+    })
+}
+
 /// Marker error carried (via anyhow's error chain) by every failure where no
 /// request completed a round-trip with a live KiCad: no socket path
 /// configured, or the NNG dial/send failed.
@@ -1533,6 +1628,159 @@ impl KiCadIpcClient {
 
     pub fn delete_track(&self, uuid: &str) -> Result<()> {
         self.delete_items(vec![uuid.to_string()])
+    }
+
+    /// Read every via from the first open board.
+    pub fn get_vias(&self) -> Result<Vec<IpcVia>> {
+        self.get_vias_in(self.get_board_document()?)
+    }
+
+    /// Read every via from one exact open board document.
+    pub fn get_vias_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Vec<IpcVia>> {
+        self.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbVia)?
+            .into_iter()
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Via"))
+            .map(|item| {
+                kiapi::board::types::Via::decode(item.value.as_slice())
+                    .context("KiCad returned an unreadable via")
+                    .and_then(ipc_via)
+            })
+            .collect()
+    }
+
+    /// Update existing vias on the first open board as one undo transaction.
+    pub fn modify_vias(
+        &self,
+        identifiers: &[String],
+        drill: Option<f64>,
+        pad_size: Option<f64>,
+    ) -> Result<Vec<IpcVia>> {
+        self.modify_vias_in(self.get_board_document()?, identifiers, drill, pad_size)
+    }
+
+    /// Update existing vias on one exact board as one Begin/Update/Push.
+    ///
+    /// All UUIDs and target geometry resolve before `BeginCommit`, so a
+    /// missing or ambiguous target creates no transaction. Returned values are
+    /// read back from KiCad after the commit rather than echoed from the request.
+    pub fn modify_vias_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        identifiers: &[String],
+        drill: Option<f64>,
+        pad_size: Option<f64>,
+    ) -> Result<Vec<IpcVia>> {
+        if identifiers.is_empty() {
+            anyhow::bail!("at least one via UUID is required");
+        }
+        if drill.is_none() && pad_size.is_none() {
+            anyhow::bail!("at least one of drill or pad_size is required");
+        }
+        validate_via_dimension("drill", drill)?;
+        validate_via_dimension("pad_size", pad_size)?;
+        if let (Some(drill), Some(pad_size)) = (drill, pad_size) {
+            if pad_size <= drill {
+                anyhow::bail!(
+                    "via pad_size must be greater than drill to preserve a positive annular ring"
+                );
+            }
+        }
+
+        let mut requested = std::collections::HashSet::with_capacity(identifiers.len());
+        for identifier in identifiers {
+            if identifier.is_empty() {
+                anyhow::bail!("via UUIDs must not be empty");
+            }
+            if !requested.insert(identifier.as_str()) {
+                anyhow::bail!("duplicate via UUID '{identifier}'");
+            }
+        }
+
+        let items = self.get_items_in(
+            document.clone(),
+            kiapi::common::types::KiCadObjectType::KotPcbVia,
+        )?;
+        let mut match_counts = std::collections::HashMap::new();
+        let mut updates = Vec::with_capacity(identifiers.len());
+        for item in items {
+            if !crate::builders::any_is(&item, "kiapi.board.types.Via") {
+                continue;
+            }
+            let mut via = kiapi::board::types::Via::decode(item.value.as_slice())
+                .context("KiCad returned an unreadable via")?;
+            let identifier = via
+                .id
+                .as_ref()
+                .map(|id| id.value.clone())
+                .unwrap_or_default();
+            if !requested.contains(identifier.as_str()) {
+                continue;
+            }
+            *match_counts.entry(identifier.clone()).or_insert(0usize) += 1;
+            update_via_dimensions(&mut via, drill, pad_size)
+                .with_context(|| format!("cannot update via '{identifier}'"))?;
+            updates.push(crate::builders::pack_any(&via, "kiapi.board.types.Via"));
+        }
+
+        let missing: Vec<_> = identifiers
+            .iter()
+            .filter(|identifier| !match_counts.contains_key(identifier.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!("via UUIDs not found: {}", missing.join(", "));
+        }
+        let ambiguous: Vec<_> = identifiers
+            .iter()
+            .filter(|identifier| match_counts.get(identifier.as_str()).copied().unwrap_or(0) != 1)
+            .map(String::as_str)
+            .collect();
+        if !ambiguous.is_empty() {
+            anyhow::bail!("via UUIDs resolve more than once: {}", ambiguous.join(", "));
+        }
+
+        let update_document = document.clone();
+        self.run_commit(
+            &format!("Modify {} via dimension(s)", identifiers.len()),
+            move |client| client.update_items_in(update_document, updates),
+        )?;
+
+        let readback = self.get_vias_in(document)?;
+        let mut by_identifier: std::collections::HashMap<String, Vec<IpcVia>> =
+            std::collections::HashMap::new();
+        for via in readback {
+            if requested.contains(via.uuid.as_str()) {
+                by_identifier.entry(via.uuid.clone()).or_default().push(via);
+            }
+        }
+        identifiers
+            .iter()
+            .map(|identifier| {
+                let mut matches = by_identifier.remove(identifier).unwrap_or_default();
+                if matches.len() != 1 {
+                    anyhow::bail!(
+                        "updated via '{}' resolved {} time(s) in post-commit readback",
+                        identifier,
+                        matches.len()
+                    );
+                }
+                let via = matches.pop().expect("length checked");
+                if drill.is_some_and(|target| (via.drill - target).abs() > 0.000_001)
+                    || pad_size.is_some_and(|target| (via.pad_size - target).abs() > 0.000_001)
+                {
+                    anyhow::bail!(
+                        "updated via '{}' failed dimension readback (drill {}, pad_size {})",
+                        identifier,
+                        via.drill,
+                        via.pad_size
+                    );
+                }
+                Ok(via)
+            })
+            .collect()
     }
 
     /// Query tracks, optionally filtered by net and/or layer.

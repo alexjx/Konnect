@@ -850,6 +850,233 @@ fn failed_multi_step_commit_is_dropped() {
     );
 }
 
+fn via_item(uuid: &str, drill: f64, diameter: f64) -> prost_types::Any {
+    let mut via = builders::build_via("GND", 1, 12.5, 24.5, drill, diameter);
+    via.id = Some(kiapi::common::types::Kiid {
+        value: uuid.to_string(),
+    });
+    builders::pack_any(&via, "kiapi.board.types.Via")
+}
+
+#[test]
+fn modify_vias_targets_one_document_one_commit_and_returns_readback() {
+    let held = Arc::new(Mutex::new(vec![
+        via_item("via-a", 0.2, 0.5),
+        via_item("via-b", 0.25, 0.55),
+    ]));
+    let held_in_mock = held.clone();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let commands_in_mock = commands.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request message");
+        if message.type_url.ends_with("GetItems") {
+            let command = kiapi::common::commands::GetItems::decode(message.value.as_slice())
+                .expect("decode GetItems");
+            assert_eq!(
+                command.header.and_then(|header| header.document),
+                Some(doc_for("target.kicad_pcb"))
+            );
+            commands_in_mock.lock().unwrap().push("get");
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items: held_in_mock.lock().unwrap().clone(),
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("BeginCommit") {
+            commands_in_mock.lock().unwrap().push("begin");
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::BeginCommitResponse {
+                    id: Some(kiapi::common::types::Kiid {
+                        value: "via-commit".to_string(),
+                    }),
+                },
+                "kiapi.common.commands.BeginCommitResponse",
+            )));
+        }
+        if message.type_url.ends_with("UpdateItems") {
+            let command = kiapi::common::commands::UpdateItems::decode(message.value.as_slice())
+                .expect("decode UpdateItems");
+            assert_eq!(
+                command.header.and_then(|header| header.document),
+                Some(doc_for("target.kicad_pcb"))
+            );
+            assert_eq!(command.items.len(), 2, "one batched UpdateItems request");
+            *held_in_mock.lock().unwrap() = command.items.clone();
+            commands_in_mock.lock().unwrap().push("update");
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::UpdateItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    updated_items: command
+                        .items
+                        .iter()
+                        .map(|_| kiapi::common::commands::ItemUpdateResult {
+                            status: Some(kiapi::common::commands::ItemStatus {
+                                code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                error_message: String::new(),
+                            }),
+                            item: None,
+                        })
+                        .collect(),
+                },
+                "kiapi.common.commands.UpdateItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("EndCommit") {
+            let command = kiapi::common::commands::EndCommit::decode(message.value.as_slice())
+                .expect("decode EndCommit");
+            assert_eq!(
+                command.action(),
+                kiapi::common::commands::CommitAction::CmaCommit
+            );
+            commands_in_mock.lock().unwrap().push("push");
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::EndCommitResponse {},
+                "kiapi.common.commands.EndCommitResponse",
+            )));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let updated = KiCadIpcClient::new(&mock.url)
+        .modify_vias_in(
+            doc_for("target.kicad_pcb"),
+            &["via-b".to_string(), "via-a".to_string()],
+            Some(0.3),
+            Some(0.7),
+        )
+        .expect("modify both vias");
+
+    assert_eq!(
+        *commands.lock().unwrap(),
+        ["get", "begin", "update", "push", "get"]
+    );
+    assert_eq!(
+        updated
+            .iter()
+            .map(|via| via.uuid.as_str())
+            .collect::<Vec<_>>(),
+        ["via-b", "via-a"],
+        "readback follows request order"
+    );
+    assert!(updated
+        .iter()
+        .all(|via| { (via.drill - 0.3).abs() < 1e-9 && (via.pad_size - 0.7).abs() < 1e-9 }));
+}
+
+#[test]
+fn modify_vias_resolves_every_target_before_begin_commit() {
+    let begin_count = Arc::new(Mutex::new(0usize));
+    let begin_count_in_mock = begin_count.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request message");
+        if message.type_url.ends_with("GetItems") {
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items: vec![via_item("via-a", 0.2, 0.5)],
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("BeginCommit") {
+            *begin_count_in_mock.lock().unwrap() += 1;
+        }
+        panic!("a failed preflight must not send {}", message.type_url);
+    });
+
+    let error = KiCadIpcClient::new(&mock.url)
+        .modify_vias_in(
+            doc_for("target.kicad_pcb"),
+            &["via-a".to_string(), "missing".to_string()],
+            Some(0.3),
+            None,
+        )
+        .expect_err("every requested via must resolve")
+        .to_string();
+
+    assert!(error.contains("missing"), "{error}");
+    assert_eq!(*begin_count.lock().unwrap(), 0, "zero transaction on error");
+}
+
+#[test]
+fn modify_vias_rejects_ambiguous_target_before_begin_commit() {
+    let begin_count = Arc::new(Mutex::new(0usize));
+    let begin_count_in_mock = begin_count.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request message");
+        if message.type_url.ends_with("GetItems") {
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items: vec![
+                        via_item("duplicate", 0.2, 0.5),
+                        via_item("duplicate", 0.25, 0.55),
+                    ],
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("BeginCommit") {
+            *begin_count_in_mock.lock().unwrap() += 1;
+        }
+        panic!("an ambiguous preflight must not send {}", message.type_url);
+    });
+
+    let error = KiCadIpcClient::new(&mock.url)
+        .modify_vias_in(
+            doc_for("target.kicad_pcb"),
+            &["duplicate".to_string()],
+            Some(0.3),
+            None,
+        )
+        .expect_err("a via identifier must resolve exactly once")
+        .to_string();
+
+    assert!(error.contains("more than once"), "{error}");
+    assert_eq!(*begin_count.lock().unwrap(), 0, "zero transaction on error");
+}
+
+#[test]
+fn modify_vias_rejects_invalid_dimensions_before_ipc() {
+    let client = KiCadIpcClient::new("inproc://must-not-dial");
+    let ids = ["via-a".to_string()];
+    for (drill, diameter) in [
+        (Some(f64::NAN), Some(0.6)),
+        (Some(0.3), Some(f64::INFINITY)),
+        (Some(0.0), Some(0.6)),
+        (Some(0.6), Some(0.6)),
+    ] {
+        let error = client
+            .modify_vias_in(doc_for("target.kicad_pcb"), &ids, drill, diameter)
+            .expect_err("invalid via geometry must fail before IPC")
+            .to_string();
+        assert!(
+            error.contains("finite")
+                || error.contains("greater than zero")
+                || error.contains("greater than drill"),
+            "{error}"
+        );
+    }
+
+    let error = client
+        .modify_vias_in(
+            doc_for("target.kicad_pcb"),
+            &["via-a".to_string(), "via-a".to_string()],
+            Some(0.3),
+            None,
+        )
+        .expect_err("duplicate UUIDs must fail before IPC")
+        .to_string();
+    assert!(error.contains("duplicate via UUID"), "{error}");
+}
+
 // ─── IpcFailure classification ────────────────────────────────────────────────
 //
 // The file-editing fallback in konnect-core is gated on this classification:

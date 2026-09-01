@@ -7,7 +7,8 @@ use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    get_path, opt_f64, require_f64, require_str, with_board_ipc_classified, ToolContext, ToolDef,
+    get_path, invalid_arg, opt_f64, require_f64, require_str, with_board_ipc_classified,
+    ToolContext, ToolDef,
 };
 use anyhow::Context;
 use konnect_sexp::writer::{apply_edits, write_atomic, SexpEdit};
@@ -107,6 +108,40 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_name", "x", "y"]
             }),
             |args, ctx| async move { handle_add_via(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "modify_vias",
+            "Modify the drill and/or copper diameter of explicitly identified vias on the exact open board. Resolves every via before opening one KiCad undo transaction and verifies the committed dimensions by readback.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuids": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 },
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "description": "Exact via UUIDs returned by KiCad IPC"
+                    },
+                    "drill": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "description": "New drill diameter in mm"
+                    },
+                    "pad_size": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "description": "New copper diameter in mm; must remain greater than drill"
+                    }
+                },
+                "required": ["board", "uuids"],
+                "anyOf": [
+                    { "required": ["drill"] },
+                    { "required": ["pad_size"] }
+                ]
+            }),
+            |args, ctx| async move { handle_modify_vias(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
@@ -533,6 +568,77 @@ async fn handle_add_via(
     Ok(CallToolResult::json(
         &json!({ "net": net_name, "x": x, "y": y, "drill": drill, "pad_size": pad_size }),
     ))
+}
+
+async fn handle_modify_vias(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let identifiers = match args.get("uuids").and_then(|value| value.as_array()) {
+        Some(values) if !values.is_empty() => {
+            let mut identifiers = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(identifier) = value.as_str() else {
+                    return Ok(invalid_arg("uuids", "must contain only strings"));
+                };
+                if identifier.is_empty() {
+                    return Ok(invalid_arg("uuids", "must not contain empty strings"));
+                }
+                identifiers.push(identifier.to_string());
+            }
+            identifiers
+        }
+        _ => return Ok(invalid_arg("uuids", "must be a non-empty array")),
+    };
+    let parse_dimension = |name: &str| -> Result<Option<f64>, CallToolResult> {
+        match args.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => value
+                .as_f64()
+                .map(Some)
+                .ok_or_else(|| invalid_arg(name, "must be a number")),
+        }
+    };
+    let drill = match parse_dimension("drill") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let pad_size = match parse_dimension("pad_size") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    if drill.is_none() && pad_size.is_none() {
+        return Ok(invalid_arg(
+            "drill",
+            "at least one of drill or pad_size is required",
+        ));
+    }
+
+    let board_for_ipc = board.clone();
+    let result = with_board_ipc_classified(ctx, &board, move |client| {
+        let document = client.find_open_board(&board_for_ipc)?;
+        client.modify_vias_in(document, &identifiers, drill, pad_size)
+    })
+    .await?;
+    match result {
+        Ok(vias) => Ok(CallToolResult::json(&json!({
+            "success": true,
+            "method": "kicad_ipc_update_items",
+            "board": board,
+            "count": vias.len(),
+            "vias": vias
+        }))),
+        Err(failure) => {
+            let reason = failure.message().to_string();
+            Ok(CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: reason.clone(),
+                },
+                format!("Modify vias refused: {reason}"),
+            ))
+        }
+    }
 }
 
 fn extension_is(path: &Path, expected: &str) -> bool {
@@ -1657,6 +1763,25 @@ async fn handle_route_diff_pair(
         "net_pos": net_pos, "net_neg": net_neg,
         "layer": layer, "width": width, "gap": gap
     })))
+}
+
+#[cfg(test)]
+mod modify_vias_contract_tests {
+    use super::*;
+
+    #[test]
+    fn public_schema_keeps_the_existing_uuids_argument() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "modify_vias")
+            .expect("modify_vias tool");
+        let properties = tool.input_schema["properties"]
+            .as_object()
+            .expect("schema properties");
+        assert!(properties.contains_key("uuids"));
+        assert!(!properties.contains_key("identifiers"));
+        assert_eq!(tool.input_schema["required"], json!(["board", "uuids"]));
+    }
 }
 
 /// Manual live acceptance gate for the final #337 undo boundary.

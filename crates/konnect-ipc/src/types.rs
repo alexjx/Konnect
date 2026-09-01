@@ -197,6 +197,21 @@ pub struct IpcTrack {
     pub end: IpcVector2,
 }
 
+/// A live via as KiCad holds it after an IPC read.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcVia {
+    /// Exact KIID used to address the via in a later mutation.
+    pub uuid: String,
+    pub net_name: String,
+    pub position: IpcVector2,
+    /// Copper diameter in millimetres.
+    pub pad_size: f64,
+    /// Finished drill diameter in millimetres.
+    pub drill: f64,
+    pub layers: Vec<String>,
+    pub locked: bool,
+}
+
 /// A graphic item inside a placed footprint — silkscreen, fabrication, or
 /// courtyard artwork, not a pad.
 ///
