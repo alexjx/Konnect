@@ -387,6 +387,39 @@ fn ipc_via(via: kiapi::board::types::Via) -> Result<IpcVia> {
     })
 }
 
+fn normalize_degrees(angle: f64) -> f64 {
+    angle.rem_euclid(360.0)
+}
+
+fn angles_match(left: f64, right: f64) -> bool {
+    let delta = (left - right + 180.0).rem_euclid(360.0) - 180.0;
+    delta.abs() <= 0.000_001
+}
+
+fn unique_footprint_by_reference(
+    items: Vec<prost_types::Any>,
+    reference: &str,
+) -> Result<kiapi::board::types::FootprintInstance> {
+    let mut found = None;
+    for item in items {
+        if !crate::builders::any_is(&item, "kiapi.board.types.FootprintInstance") {
+            continue;
+        }
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .context("KiCad returned an unreadable footprint instance")?;
+        if footprint_reference(&footprint) != reference {
+            continue;
+        }
+        if found.replace(footprint).is_some() {
+            anyhow::bail!(
+                "footprint reference '{}' appears more than once on the board",
+                reference
+            );
+        }
+    }
+    found.with_context(|| format!("footprint '{reference}' not found on board"))
+}
+
 /// Marker error carried (via anyhow's error chain) by every failure where no
 /// request completed a round-trip with a live KiCad: no socket path
 /// configured, or the NNG dial/send failed.
@@ -2258,6 +2291,197 @@ impl KiCadIpcClient {
                 })
             })
             .collect()
+    }
+
+    /// Set every pad in one footprint to an angle relative to the footprint.
+    pub fn set_footprint_pad_relative_angle(
+        &self,
+        reference: &str,
+        relative_angle: f64,
+    ) -> Result<Vec<(String, f64, f64)>> {
+        self.set_footprint_pad_relative_angle_in(
+            self.get_board_document()?,
+            reference,
+            relative_angle,
+        )
+    }
+
+    /// Set every pad angle in one exact open board document.
+    ///
+    /// The footprint reference and every pad number resolve uniquely, and the
+    /// complete update is built, before `BeginCommit`. Only each pad stack's
+    /// angle changes; KiCad receives the original footprint and pad UUIDs,
+    /// nets, positions, and all other pad-stack fields in one `UpdateItems`.
+    pub fn set_footprint_pad_relative_angle_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+        relative_angle: f64,
+    ) -> Result<Vec<(String, f64, f64)>> {
+        if !relative_angle.is_finite() {
+            anyhow::bail!("pad relative_angle must be finite");
+        }
+
+        let items = self.get_items_in(
+            document.clone(),
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )?;
+        let mut footprint = unique_footprint_by_reference(items, reference)?;
+        let footprint_uuid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.clone())
+            .filter(|uuid| !uuid.is_empty())
+            .with_context(|| format!("footprint '{reference}' has no UUID"))?;
+        let footprint_angle = footprint
+            .orientation
+            .as_ref()
+            .map(|angle| angle.value_degrees)
+            .unwrap_or(0.0);
+        if !footprint_angle.is_finite() {
+            anyhow::bail!("footprint '{reference}' has a non-finite rotation");
+        }
+        let target_absolute = normalize_degrees(footprint_angle + relative_angle);
+        let definition = footprint
+            .definition
+            .as_mut()
+            .with_context(|| format!("footprint '{reference}' has no definition"))?;
+        let mut pad_numbers = std::collections::HashSet::new();
+        let mut seen_pad_uuids = std::collections::HashSet::new();
+        let mut pad_uuids = std::collections::HashMap::new();
+        let mut changed = Vec::new();
+        for child in &mut definition.items {
+            if !crate::builders::any_is(child, "kiapi.board.types.Pad") {
+                continue;
+            }
+            let mut pad = kiapi::board::types::Pad::decode(child.value.as_slice())
+                .with_context(|| format!("footprint '{reference}' has an unreadable pad"))?;
+            if !pad_numbers.insert(pad.number.clone()) {
+                anyhow::bail!(
+                    "footprint '{reference}' pad number '{}' appears more than once",
+                    pad.number
+                );
+            }
+            let pad_uuid = pad
+                .id
+                .as_ref()
+                .map(|id| id.value.clone())
+                .filter(|uuid| !uuid.is_empty())
+                .with_context(|| {
+                    format!("footprint '{reference}' pad '{}' has no UUID", pad.number)
+                })?;
+            if !seen_pad_uuids.insert(pad_uuid.clone()) {
+                anyhow::bail!(
+                    "footprint '{reference}' pad UUID '{pad_uuid}' appears more than once"
+                );
+            }
+            let old_angle = pad
+                .pad_stack
+                .as_ref()
+                .and_then(|stack| stack.angle.as_ref())
+                .map(|angle| angle.value_degrees)
+                .unwrap_or(0.0);
+            if !old_angle.is_finite() {
+                anyhow::bail!(
+                    "footprint '{reference}' pad '{}' has a non-finite angle",
+                    pad.number
+                );
+            }
+            pad.pad_stack.get_or_insert_with(Default::default).angle =
+                Some(kiapi::common::types::Angle {
+                    value_degrees: target_absolute,
+                });
+            changed.push((pad.number.clone(), old_angle, target_absolute));
+            pad_uuids.insert(pad.number.clone(), pad_uuid);
+            child.value = pad.encode_to_vec();
+        }
+        if changed.is_empty() {
+            anyhow::bail!("footprint '{reference}' has no pads to update");
+        }
+
+        let update = crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+        let update_document = document.clone();
+        self.run_commit(
+            &format!("Set footprint pad angles for {reference}"),
+            move |client| client.update_items_in(update_document, vec![update]),
+        )?;
+
+        let readback = self.get_items_in(
+            document,
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )?;
+        let footprint = unique_footprint_by_reference(readback, reference)?;
+        if footprint.id.as_ref().map(|id| id.value.as_str()) != Some(footprint_uuid.as_str()) {
+            anyhow::bail!("footprint '{reference}' UUID changed during pad-angle update");
+        }
+        let readback_footprint_angle = footprint
+            .orientation
+            .as_ref()
+            .map(|angle| angle.value_degrees)
+            .unwrap_or(0.0);
+        if !readback_footprint_angle.is_finite() {
+            anyhow::bail!("footprint '{reference}' read back with a non-finite rotation");
+        }
+        let definition = footprint
+            .definition
+            .as_ref()
+            .with_context(|| format!("footprint '{reference}' read back without a definition"))?;
+        let expected_relative = normalize_degrees(relative_angle);
+        let mut verified = std::collections::HashSet::new();
+        for child in &definition.items {
+            if !crate::builders::any_is(child, "kiapi.board.types.Pad") {
+                continue;
+            }
+            let pad = kiapi::board::types::Pad::decode(child.value.as_slice())
+                .with_context(|| format!("footprint '{reference}' read back an unreadable pad"))?;
+            let Some(expected_uuid) = pad_uuids.get(&pad.number) else {
+                continue;
+            };
+            if !verified.insert(pad.number.clone()) {
+                anyhow::bail!(
+                    "footprint '{reference}' pad number '{}' appears more than once on readback",
+                    pad.number
+                );
+            }
+            if pad.id.as_ref().map(|id| id.value.as_str()) != Some(expected_uuid.as_str()) {
+                anyhow::bail!(
+                    "footprint '{reference}' pad '{}' UUID changed during update",
+                    pad.number
+                );
+            }
+            let absolute = pad
+                .pad_stack
+                .as_ref()
+                .and_then(|stack| stack.angle.as_ref())
+                .map(|angle| angle.value_degrees)
+                .with_context(|| {
+                    format!(
+                        "footprint '{reference}' pad '{}' read back without an angle",
+                        pad.number
+                    )
+                })?;
+            let observed_relative = normalize_degrees(absolute - readback_footprint_angle);
+            if !absolute.is_finite() || !angles_match(observed_relative, expected_relative) {
+                anyhow::bail!(
+                    "footprint '{reference}' pad '{}' failed relative-angle readback: expected {}, got {}",
+                    pad.number,
+                    expected_relative,
+                    observed_relative
+                );
+            }
+        }
+        if verified.len() != pad_uuids.len() {
+            let missing = pad_uuids
+                .keys()
+                .filter(|number| !verified.contains(*number))
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            anyhow::bail!(
+                "footprint '{reference}' pads missing from readback: {}",
+                missing.join(", ")
+            );
+        }
+        Ok(changed)
     }
 
     /// Update the visible value field of an existing footprint.

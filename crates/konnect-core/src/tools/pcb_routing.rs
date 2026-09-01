@@ -145,6 +145,22 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
+            "query_vias",
+            "List vias with dimensions and layer spans from the exact open board, optionally filtered by net and exact dimensions.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":    { "type": "string" },
+                    "net_name": { "type": "string", "description": "Filter by net (optional)" },
+                    "drill":    { "type": "number", "description": "Filter by exact drill diameter in mm (optional)" },
+                    "pad_size": { "type": "number", "description": "Filter by exact via pad diameter in mm (optional)" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_query_vias(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "plan_specctra_ses_import",
             "Validate a Freerouting Specctra SES against its revision-bound Konnect manifest and the exact live KiCad board. Returns every track and via that would be created; never mutates or saves the board.",
             json!({
@@ -636,6 +652,96 @@ async fn handle_modify_vias(
                     reason: reason.clone(),
                 },
                 format!("Modify vias refused: {reason}"),
+            ))
+        }
+    }
+}
+
+fn optional_finite_via_filter(
+    args: &serde_json::Value,
+    name: &str,
+) -> Result<Option<f64>, CallToolResult> {
+    match args.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => match value.as_f64() {
+            Some(value) if value.is_finite() => Ok(Some(value)),
+            Some(_) => Err(invalid_arg(name, "must be finite")),
+            None => Err(invalid_arg(name, "must be a number")),
+        },
+    }
+}
+
+fn query_via_items(
+    vias: &[konnect_ipc::IpcVia],
+    net_name: Option<&str>,
+    drill: Option<f64>,
+    pad_size: Option<f64>,
+) -> Vec<serde_json::Value> {
+    const EXACT_DIMENSION_TOLERANCE_MM: f64 = 0.000_001;
+    vias.iter()
+        .filter(|via| {
+            net_name.is_none_or(|net| via.net_name == net)
+                && drill
+                    .is_none_or(|value| (via.drill - value).abs() < EXACT_DIMENSION_TOLERANCE_MM)
+                && pad_size
+                    .is_none_or(|value| (via.pad_size - value).abs() < EXACT_DIMENSION_TOLERANCE_MM)
+        })
+        .map(|via| {
+            json!({
+                "uuid": via.uuid,
+                "net": via.net_name,
+                "x": via.position.x,
+                "y": via.position.y,
+                "pad_size": via.pad_size,
+                "drill": via.drill,
+                "layers": via.layers,
+                "locked": via.locked
+            })
+        })
+        .collect()
+}
+
+async fn handle_query_vias(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let net_name = match args.get("net_name") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match value.as_str() {
+            Some(net) => Some(net.to_string()),
+            None => return Ok(invalid_arg("net_name", "must be a string")),
+        },
+    };
+    let drill = match optional_finite_via_filter(args, "drill") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let pad_size = match optional_finite_via_filter(args, "pad_size") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+
+    let board_for_ipc = board.clone();
+    let result = with_board_ipc_classified(ctx, &board, move |client| {
+        let document = client.find_open_board(&board_for_ipc)?;
+        client.get_vias_in(document)
+    })
+    .await?;
+    match result {
+        Ok(vias) => {
+            let items = query_via_items(&vias, net_name.as_deref(), drill, pad_size);
+            Ok(CallToolResult::json(
+                &json!({ "count": items.len(), "vias": items }),
+            ))
+        }
+        Err(failure) => {
+            let reason = failure.message().to_string();
+            Ok(CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: reason.clone(),
+                },
+                format!("Query vias refused: {reason}"),
             ))
         }
     }
@@ -1781,6 +1887,116 @@ mod modify_vias_contract_tests {
         assert!(properties.contains_key("uuids"));
         assert!(!properties.contains_key("identifiers"));
         assert_eq!(tool.input_schema["required"], json!(["board", "uuids"]));
+    }
+}
+
+#[cfg(test)]
+mod query_vias_contract_tests {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use crate::router::ToolRouter;
+    use crate::tools::{BoardAccess, ServerConfig};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn via(
+        uuid: &str,
+        net_name: &str,
+        x: f64,
+        y: f64,
+        drill: f64,
+        pad_size: f64,
+        locked: bool,
+    ) -> konnect_ipc::IpcVia {
+        konnect_ipc::IpcVia {
+            uuid: uuid.to_string(),
+            net_name: net_name.to_string(),
+            position: konnect_ipc::IpcVector2 { x, y },
+            pad_size,
+            drill,
+            layers: vec!["F.Cu".to_string(), "B.Cu".to_string()],
+            locked,
+        }
+    }
+
+    #[test]
+    fn public_schema_keeps_the_fork_filters_and_is_live_only() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "query_vias")
+            .expect("query_vias tool");
+        let properties = tool.input_schema["properties"]
+            .as_object()
+            .expect("schema properties");
+        assert_eq!(
+            properties.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["board", "drill", "net_name", "pad_size"]
+        );
+        assert_eq!(tool.input_schema["required"], json!(["board"]));
+        assert_eq!(tool.board_access, BoardAccess::LiveOnly);
+    }
+
+    #[test]
+    fn query_filters_vias_and_reports_the_complete_read_only_contract() {
+        let vias = vec![
+            via("via-a", "GND", 10.0, 20.0, 0.4, 0.8, true),
+            via("via-b", "GND", 11.0, 21.0, 0.3, 0.6, false),
+            via("via-c", "+3V3", 12.0, 22.0, 0.4, 0.8, false),
+        ];
+
+        let items = query_via_items(&vias, Some("GND"), Some(0.4), Some(0.8));
+
+        assert_eq!(
+            items,
+            vec![json!({
+                "uuid": "via-a",
+                "net": "GND",
+                "x": 10.0,
+                "y": 20.0,
+                "pad_size": 0.8,
+                "drill": 0.4,
+                "layers": ["F.Cu", "B.Cu"],
+                "locked": true
+            })]
+        );
+        assert_eq!(
+            query_via_items(&vias, None, Some(0.400_000_5), None).len(),
+            2,
+            "sub-nanometre IPC conversion noise should still match"
+        );
+        assert!(query_via_items(&vias, None, Some(0.400_002), None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_filter_is_rejected_before_any_ipc_connection() {
+        let result = handle_query_vias(
+            &json!({"board": "not-open.kicad_pcb", "drill": "0.4"}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("structured error must be text");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "drill");
     }
 }
 

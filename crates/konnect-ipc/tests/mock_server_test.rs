@@ -1077,6 +1077,265 @@ fn modify_vias_rejects_invalid_dimensions_before_ipc() {
     assert!(error.contains("duplicate via UUID"), "{error}");
 }
 
+fn pad_with_angle(number: &str, uuid: &str, angle: f64) -> prost_types::Any {
+    builders::pack_any(
+        &kiapi::board::types::Pad {
+            id: Some(kiid(uuid)),
+            number: number.to_string(),
+            position: Some(builders::vec2(10.0 + angle, 20.0)),
+            net: Some(kiapi::board::types::Net {
+                code: Some(kiapi::board::types::NetCode { value: 7 }),
+                name: "GND".to_string(),
+            }),
+            pad_stack: Some(kiapi::board::types::PadStack {
+                angle: Some(kiapi::common::types::Angle {
+                    value_degrees: angle,
+                }),
+                layers: vec![
+                    kiapi::board::types::BoardLayer::BlFCu as i32,
+                    kiapi::board::types::BoardLayer::BlFMask as i32,
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        "kiapi.board.types.Pad",
+    )
+}
+
+fn footprint_with_pad_angles(
+    reference: &str,
+    footprint_uuid: &str,
+    rotation: f64,
+    pads: Vec<prost_types::Any>,
+) -> prost_types::Any {
+    builders::pack_any(
+        &kiapi::board::types::FootprintInstance {
+            id: Some(kiid(footprint_uuid)),
+            position: Some(builders::vec2(100.0, 80.0)),
+            orientation: Some(kiapi::common::types::Angle {
+                value_degrees: rotation,
+            }),
+            reference_field: Some(kiapi::board::types::Field {
+                name: "Reference".to_string(),
+                text: Some(kiapi::board::types::BoardText {
+                    text: Some(kiapi::common::types::Text {
+                        text: reference.to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            definition: Some(kiapi::board::types::Footprint {
+                items: pads,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        "kiapi.board.types.FootprintInstance",
+    )
+}
+
+#[test]
+fn set_pad_relative_angle_targets_one_document_one_commit_and_verifies_readback() {
+    let held = Arc::new(Mutex::new(vec![footprint_with_pad_angles(
+        "U1",
+        "footprint-u1",
+        45.0,
+        vec![
+            pad_with_angle("1", "pad-1", 10.0),
+            pad_with_angle("2", "pad-2", 20.0),
+        ],
+    )]));
+    let held_in_mock = held.clone();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let commands_in_mock = commands.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request message");
+        if message.type_url.ends_with("GetItems") {
+            let command = kiapi::common::commands::GetItems::decode(message.value.as_slice())
+                .expect("decode GetItems");
+            assert_eq!(
+                command.header.and_then(|header| header.document),
+                Some(doc_for("target.kicad_pcb"))
+            );
+            commands_in_mock.lock().unwrap().push("get");
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items: held_in_mock.lock().unwrap().clone(),
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("BeginCommit") {
+            commands_in_mock.lock().unwrap().push("begin");
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::BeginCommitResponse {
+                    id: Some(kiid("pad-angle-commit")),
+                },
+                "kiapi.common.commands.BeginCommitResponse",
+            )));
+        }
+        if message.type_url.ends_with("UpdateItems") {
+            let command = kiapi::common::commands::UpdateItems::decode(message.value.as_slice())
+                .expect("decode UpdateItems");
+            assert_eq!(
+                command.header.and_then(|header| header.document),
+                Some(doc_for("target.kicad_pcb"))
+            );
+            assert_eq!(command.items.len(), 1, "update one footprint as a batch");
+            let footprint =
+                kiapi::board::types::FootprintInstance::decode(command.items[0].value.as_slice())
+                    .expect("decode updated footprint");
+            assert_eq!(footprint.id, Some(kiid("footprint-u1")));
+            assert_eq!(footprint.position, Some(builders::vec2(100.0, 80.0)));
+            let pads = footprint.definition.expect("definition").items;
+            for (item, expected_number, expected_uuid, old_angle) in [
+                (&pads[0], "1", "pad-1", 10.0),
+                (&pads[1], "2", "pad-2", 20.0),
+            ] {
+                let pad = kiapi::board::types::Pad::decode(item.value.as_slice())
+                    .expect("decode updated pad");
+                let original = pad_with_angle(expected_number, expected_uuid, old_angle);
+                let mut expected = kiapi::board::types::Pad::decode(original.value.as_slice())
+                    .expect("decode expected pad");
+                expected
+                    .pad_stack
+                    .as_mut()
+                    .expect("expected pad stack")
+                    .angle = Some(kiapi::common::types::Angle {
+                    value_degrees: 75.0,
+                });
+                assert_eq!(pad, expected, "only the pad-stack angle may change");
+                assert_eq!(pad.number, expected_number);
+                assert_eq!(pad.id, Some(kiid(expected_uuid)));
+                assert_eq!(pad.net.as_ref().map(|net| net.name.as_str()), Some("GND"));
+                let stack = pad.pad_stack.expect("pad stack");
+                assert_eq!(
+                    stack.layers,
+                    [
+                        kiapi::board::types::BoardLayer::BlFCu as i32,
+                        kiapi::board::types::BoardLayer::BlFMask as i32
+                    ]
+                );
+                assert_eq!(stack.angle.expect("angle").value_degrees, 75.0);
+            }
+            *held_in_mock.lock().unwrap() = command.items.clone();
+            commands_in_mock.lock().unwrap().push("update");
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::UpdateItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    updated_items: vec![kiapi::common::commands::ItemUpdateResult {
+                        status: Some(kiapi::common::commands::ItemStatus {
+                            code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                            error_message: String::new(),
+                        }),
+                        item: None,
+                    }],
+                },
+                "kiapi.common.commands.UpdateItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("EndCommit") {
+            let command = kiapi::common::commands::EndCommit::decode(message.value.as_slice())
+                .expect("decode EndCommit");
+            assert_eq!(
+                command.action(),
+                kiapi::common::commands::CommitAction::CmaCommit
+            );
+            commands_in_mock.lock().unwrap().push("push");
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::EndCommitResponse {},
+                "kiapi.common.commands.EndCommitResponse",
+            )));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let changed = KiCadIpcClient::new(&mock.url)
+        .set_footprint_pad_relative_angle_in(doc_for("target.kicad_pcb"), "U1", 30.0)
+        .expect("set every U1 pad to 30 degrees relative");
+
+    assert_eq!(
+        *commands.lock().unwrap(),
+        ["get", "begin", "update", "push", "get"]
+    );
+    assert_eq!(changed.len(), 2);
+    assert_eq!(changed[0], ("1".to_string(), 10.0, 75.0));
+    assert_eq!(changed[1], ("2".to_string(), 20.0, 75.0));
+}
+
+#[test]
+fn set_pad_relative_angle_resolves_footprint_and_pad_numbers_before_begin_commit() {
+    for items in [
+        Vec::new(),
+        vec![
+            footprint_with_pad_angles(
+                "U1",
+                "footprint-a",
+                0.0,
+                vec![pad_with_angle("1", "pad-a", 0.0)],
+            ),
+            footprint_with_pad_angles(
+                "U1",
+                "footprint-b",
+                0.0,
+                vec![pad_with_angle("1", "pad-b", 0.0)],
+            ),
+        ],
+        vec![footprint_with_pad_angles(
+            "U1",
+            "footprint-a",
+            0.0,
+            vec![
+                pad_with_angle("1", "pad-a", 0.0),
+                pad_with_angle("1", "pad-b", 0.0),
+            ],
+        )],
+    ] {
+        let begin_count = Arc::new(Mutex::new(0usize));
+        let begin_count_in_mock = begin_count.clone();
+        let mock = spawn_mock(move |request| {
+            let message = request.message.expect("request message");
+            if message.type_url.ends_with("GetItems") {
+                return Some(reply_with(builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: items.clone(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                )));
+            }
+            if message.type_url.ends_with("BeginCommit") {
+                *begin_count_in_mock.lock().unwrap() += 1;
+            }
+            panic!("a failed preflight must not send {}", message.type_url);
+        });
+
+        KiCadIpcClient::new(&mock.url)
+            .set_footprint_pad_relative_angle_in(doc_for("target.kicad_pcb"), "U1", 30.0)
+            .expect_err("footprint and pad numbers must resolve uniquely");
+        assert_eq!(*begin_count.lock().unwrap(), 0, "zero transaction on error");
+    }
+}
+
+#[test]
+fn set_pad_relative_angle_rejects_non_finite_input_before_ipc() {
+    let client = KiCadIpcClient::new("inproc://must-not-dial-pad-angle");
+    for angle in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let error = client
+            .set_footprint_pad_relative_angle_in(doc_for("target.kicad_pcb"), "U1", angle)
+            .expect_err("invalid angle must fail before IPC")
+            .to_string();
+        assert!(error.contains("finite"), "{error}");
+    }
+}
+
 // ─── IpcFailure classification ────────────────────────────────────────────────
 //
 // The file-editing fallback in konnect-core is gated on this classification:

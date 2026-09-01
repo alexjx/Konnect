@@ -1799,6 +1799,21 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
+            "set_component_pad_relative_angle",
+            "Repair or intentionally set every pad angle in one footprint relative to the footprint body via KiCad IPC.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":          { "type": "string" },
+                    "reference":      { "type": "string" },
+                    "relative_angle": { "type": "number", "description": "Pad angle relative to the footprint body in degrees" }
+                },
+                "required": ["board", "reference", "relative_angle"]
+            }),
+            |args, ctx| async move { handle_set_component_pad_relative_angle(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "set_component_placements",
             "Set X/Y positions and rotations for multiple existing footprints atomically. Uses one live KiCAD IPC update and one undo step when reachable; otherwise safely edits a closed board file once with revision checks.",
             json!({
@@ -2354,6 +2369,47 @@ async fn handle_rotate_component(
             }
         }
     }
+}
+
+async fn handle_set_component_pad_relative_angle(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    let relative_angle = match require_f64(args, "relative_angle") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+
+    let board_for_ipc = board.clone();
+    let reference_for_ipc = reference.clone();
+    let changed = match with_board_ipc_classified(ctx, &board, move |client| {
+        let document = client.find_open_board(&board_for_ipc)?;
+        client.set_footprint_pad_relative_angle_in(document, &reference_for_ipc, relative_angle)
+    })
+    .await?
+    {
+        Ok(changed) => changed,
+        Err(konnect_ipc::IpcFailure::Unreachable(message)) => {
+            return Ok(CallToolResult::error(format!(
+                "KiCAD must be running with the board loaded (IPC error: {message})"
+            )))
+        }
+        Err(konnect_ipc::IpcFailure::Rejected(message)) => {
+            return Ok(CallToolResult::error(message))
+        }
+    };
+
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "relative_angle": relative_angle,
+        "pads": changed,
+        "method": "kicad_ipc_commit"
+    })))
 }
 
 fn invalid_placement(field: String, reason: impl Into<String>) -> CallToolResult {
@@ -3664,6 +3720,26 @@ async fn handle_get_board_2d_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pad_relative_angle_schema_keeps_the_fork_contract() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "set_component_pad_relative_angle")
+            .expect("pad relative-angle tool");
+        assert_eq!(
+            tool.input_schema["required"],
+            json!(["board", "reference", "relative_angle"])
+        );
+        let properties = tool.input_schema["properties"]
+            .as_object()
+            .expect("schema properties");
+        assert!(properties.contains_key("board"));
+        assert!(properties.contains_key("reference"));
+        assert!(properties.contains_key("relative_angle"));
+        assert_eq!(properties.len(), 3);
+        assert_eq!(tool.board_access, crate::tools::BoardAccess::LiveOnly);
+    }
 
     const FOOTPRINT: &str = r#"(footprint "R_0402"
   (version 20240108)
