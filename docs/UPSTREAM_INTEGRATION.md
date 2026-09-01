@@ -171,6 +171,22 @@ when the integration is ready for team review. Restoring the two workflow files
 is required only on the first run because a branch rooted at upstream does not
 contain fork-only documentation yet.
 
+Some fork clones fetch only `origin/main`. In that case `push -u` writes branch
+configuration but Git still refuses to resolve `@{u}` because the integration
+branch is outside the remote's fetch refspec. Add the permanent branch to the
+refspec once, then verify that ahead/behind checks use the real remote-tracking
+reference:
+
+```powershell
+$integrationRefspec = "+refs/heads/upstream-integration:refs/remotes/origin/upstream-integration"
+if ((git config --get-all remote.origin.fetch) -notcontains $integrationRefspec) {
+    git config --add remote.origin.fetch $integrationRefspec
+}
+git fetch origin upstream-integration
+git rev-parse --abbrev-ref --symbolic-full-name '@{u}'
+git rev-list --left-right --count HEAD...origin/upstream-integration
+```
+
 For later runs, record which upstream commit the branch last integrated. Measure
 only the new upstream interval and choose merge, cherry-pick, or semantic replay
 per behavior slice. Frequent, small updates may merge cleanly; the permanent
