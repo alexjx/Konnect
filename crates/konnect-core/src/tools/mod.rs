@@ -30,6 +30,7 @@ pub mod schematic_builder;
 pub mod svg_import;
 pub mod templates;
 pub mod verification;
+pub mod workflow;
 
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::router::ToolRouter;
@@ -122,6 +123,9 @@ pub struct ToolContext {
     /// Boards positively observed open through IPC during this server process.
     /// Sticky state prevents an unsafe file fallback after KiCad disappears.
     pub(crate) board_session: board_session::BoardSessionMemory,
+    /// Guarded workflow runs and per-resource serialization locks. Each server
+    /// context owns an independent store; cloned handler contexts share it.
+    pub workflow_store: Arc<workflow::WorkflowStore>,
 }
 
 impl ToolContext {
@@ -134,6 +138,7 @@ impl ToolContext {
             observer: crate::observability::CallObserver::new(None),
             jlcpcb_cache: QueryCache::default(),
             board_session: board_session::BoardSessionMemory::default(),
+            workflow_store: Arc::new(workflow::WorkflowStore::default()),
         }
     }
 
@@ -150,6 +155,7 @@ impl ToolContext {
             observer,
             jlcpcb_cache: QueryCache::default(),
             board_session: board_session::BoardSessionMemory::default(),
+            workflow_store: Arc::new(workflow::WorkflowStore::default()),
         }
     }
 }
