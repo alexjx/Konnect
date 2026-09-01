@@ -25,6 +25,27 @@ cd crates/schematic-viewer
 cargo build --release
 ```
 
+## New contributor map
+
+Start with [the architecture overview](docs/DEVELOPER_OVERVIEW.md), then use this
+short map to locate the change:
+
+- `crates/konnect-core` owns MCP tool schemas, handlers, routing, and most
+  behavior tests.
+- `crates/konnect-ipc` owns KiCad 10 protobuf/NNG communication; live PCB writes
+  must keep their board-identity and read-back safeguards.
+- `crates/konnect-sexp` and `crates/konnect-schematic-editor` own conflict-safe
+  file editing and the typed schematic model.
+- `tool-directory.md` is the public tool catalogue. A tool addition or removal
+  must update the registry and generated documentation counts as described in
+  [CONTRIBUTING.md](CONTRIBUTING.md#pull-request-checklist).
+
+For ordinary feature work, keep the diff inside the owning crate and add a
+focused regression test. For upstream adoption, use the
+[upstream integration runbook](docs/UPSTREAM_INTEGRATION.md) and verify the
+[intentional-removal manifest](docs/upstream-intentional-removals.txt) instead of
+restoring removed skill paths by habit.
+
 ## Maintenance runbooks
 
 - [Upstream integration workflow](docs/UPSTREAM_INTEGRATION.md) — repeatably

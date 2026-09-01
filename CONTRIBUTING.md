@@ -2,14 +2,32 @@
 
 Thanks for your interest! Bug reports, feature requests, and pull requests are welcome.
 
+## First contribution
+
+1. Clone [`alexjx/Konnect`](https://github.com/alexjx/Konnect) and choose one
+   focused change from the [fork issue tracker](https://github.com/alexjx/Konnect/issues).
+2. Follow the [developer quick start](DEV.md#quick-start), then read the
+   [new-contributor map](DEV.md#new-contributor-map) before changing a public
+   tool or file format.
+3. Keep upstream integration policy separate from feature work. Changes that
+   adopt upstream commits must follow the
+   [upstream integration runbook](docs/UPSTREAM_INTEGRATION.md), including its
+   intentional-removal checks.
+4. Run the focused tests for the area you changed, then the pull-request checks
+   below. Record any environment-dependent test you could not run.
+
+The upstream governance and licensing documents remain unchanged. Work intended
+for upstream should also follow the upstream repository's contribution process.
+
 ## Before you start
 
 - Read [GOVERNANCE.md](GOVERNANCE.md) — who maintains what, how work is claimed,
   and what has to be true before a change lands.
 - Check [ROADMAP.md](ROADMAP.md) — your idea may already be planned (or intentionally
   out of scope).
-- For anything non-trivial, open an issue first so we can agree on the approach before
-  you invest time.
+- For anything non-trivial, open a
+  [fork issue](https://github.com/alexjx/Konnect/issues) first so we can agree on
+  the approach before you invest time.
 - Keep each pull request focused on one reviewable outcome. Split unrelated platform,
   protocol, feature, and documentation changes into a short PR series.
 - Read [docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md) before adding public

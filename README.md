@@ -23,6 +23,29 @@ skills and safety hooks that teach supported KiCAD conventions out of the box.
 > see [CONTRIBUTING.md](CONTRIBUTING.md) and the
 > [naming conventions](docs/NAMING_CONVENTIONS.md).
 
+## About this fork
+
+This repository is the [`alexjx/Konnect`](https://github.com/alexjx/Konnect)
+fork of [`mixelpixx/Konnect`](https://github.com/mixelpixx/Konnect). The upstream
+architecture, implementation, and contributor history remain the foundation of
+the project; fork-specific changes do not imply upstream endorsement.
+
+The fork currently focuses on three integration policies:
+
+- prefer safety-gated mutations: exact document revisions and editor-lock
+  refusal on guarded file edits, explicit live-board identity for IPC
+  operations, and plan/apply/read-back workflows where the tool supports them;
+- install four namespaced skills — `konnect-kicad-schematic`,
+  `konnect-kicad-pcb-layout`, `konnect-kicad-layout-review`, and
+  `konnect-kicad-package-audit` — without overwriting unrelated user skills;
+- preserve deliberate removals during upstream integration, using the
+  [integration runbook](docs/UPSTREAM_INTEGRATION.md) and its
+  [intentional-removal manifest](docs/upstream-intentional-removals.txt).
+
+The upstream technical and installation guidance below is retained. Fork bugs
+and proposals belong in the
+[`alexjx/Konnect` issue tracker](https://github.com/alexjx/Konnect/issues).
+
 > ## Add realtime research to KiCAD MCP and Konnect. Introducing Nimrod
 >
 > [**Nimrod**](https://nimrod.orchis.ai) is our web-research MCP server:
@@ -148,6 +171,9 @@ geometry are rejected before mutation.
 ### Build from source
 
 ```bash
+git clone https://github.com/alexjx/Konnect.git
+cd Konnect
+
 # protoc is required (protobuf code generation), and cmake (the nng crate
 # compiles the NNG C library with it).
 # Windows: choco install protoc cmake
@@ -353,6 +379,7 @@ works only when passed with `--config`.)
 
 ## Support
 
-- Issues & feature requests: [GitHub Issues](https://github.com/mixelpixx/Konnect/issues)
+- Fork issues & feature requests: [`alexjx/Konnect` issues](https://github.com/alexjx/Konnect/issues)
+- Upstream project: [`mixelpixx/Konnect`](https://github.com/mixelpixx/Konnect)
 - Roadmap: [ROADMAP.md](ROADMAP.md)
 - Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
