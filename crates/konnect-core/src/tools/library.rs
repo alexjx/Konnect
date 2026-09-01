@@ -14,6 +14,7 @@ use konnect_sexp::writer::{
     write_atomic, write_atomic_if_unchanged, write_new_atomic, SexpEdit,
 };
 use serde_json::json;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -147,6 +148,45 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["footprint_path", "pad_number"]
             }),
             |args, ctx| async move { handle_edit_footprint_pad(args, ctx).await }
+        ),
+        tool!(
+            "replace_footprint_pad_layout",
+            "Atomically replace every direct-child pad in an existing .kicad_mod footprint while preserving all non-pad source verbatim. An empty pads array removes every pad.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "footprint_path": { "type": "string", "description": "Path to an existing .kicad_mod file" },
+                    "pads": {
+                        "type": "array",
+                        "description": "Complete replacement pad layout, in the order it should appear in the footprint",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "number": { "type": "string" },
+                                "type": { "type": "string", "enum": ["smd", "thru_hole", "np_thru_hole"] },
+                                "shape": { "type": "string", "enum": ["circle", "rect", "oval", "roundrect"] },
+                                "x": { "type": "number" },
+                                "y": { "type": "number" },
+                                "width": { "type": "number", "exclusiveMinimum": 0 },
+                                "height": { "type": "number", "exclusiveMinimum": 0 },
+                                "rotation": { "type": "number", "description": "Pad rotation in degrees (default 0)" },
+                                "drill": { "type": "number", "exclusiveMinimum": 0, "description": "Circular drill diameter; shorthand for equal drill_width/drill_height" },
+                                "drill_width": { "type": "number", "exclusiveMinimum": 0, "description": "Required with drill_height for an oval through-hole drill" },
+                                "drill_height": { "type": "number", "exclusiveMinimum": 0, "description": "Required with drill_width for an oval through-hole drill" },
+                                "layers": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Explicit canonical KiCAD pad layers; defaults follow the pad type"
+                                },
+                                "roundrect_rratio": { "type": "number", "minimum": 0, "maximum": 0.5 }
+                            },
+                            "required": ["number", "type", "shape", "x", "y", "width", "height"]
+                        }
+                    }
+                },
+                "required": ["footprint_path", "pads"]
+            }),
+            |args, ctx| async move { handle_replace_footprint_pad_layout(args, ctx).await }
         ),
         tool!(
             "register_footprint_library",
@@ -944,6 +984,446 @@ async fn handle_edit_footprint_pad(
             "shape": shape,
             "matched_count": matched_count,
             "updated_count": matched_count
+        }))
+        .unwrap(),
+    ))
+}
+
+#[derive(Debug)]
+struct ReplacementPad {
+    number: String,
+    pad_type: &'static str,
+    shape: &'static str,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    rotation: f64,
+    drill: Option<(f64, f64)>,
+    layers: Vec<&'static str>,
+    roundrect_rratio: Option<f64>,
+}
+
+fn replacement_pad_error(index: usize, field: &str, reason: impl Into<String>) -> (String, String) {
+    (format!("pads[{index}].{field}"), reason.into())
+}
+
+fn replacement_number(
+    pad: &serde_json::Value,
+    index: usize,
+    field: &str,
+) -> Result<f64, (String, String)> {
+    let Some(value) = pad.get(field).and_then(serde_json::Value::as_f64) else {
+        return Err(replacement_pad_error(index, field, "must be a number"));
+    };
+    if !value.is_finite() {
+        return Err(replacement_pad_error(index, field, "must be finite"));
+    }
+    Ok(value)
+}
+
+fn optional_replacement_number(
+    pad: &serde_json::Value,
+    index: usize,
+    field: &str,
+) -> Result<Option<f64>, (String, String)> {
+    match pad.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => {
+            let Some(value) = value.as_f64() else {
+                return Err(replacement_pad_error(index, field, "must be a number"));
+            };
+            if !value.is_finite() {
+                return Err(replacement_pad_error(index, field, "must be finite"));
+            }
+            Ok(Some(value))
+        }
+    }
+}
+
+fn parse_replacement_pad(
+    pad: &serde_json::Value,
+    index: usize,
+) -> Result<ReplacementPad, (String, String)> {
+    let Some(object) = pad.as_object() else {
+        return Err(replacement_pad_error(index, "pad", "must be an object"));
+    };
+    let number = object
+        .get("number")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| replacement_pad_error(index, "number", "must be a string"))?
+        .to_string();
+    let pad_type = match object.get("type").and_then(serde_json::Value::as_str) {
+        Some("smd") => "smd",
+        Some("thru_hole") => "thru_hole",
+        Some("np_thru_hole") => "np_thru_hole",
+        Some(value) => {
+            return Err(replacement_pad_error(
+                index,
+                "type",
+                format!("unsupported pad type '{value}'"),
+            ))
+        }
+        None => return Err(replacement_pad_error(index, "type", "must be a string")),
+    };
+    let shape = match object.get("shape").and_then(serde_json::Value::as_str) {
+        Some("circle") => "circle",
+        Some("rect") => "rect",
+        Some("oval") => "oval",
+        Some("roundrect") => "roundrect",
+        Some(value) => {
+            return Err(replacement_pad_error(
+                index,
+                "shape",
+                format!("unsupported standard shape '{value}'"),
+            ))
+        }
+        None => return Err(replacement_pad_error(index, "shape", "must be a string")),
+    };
+    let x = replacement_number(pad, index, "x")?;
+    let y = replacement_number(pad, index, "y")?;
+    let width = replacement_number(pad, index, "width")?;
+    let height = replacement_number(pad, index, "height")?;
+    if width <= 0.0 {
+        return Err(replacement_pad_error(
+            index,
+            "width",
+            "must be greater than zero",
+        ));
+    }
+    if height <= 0.0 {
+        return Err(replacement_pad_error(
+            index,
+            "height",
+            "must be greater than zero",
+        ));
+    }
+    let rotation = optional_replacement_number(pad, index, "rotation")?.unwrap_or(0.0);
+
+    let circular_drill = optional_replacement_number(pad, index, "drill")?;
+    let drill_width = optional_replacement_number(pad, index, "drill_width")?;
+    let drill_height = optional_replacement_number(pad, index, "drill_height")?;
+    if circular_drill.is_some() && (drill_width.is_some() || drill_height.is_some()) {
+        return Err(replacement_pad_error(
+            index,
+            "drill",
+            "cannot be combined with drill_width or drill_height",
+        ));
+    }
+    if drill_width.is_some() != drill_height.is_some() {
+        return Err(replacement_pad_error(
+            index,
+            "drill_width",
+            "drill_width and drill_height must be supplied together",
+        ));
+    }
+    let drill = circular_drill
+        .map(|diameter| (diameter, diameter))
+        .or_else(|| drill_width.zip(drill_height));
+    match (pad_type, drill) {
+        ("smd", Some(_)) => {
+            return Err(replacement_pad_error(
+                index,
+                "drill",
+                "an SMD pad cannot have a drill",
+            ))
+        }
+        ("thru_hole" | "np_thru_hole", None) => {
+            return Err(replacement_pad_error(
+                index,
+                "drill",
+                "a through-hole pad requires drill or drill_width/drill_height",
+            ))
+        }
+        _ => {}
+    }
+    if let Some((drill_width, drill_height)) = drill {
+        if drill_width <= 0.0 || drill_height <= 0.0 {
+            return Err(replacement_pad_error(
+                index,
+                "drill",
+                "drill dimensions must be greater than zero",
+            ));
+        }
+        if drill_width > width || drill_height > height {
+            return Err(replacement_pad_error(
+                index,
+                "drill",
+                "drill dimensions must not exceed the pad size",
+            ));
+        }
+    }
+
+    const VALID_LAYERS: &[&str] = &[
+        "F.Cu", "B.Cu", "F.Paste", "B.Paste", "F.Mask", "B.Mask", "*.Cu", "*.Mask",
+    ];
+    let layers = match object.get("layers") {
+        None | Some(serde_json::Value::Null) if pad_type == "smd" => {
+            vec!["F.Cu", "F.Paste", "F.Mask"]
+        }
+        None | Some(serde_json::Value::Null) => vec!["*.Cu", "*.Mask"],
+        Some(value) => {
+            let Some(values) = value.as_array() else {
+                return Err(replacement_pad_error(index, "layers", "must be an array"));
+            };
+            if values.is_empty() {
+                return Err(replacement_pad_error(index, "layers", "must not be empty"));
+            }
+            let mut layers = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(layer) = value.as_str() else {
+                    return Err(replacement_pad_error(
+                        index,
+                        "layers",
+                        "must contain only strings",
+                    ));
+                };
+                let Some(canonical) = VALID_LAYERS.iter().copied().find(|valid| *valid == layer)
+                else {
+                    return Err(replacement_pad_error(
+                        index,
+                        "layers",
+                        format!("unsupported pad layer '{layer}'"),
+                    ));
+                };
+                layers.push(canonical);
+            }
+            layers
+        }
+    };
+    if pad_type == "smd" && !layers.iter().any(|layer| matches!(*layer, "F.Cu" | "B.Cu")) {
+        return Err(replacement_pad_error(
+            index,
+            "layers",
+            "an SMD pad must include F.Cu or B.Cu",
+        ));
+    }
+    if pad_type != "smd" && !layers.contains(&"*.Cu") {
+        return Err(replacement_pad_error(
+            index,
+            "layers",
+            "a through-hole pad must include *.Cu",
+        ));
+    }
+
+    let roundrect_rratio = optional_replacement_number(pad, index, "roundrect_rratio")?;
+    if roundrect_rratio.is_some() && shape != "roundrect" {
+        return Err(replacement_pad_error(
+            index,
+            "roundrect_rratio",
+            "is only valid for a roundrect pad",
+        ));
+    }
+    if roundrect_rratio.is_some_and(|ratio| !(0.0..=0.5).contains(&ratio)) {
+        return Err(replacement_pad_error(
+            index,
+            "roundrect_rratio",
+            "must be between 0 and 0.5",
+        ));
+    }
+
+    Ok(ReplacementPad {
+        number,
+        pad_type,
+        shape,
+        x,
+        y,
+        width,
+        height,
+        rotation,
+        drill,
+        layers,
+        roundrect_rratio: if shape == "roundrect" {
+            Some(roundrect_rratio.unwrap_or(0.25))
+        } else {
+            None
+        },
+    })
+}
+
+fn format_replacement_pad(pad: &ReplacementPad) -> String {
+    let at = if pad.rotation == 0.0 {
+        format!("(at {} {})", fmt_f64(pad.x), fmt_f64(pad.y))
+    } else {
+        format!(
+            "(at {} {} {})",
+            fmt_f64(pad.x),
+            fmt_f64(pad.y),
+            fmt_f64(pad.rotation)
+        )
+    };
+    let drill = pad.drill.map_or_else(String::new, |(width, height)| {
+        if (width - height).abs() < 1e-9 {
+            format!(" (drill {})", fmt_f64(width))
+        } else {
+            format!(" (drill oval {} {})", fmt_f64(width), fmt_f64(height))
+        }
+    });
+    let layers = pad
+        .layers
+        .iter()
+        .map(|layer| format!("\"{layer}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let ratio = pad.roundrect_rratio.map_or_else(String::new, |ratio| {
+        format!(" (roundrect_rratio {})", fmt_f64(ratio))
+    });
+    format!(
+        "(pad \"{}\" {} {} {} (size {} {}){} (layers {}){})",
+        escape_library_string(&pad.number),
+        pad.pad_type,
+        pad.shape,
+        at,
+        fmt_f64(pad.width),
+        fmt_f64(pad.height),
+        drill,
+        layers,
+        ratio
+    )
+}
+
+fn direct_footprint_pad_ranges(content: &str) -> Result<Vec<(usize, usize)>, String> {
+    let mut pads = Vec::new();
+    for (start, end) in find_direct_child_blocks(content, "footprint") {
+        let child = parse_sexp(&content[start..end])
+            .map_err(|error| format!("footprint contains a malformed direct child: {error}"))?;
+        if child.head() == Some("pad") {
+            pads.push((start, end));
+        }
+    }
+    Ok(pads)
+}
+
+fn line_indent_before(content: &str, offset: usize) -> String {
+    let line_start = content[..offset]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    content[line_start..offset]
+        .chars()
+        .take_while(|character| character.is_whitespace())
+        .collect()
+}
+
+fn replace_footprint_pad_layout_source(
+    content: &str,
+    pads: &[ReplacementPad],
+) -> Result<(String, usize), String> {
+    let root = parse_sexp(content).map_err(|error| format!("footprint is malformed: {error}"))?;
+    if root.head() != Some("footprint") {
+        return Err(crate::tools::footprint_root_reason(root.head()));
+    }
+    let old_pads = direct_footprint_pad_ranges(content)?;
+    let default_indent = find_direct_child_blocks(content, "footprint")
+        .first()
+        .map(|(start, _)| line_indent_before(content, *start))
+        .filter(|indent| !indent.is_empty())
+        .unwrap_or_else(|| "  ".to_string());
+    let indent = old_pads
+        .first()
+        .map(|(start, _)| line_indent_before(content, *start))
+        .filter(|indent| !indent.is_empty())
+        .unwrap_or(default_indent);
+    let rendered = pads
+        .iter()
+        .map(format_replacement_pad)
+        .collect::<Vec<_>>()
+        .join(&format!("\n{indent}"));
+
+    let replacement = if let Some((first_start, first_end)) = old_pads.first().copied() {
+        let mut edits = vec![SexpEdit::replace(first_start, first_end, rendered)];
+        edits.extend(
+            old_pads
+                .iter()
+                .skip(1)
+                .map(|(start, end)| SexpEdit::delete(*start, *end)),
+        );
+        apply_edits(content.to_string(), edits)
+    } else if rendered.is_empty() {
+        content.to_string()
+    } else {
+        let root_start = find_block_starts(content, "footprint")
+            .into_iter()
+            .next()
+            .ok_or_else(|| "footprint root block was not found".to_string())?;
+        let (_, root_end) = find_balanced_block(content, root_start)
+            .ok_or_else(|| "footprint root block is unbalanced".to_string())?;
+        apply_edits(
+            content.to_string(),
+            vec![SexpEdit::insert(
+                root_end - 1,
+                format!("\n{indent}{rendered}"),
+            )],
+        )
+    };
+    parse_sexp(&replacement)
+        .map_err(|error| format!("replacement footprint is malformed: {error}"))?;
+    Ok((replacement, old_pads.len()))
+}
+
+fn ensure_footprint_library_editor_is_closed(path: &Path) -> Result<(), konnect_sexp::SexpError> {
+    let is_footprint = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_mod"));
+    if !is_footprint {
+        return Ok(());
+    }
+    let Some(file_name) = path.file_name() else {
+        return Ok(());
+    };
+    let mut lock_name = OsString::from("~");
+    lock_name.push(file_name);
+    lock_name.push(".lck");
+    let lock_path = path.with_file_name(lock_name);
+    match std::fs::symlink_metadata(&lock_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) | Err(_) => Err(konnect_sexp::SexpError::KiCadEditorLocked {
+            path: path.to_path_buf(),
+            lock_path,
+        }),
+    }
+}
+
+fn commit_footprint_pad_layout(
+    path: &Path,
+    expected: &str,
+    replacement: &str,
+) -> Result<(), konnect_sexp::SexpError> {
+    ensure_footprint_library_editor_is_closed(path)?;
+    write_atomic_if_unchanged(path, expected, replacement)
+}
+
+async fn handle_replace_footprint_pad_layout(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let path = get_path(args, "footprint_path")?;
+    let pad_values = match require_array(args, "pads") {
+        Ok(values) => values,
+        Err(error) => return Ok(error),
+    };
+    let mut pads = Vec::with_capacity(pad_values.len());
+    for (index, pad) in pad_values.iter().enumerate() {
+        match parse_replacement_pad(pad, index) {
+            Ok(pad) => pads.push(pad),
+            Err((field, reason)) => return Ok(invalid_library_argument(&field, reason)),
+        }
+    }
+
+    let content = read_consistent(&path)?;
+    let (replacement, removed_pad_count) =
+        match replace_footprint_pad_layout_source(&content, &pads) {
+            Ok(replacement) => replacement,
+            Err(reason) => return Ok(invalid_library_argument("footprint_path", reason)),
+        };
+    commit_footprint_pad_layout(&path, &content, &replacement)?;
+
+    Ok(CallToolResult::text(
+        serde_json::to_string(&json!({
+            "success": true,
+            "footprint_path": path,
+            "removed_pad_count": removed_pad_count,
+            "pad_count": pads.len()
         }))
         .unwrap(),
     ))
@@ -5299,6 +5779,202 @@ mod tests {
         assert!(result.is_error);
         let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
         assert_eq!(output["error"]["field"], "shape");
+    }
+
+    const REPLACE_PAD_FIXTURE: &str = r#"(footprint "Connector_Test"
+  (version 20240108)
+  (generator "pcbnew")
+  (layer "F.Cu")
+  (uuid "11111111-1111-4111-8111-111111111111")
+  (property "Reference" "J1" (at 0 -3 0) (layer "F.SilkS"))
+  (pad "2" thru_hole circle (at 2.54 0) (size 1.8 1.8) (drill 1) (layers "*.Cu" "*.Mask"))
+  (fp_rect (start -1 -2) (end 4 2) (stroke (width 0.1) (type default)) (fill none) (layer "F.Fab"))
+  (pad "1" thru_hole rect (at 0 0) (size 1.8 1.8) (drill 1) (layers "*.Cu" "*.Mask"))
+  (model "${KICAD10_3DMODEL_DIR}/Connector.step"
+    (offset (xyz 0 0 0))
+    (scale (xyz 1 1 1))
+    (rotate (xyz 0 0 0)))
+)
+"#;
+
+    fn source_without_direct_pads(source: &str) -> String {
+        apply_edits(
+            source.to_string(),
+            direct_footprint_pad_ranges(source)
+                .unwrap()
+                .into_iter()
+                .map(|(start, end)| SexpEdit::delete(start, end))
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn replace_pad_layout_adds_deletes_and_reorders_while_preserving_non_pad_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Connector_Test.kicad_mod");
+        std::fs::write(&path, REPLACE_PAD_FIXTURE).unwrap();
+
+        let result = handle_replace_footprint_pad_layout(
+            &json!({
+                "footprint_path": path,
+                "pads": [
+                    {"number":"3", "type":"smd", "shape":"roundrect", "x":5, "y":0, "width":1.2, "height":2.0, "rotation":90, "layers":["B.Cu","B.Paste","B.Mask"], "roundrect_rratio":0.2},
+                    {"number":"1", "type":"thru_hole", "shape":"rect", "x":0, "y":0, "width":2, "height":2, "drill_width":1.0, "drill_height":1.2},
+                    {"number":"2", "type":"thru_hole", "shape":"circle", "x":2.54, "y":0, "width":2, "height":2, "drill":1.0}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let updated = std::fs::read_to_string(&path).unwrap();
+        parse_sexp(&updated).expect("replacement remains valid S-expression");
+        for preserved in [
+            "(uuid \"11111111-1111-4111-8111-111111111111\")",
+            "(property \"Reference\" \"J1\" (at 0 -3 0) (layer \"F.SilkS\"))",
+            "(fp_rect (start -1 -2) (end 4 2) (stroke (width 0.1) (type default)) (fill none) (layer \"F.Fab\"))",
+            "(model \"${KICAD10_3DMODEL_DIR}/Connector.step\"\n    (offset (xyz 0 0 0))\n    (scale (xyz 1 1 1))\n    (rotate (xyz 0 0 0)))",
+        ] {
+            assert_eq!(
+                updated.matches(preserved).count(),
+                1,
+                "non-pad source changed or was duplicated: {preserved}\n{updated}"
+            );
+        }
+        let numbers = direct_footprint_pad_ranges(&updated)
+            .unwrap()
+            .into_iter()
+            .map(|(start, end)| {
+                parse_sexp(&updated[start..end])
+                    .unwrap()
+                    .get(1)
+                    .and_then(SexpNode::as_str)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, ["3", "1", "2"]);
+        assert!(updated.contains("(at 5 0 90)"), "{updated}");
+        assert!(updated.contains("(drill oval 1 1.2)"), "{updated}");
+        assert!(updated.contains("(roundrect_rratio 0.2)"), "{updated}");
+    }
+
+    #[tokio::test]
+    async fn replace_pad_layout_accepts_an_empty_layout_and_preserves_every_other_item() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Connector_Test.kicad_mod");
+        std::fs::write(&path, REPLACE_PAD_FIXTURE).unwrap();
+
+        let result = handle_replace_footprint_pad_layout(
+            &json!({"footprint_path": path, "pads": []}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(direct_footprint_pad_ranges(&updated).unwrap().is_empty());
+        assert_eq!(updated, source_without_direct_pads(REPLACE_PAD_FIXTURE));
+    }
+
+    #[tokio::test]
+    async fn replace_pad_layout_adds_the_first_pad_to_a_padless_footprint() {
+        const PADLESS: &str = "(footprint \"Padless\"\n  (version 20240108)\n  (layer \"F.Cu\")\n  (uuid \"keep-me\")\n)\n";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Padless.kicad_mod");
+        std::fs::write(&path, PADLESS).unwrap();
+
+        let result = handle_replace_footprint_pad_layout(
+            &json!({
+                "footprint_path": path,
+                "pads": [{"number":"1", "type":"smd", "shape":"rect", "x":0, "y":0, "width":1, "height":2}]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(direct_footprint_pad_ranges(&updated).unwrap().len(), 1);
+        assert!(updated.contains("(uuid \"keep-me\")"), "{updated}");
+        parse_sexp(&updated).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_replacement_pad_is_a_zero_write_structured_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Connector_Test.kicad_mod");
+        std::fs::write(&path, REPLACE_PAD_FIXTURE).unwrap();
+
+        let result = handle_replace_footprint_pad_layout(
+            &json!({
+                "footprint_path": path,
+                "pads": [{"number":"1", "type":"thru_hole", "shape":"circle", "x":0, "y":0, "width":1, "height":1, "drill":1.2}]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{:?}", result.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), REPLACE_PAD_FIXTURE);
+    }
+
+    #[test]
+    fn stale_pad_layout_revision_is_a_zero_write_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Connector_Test.kicad_mod");
+        std::fs::write(&path, REPLACE_PAD_FIXTURE).unwrap();
+        let newer = REPLACE_PAD_FIXTURE.replace("Connector_Test", "Connector_Newer");
+        std::fs::write(&path, &newer).unwrap();
+
+        let error = commit_footprint_pad_layout(&path, REPLACE_PAD_FIXTURE, "replacement")
+            .expect_err("a stale source revision must conflict");
+        assert!(matches!(error, konnect_sexp::SexpError::Conflict { .. }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+    }
+
+    #[tokio::test]
+    async fn footprint_editor_lock_is_a_zero_write_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Connector_Test.kicad_mod");
+        let lock = directory.path().join("~Connector_Test.kicad_mod.lck");
+        std::fs::write(&path, REPLACE_PAD_FIXTURE).unwrap();
+        std::fs::write(&lock, "owner@host").unwrap();
+
+        let error = handle_replace_footprint_pad_layout(
+            &json!({"footprint_path": path, "pads": []}),
+            &test_ctx(),
+        )
+        .await
+        .expect_err("an editor lock must conflict");
+        assert!(error.chain().any(|cause| cause
+            .downcast_ref::<konnect_sexp::SexpError>()
+            .is_some_and(|error| matches!(
+                error,
+                konnect_sexp::SexpError::KiCadEditorLocked { .. }
+            ))));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), REPLACE_PAD_FIXTURE);
+    }
+
+    #[test]
+    fn replace_pad_layout_schema_exposes_the_complete_ordered_layout() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "replace_footprint_pad_layout")
+            .expect("library must expose replace_footprint_pad_layout");
+        assert_eq!(
+            tool.input_schema["required"],
+            json!(["footprint_path", "pads"])
+        );
+        assert_eq!(
+            tool.input_schema["properties"]["pads"]["items"]["properties"]["type"]["enum"],
+            json!(["smd", "thru_hole", "np_thru_hole"])
+        );
     }
 
     #[test]
