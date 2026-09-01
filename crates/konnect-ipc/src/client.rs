@@ -420,6 +420,310 @@ fn unique_footprint_by_reference(
     found.with_context(|| format!("footprint '{reference}' not found on board"))
 }
 
+fn flipped_side_layer(layer: i32) -> Result<(i32, bool)> {
+    let Some(name) = kiapi::board::types::BoardLayer::try_from(layer)
+        .ok()
+        .and_then(crate::builders::layer_name)
+    else {
+        anyhow::bail!("footprint contains an unknown board layer value {layer}");
+    };
+    let paired = match name {
+        "F.Cu" => Some("B.Cu"),
+        "B.Cu" => Some("F.Cu"),
+        "F.Adhes" => Some("B.Adhes"),
+        "B.Adhes" => Some("F.Adhes"),
+        "F.Paste" => Some("B.Paste"),
+        "B.Paste" => Some("F.Paste"),
+        "F.SilkS" => Some("B.SilkS"),
+        "B.SilkS" => Some("F.SilkS"),
+        "F.Mask" => Some("B.Mask"),
+        "B.Mask" => Some("F.Mask"),
+        "F.CrtYd" => Some("B.CrtYd"),
+        "B.CrtYd" => Some("F.CrtYd"),
+        "F.Fab" => Some("B.Fab"),
+        "B.Fab" => Some("F.Fab"),
+        _ if name.starts_with("F.") || name.starts_with("B.") => {
+            anyhow::bail!("unsupported side-specific KiCad layer '{name}'")
+        }
+        _ => None,
+    };
+    Ok(match paired {
+        Some(name) => (crate::builders::layer_from_name(name) as i32, true),
+        None => (layer, false),
+    })
+}
+
+fn normalize_signed_degrees(angle: f64) -> f64 {
+    let normalized = angle.rem_euclid(360.0);
+    if normalized > 180.0 {
+        normalized - 360.0
+    } else {
+        normalized
+    }
+}
+
+fn mirror_position_y(position: &mut Option<kiapi::common::types::Vector2>, center_y_nm: i64) {
+    if let Some(position) = position {
+        position.y_nm = ((center_y_nm as i128 * 2 - position.y_nm as i128)
+            .clamp(i64::MIN as i128, i64::MAX as i128)) as i64;
+    }
+}
+
+fn mirror_angle_negated(angle: &mut Option<kiapi::common::types::Angle>) -> Result<()> {
+    if let Some(angle) = angle {
+        if !angle.value_degrees.is_finite() {
+            anyhow::bail!("footprint child contains a non-finite angle");
+        }
+        angle.value_degrees = normalize_signed_degrees(-angle.value_degrees);
+    }
+    Ok(())
+}
+
+fn mirror_text_for_flip(
+    text: &mut kiapi::common::types::Text,
+    center_y_nm: i64,
+    side_specific: bool,
+) -> Result<()> {
+    mirror_position_y(&mut text.position, center_y_nm);
+    if let Some(attributes) = text.attributes.as_mut() {
+        if let Some(angle) = attributes.angle.as_mut() {
+            if !angle.value_degrees.is_finite() {
+                anyhow::bail!("footprint text contains a non-finite angle");
+            }
+            angle.value_degrees = normalize_degrees(180.0 - angle.value_degrees);
+        }
+        if side_specific {
+            attributes.mirrored = !attributes.mirrored;
+        }
+    }
+    Ok(())
+}
+
+fn mirror_board_text_for_flip(
+    text: &mut kiapi::board::types::BoardText,
+    center_y_nm: i64,
+) -> Result<()> {
+    let (layer, side_specific) = flipped_side_layer(text.layer)?;
+    text.layer = layer;
+    if let Some(text) = text.text.as_mut() {
+        mirror_text_for_flip(text, center_y_nm, side_specific)?;
+    }
+    Ok(())
+}
+
+fn mirror_field_for_flip(
+    field: &mut Option<kiapi::board::types::Field>,
+    center_y_nm: i64,
+) -> Result<()> {
+    if let Some(text) = field.as_mut().and_then(|field| field.text.as_mut()) {
+        mirror_board_text_for_flip(text, center_y_nm)?;
+    }
+    Ok(())
+}
+
+fn mirror_polyline_for_flip(line: &mut kiapi::common::types::PolyLine, center_y_nm: i64) {
+    use kiapi::common::types::poly_line_node::Geometry;
+    for node in &mut line.nodes {
+        match node.geometry.as_mut() {
+            Some(Geometry::Point(point)) => {
+                point.y_nm = center_y_nm * 2 - point.y_nm;
+            }
+            Some(Geometry::Arc(arc)) => {
+                mirror_position_y(&mut arc.start, center_y_nm);
+                mirror_position_y(&mut arc.mid, center_y_nm);
+                mirror_position_y(&mut arc.end, center_y_nm);
+                std::mem::swap(&mut arc.start, &mut arc.end);
+            }
+            None => {}
+        }
+    }
+}
+
+fn mirror_graphic_for_flip(
+    graphic: &mut kiapi::board::types::BoardGraphicShape,
+    center_y_nm: i64,
+) -> Result<()> {
+    graphic.layer = flipped_side_layer(graphic.layer)?.0;
+    use kiapi::common::types::graphic_shape::Geometry;
+    let Some(geometry) = graphic
+        .shape
+        .as_mut()
+        .and_then(|shape| shape.geometry.as_mut())
+    else {
+        return Ok(());
+    };
+    match geometry {
+        Geometry::Segment(segment) => {
+            mirror_position_y(&mut segment.start, center_y_nm);
+            mirror_position_y(&mut segment.end, center_y_nm);
+        }
+        Geometry::Rectangle(rectangle) => {
+            mirror_position_y(&mut rectangle.top_left, center_y_nm);
+            mirror_position_y(&mut rectangle.bottom_right, center_y_nm);
+        }
+        Geometry::Arc(arc) => {
+            mirror_position_y(&mut arc.start, center_y_nm);
+            mirror_position_y(&mut arc.mid, center_y_nm);
+            mirror_position_y(&mut arc.end, center_y_nm);
+            std::mem::swap(&mut arc.start, &mut arc.end);
+        }
+        Geometry::Circle(circle) => {
+            mirror_position_y(&mut circle.center, center_y_nm);
+            mirror_position_y(&mut circle.radius_point, center_y_nm);
+        }
+        Geometry::Polygon(polygons) => {
+            for polygon in &mut polygons.polygons {
+                if let Some(outline) = polygon.outline.as_mut() {
+                    mirror_polyline_for_flip(outline, center_y_nm);
+                }
+                for hole in &mut polygon.holes {
+                    mirror_polyline_for_flip(hole, center_y_nm);
+                }
+            }
+        }
+        Geometry::Bezier(bezier) => {
+            mirror_position_y(&mut bezier.start, center_y_nm);
+            mirror_position_y(&mut bezier.control1, center_y_nm);
+            mirror_position_y(&mut bezier.control2, center_y_nm);
+            mirror_position_y(&mut bezier.end, center_y_nm);
+        }
+    }
+    Ok(())
+}
+
+fn mirror_footprint_for_flip(footprint: &mut kiapi::board::types::FootprintInstance) -> Result<()> {
+    let center_y_nm = footprint
+        .position
+        .as_ref()
+        .context("footprint has no position")?
+        .y_nm;
+    let current_layer = layer_enum_to_name(footprint.layer);
+    if !matches!(current_layer, "F.Cu" | "B.Cu") {
+        anyhow::bail!("footprint sits on '{current_layer}', which is neither F.Cu nor B.Cu");
+    }
+    footprint.layer = flipped_side_layer(footprint.layer)?.0;
+    mirror_angle_negated(&mut footprint.orientation)?;
+    for field in [
+        &mut footprint.reference_field,
+        &mut footprint.value_field,
+        &mut footprint.datasheet_field,
+        &mut footprint.description_field,
+    ] {
+        mirror_field_for_flip(field, center_y_nm)?;
+    }
+
+    let definition = footprint
+        .definition
+        .as_mut()
+        .context("footprint has no definition")?;
+    for layer in &mut definition.private_layers {
+        *layer = flipped_side_layer(*layer)?.0;
+    }
+    for field in [
+        &mut definition.reference_field,
+        &mut definition.value_field,
+        &mut definition.datasheet_field,
+        &mut definition.description_field,
+    ] {
+        mirror_field_for_flip(field, center_y_nm)?;
+    }
+    for child in &mut definition.items {
+        let child_type = crate::builders::any_type_name(child);
+        if child_type == "kiapi.board.types.Pad" {
+            let mut pad = kiapi::board::types::Pad::decode(child.value.as_slice())
+                .context("footprint contains an unreadable pad")?;
+            mirror_position_y(&mut pad.position, center_y_nm);
+            if let Some(stack) = pad.pad_stack.as_mut() {
+                mirror_angle_negated(&mut stack.angle)?;
+                for layer in &mut stack.layers {
+                    *layer = flipped_side_layer(*layer)?.0;
+                }
+                for layer in &mut stack.copper_layers {
+                    layer.layer = flipped_side_layer(layer.layer)?.0;
+                    if !layer.custom_shapes.is_empty() || layer.offset.is_some() {
+                        anyhow::bail!(
+                            "footprint pad '{}' uses custom or offset pad geometry that cannot be safely flipped",
+                            pad.number
+                        );
+                    }
+                }
+                std::mem::swap(&mut stack.front_outer_layers, &mut stack.back_outer_layers);
+                std::mem::swap(
+                    &mut stack.front_post_machining,
+                    &mut stack.back_post_machining,
+                );
+            }
+            child.value = pad.encode_to_vec();
+        } else if child_type == "kiapi.board.types.BoardGraphicShape" {
+            let mut graphic =
+                kiapi::board::types::BoardGraphicShape::decode(child.value.as_slice())
+                    .context("footprint contains an unreadable graphic")?;
+            mirror_graphic_for_flip(&mut graphic, center_y_nm)?;
+            child.value = graphic.encode_to_vec();
+        } else if child_type == "kiapi.board.types.BoardText" {
+            let mut text = kiapi::board::types::BoardText::decode(child.value.as_slice())
+                .context("footprint contains unreadable text")?;
+            mirror_board_text_for_flip(&mut text, center_y_nm)?;
+            child.value = text.encode_to_vec();
+        } else if child_type == "kiapi.board.types.Field" {
+            let mut field = kiapi::board::types::Field::decode(child.value.as_slice())
+                .context("footprint contains an unreadable field")?;
+            if let Some(text) = field.text.as_mut() {
+                mirror_board_text_for_flip(text, center_y_nm)?;
+            }
+            child.value = field.encode_to_vec();
+        } else if child_type == "kiapi.board.types.Footprint3DModel" {
+            let mut model = kiapi::board::types::Footprint3DModel::decode(child.value.as_slice())
+                .context("footprint contains an unreadable 3D model")?;
+            if let Some(offset) = model.offset.as_mut() {
+                offset.y_nm = -offset.y_nm;
+            }
+            if let Some(rotation) = model.rotation.as_mut() {
+                rotation.x_nm = -rotation.x_nm;
+                rotation.y_nm = -rotation.y_nm;
+            }
+            child.value = model.encode_to_vec();
+        } else if child_type == "kiapi.board.types.Group" {
+            // Group membership and identity carry no independent geometry.
+        } else {
+            anyhow::bail!(
+                "footprint contains an unsupported item type '{child_type}'; refusing to flip it"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn footprint_summary(footprint: &kiapi::board::types::FootprintInstance) -> IpcFootprint {
+    let position = footprint.position.unwrap_or_default();
+    IpcFootprint {
+        reference: footprint_reference(footprint).to_string(),
+        value: footprint
+            .value_field
+            .as_ref()
+            .and_then(|field| field.text.as_ref())
+            .and_then(|text| text.text.as_ref())
+            .map(|text| text.text.clone())
+            .unwrap_or_default(),
+        footprint: footprint
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.id.as_ref())
+            .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
+            .unwrap_or_default(),
+        position: IpcVector2 {
+            x: nm_to_mm(position.x_nm),
+            y: nm_to_mm(position.y_nm),
+        },
+        rotation: footprint
+            .orientation
+            .as_ref()
+            .map(|angle| angle.value_degrees)
+            .unwrap_or(0.0),
+        layer: layer_enum_to_name(footprint.layer).to_string(),
+    }
+}
+
 /// Marker error carried (via anyhow's error chain) by every failure where no
 /// request completed a round-trip with a live KiCad: no socket path
 /// configured, or the NNG dial/send failed.
@@ -2291,6 +2595,59 @@ impl KiCadIpcClient {
                 })
             })
             .collect()
+    }
+
+    /// Flip one uniquely identified footprint between the front and back
+    /// board sides in one undoable update of one exact open document.
+    ///
+    /// The complete footprint instance is cloned and transformed before
+    /// `BeginCommit`, so an invalid layer, ambiguous reference, unreadable
+    /// child, or unsupported geometry produces no mutation transaction. The
+    /// returned placement is read back from KiCad after the commit.
+    pub fn flip_footprint_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+    ) -> Result<IpcFootprint> {
+        let items = self.get_items_in(
+            document.clone(),
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )?;
+        let mut footprint = unique_footprint_by_reference(items, reference)?;
+        let footprint_uuid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.clone())
+            .filter(|uuid| !uuid.is_empty())
+            .with_context(|| format!("footprint '{reference}' has no UUID"))?;
+        let original_position = footprint
+            .position
+            .with_context(|| format!("footprint '{reference}' has no position"))?;
+        let original_layer = footprint.layer;
+        mirror_footprint_for_flip(&mut footprint)
+            .with_context(|| format!("cannot safely flip footprint '{reference}'"))?;
+        let expected_layer = footprint.layer;
+        let update = crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+        let update_document = document.clone();
+        self.run_commit(&format!("Flip footprint {reference}"), move |client| {
+            client.update_items_in(update_document, vec![update])
+        })?;
+
+        let readback = self.get_items_in(
+            document,
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )?;
+        let held = unique_footprint_by_reference(readback, reference)?;
+        if held.id.as_ref().map(|id| id.value.as_str()) != Some(footprint_uuid.as_str()) {
+            anyhow::bail!("footprint '{reference}' UUID changed during flip");
+        }
+        if held.position != Some(original_position) {
+            anyhow::bail!("footprint '{reference}' anchor moved during flip");
+        }
+        if held.layer != expected_layer || held.layer == original_layer {
+            anyhow::bail!("footprint '{reference}' did not read back on the opposite board side");
+        }
+        Ok(footprint_summary(&held))
     }
 
     /// Set every pad in one footprint to an angle relative to the footprint.

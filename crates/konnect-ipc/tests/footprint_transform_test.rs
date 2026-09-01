@@ -620,6 +620,218 @@ fn missing_placement_target_fails_before_begin_commit() {
 }
 
 #[test]
+fn exact_document_flip_uses_one_commit_preserves_identity_and_returns_readback() {
+    #[derive(Default)]
+    struct Counts {
+        gets: usize,
+        begin: usize,
+        update: usize,
+        push: usize,
+    }
+
+    let mut footprint = mk_footprint_r1();
+    footprint.id = Some(kiapi::common::types::Kiid {
+        value: "footprint-r1".to_string(),
+    });
+    footprint.layer = kiapi::board::types::BoardLayer::BlFCu as i32;
+    footprint.locked = kiapi::common::types::LockedState::LsLocked as i32;
+    footprint.orientation = Some(kiapi::common::types::Angle {
+        value_degrees: 30.0,
+    });
+    footprint.symbol_sheet_name = "Power".to_string();
+    let reference_text = footprint
+        .reference_field
+        .as_mut()
+        .unwrap()
+        .text
+        .as_mut()
+        .unwrap();
+    reference_text.layer = kiapi::board::types::BoardLayer::BlFSilkS as i32;
+    let attributes = reference_text
+        .text
+        .as_mut()
+        .unwrap()
+        .attributes
+        .get_or_insert_with(Default::default);
+    attributes.angle = Some(kiapi::common::types::Angle {
+        value_degrees: 20.0,
+    });
+
+    let current = Arc::new(Mutex::new(footprint));
+    let current_in_mock = current.clone();
+    let counts = Arc::new(Mutex::new(Counts::default()));
+    let counts_in_mock = counts.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetItems") {
+            let command =
+                kiapi::common::commands::GetItems::decode(message.value.as_slice()).unwrap();
+            assert_eq!(
+                header_board_filename(command.header.as_ref().expect("GetItems header")),
+                "target.kicad_pcb"
+            );
+            counts_in_mock.lock().unwrap().gets += 1;
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items: vec![builders::pack_any(
+                        &*current_in_mock.lock().unwrap(),
+                        "kiapi.board.types.FootprintInstance",
+                    )],
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("BeginCommit") {
+            counts_in_mock.lock().unwrap().begin += 1;
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::BeginCommitResponse {
+                    id: Some(kiapi::common::types::Kiid {
+                        value: "flip-commit".to_string(),
+                    }),
+                },
+                "kiapi.common.commands.BeginCommitResponse",
+            )));
+        }
+        if message.type_url.ends_with("UpdateItems") {
+            counts_in_mock.lock().unwrap().update += 1;
+            let command =
+                kiapi::common::commands::UpdateItems::decode(message.value.as_slice()).unwrap();
+            assert_eq!(
+                header_board_filename(command.header.as_ref().expect("UpdateItems header")),
+                "target.kicad_pcb"
+            );
+            assert_eq!(command.items.len(), 1);
+            let updated =
+                kiapi::board::types::FootprintInstance::decode(command.items[0].value.as_slice())
+                    .unwrap();
+            assert_eq!(updated.id.as_ref().unwrap().value, "footprint-r1");
+            assert_eq!(
+                updated.locked,
+                kiapi::common::types::LockedState::LsLocked as i32
+            );
+            assert_eq!(updated.symbol_sheet_name, "Power");
+            assert_eq!(updated.layer, kiapi::board::types::BoardLayer::BlBCu as i32);
+            assert_eq!(updated.orientation.as_ref().unwrap().value_degrees, -30.0);
+            assert_eq!(
+                pad_positions_mm(&updated),
+                vec![(99.0, 100.0), (101.0, 100.0)]
+            );
+            let reference = updated
+                .reference_field
+                .as_ref()
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                reference.layer,
+                kiapi::board::types::BoardLayer::BlBSilkS as i32
+            );
+            let text = reference.text.as_ref().unwrap();
+            assert_eq!(builders::nm_to_mm(text.position.unwrap().y_nm), 102.0);
+            assert_eq!(
+                text.attributes
+                    .as_ref()
+                    .unwrap()
+                    .angle
+                    .as_ref()
+                    .unwrap()
+                    .value_degrees,
+                160.0
+            );
+            assert!(text.attributes.as_ref().unwrap().mirrored);
+            *current_in_mock.lock().unwrap() = updated;
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::UpdateItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    updated_items: command
+                        .items
+                        .into_iter()
+                        .map(|item| kiapi::common::commands::ItemUpdateResult {
+                            status: Some(kiapi::common::commands::ItemStatus {
+                                code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                error_message: String::new(),
+                            }),
+                            item: Some(item),
+                        })
+                        .collect(),
+                },
+                "kiapi.common.commands.UpdateItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("EndCommit") {
+            let command =
+                kiapi::common::commands::EndCommit::decode(message.value.as_slice()).unwrap();
+            assert_eq!(
+                command.action,
+                kiapi::common::commands::CommitAction::CmaCommit as i32
+            );
+            counts_in_mock.lock().unwrap().push += 1;
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::EndCommitResponse {},
+                "kiapi.common.commands.EndCommitResponse",
+            )));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let flipped = KiCadIpcClient::new(&mock.url)
+        .flip_footprint_in(board_document("target.kicad_pcb"), "R1")
+        .unwrap();
+
+    assert_eq!(flipped.reference, "R1");
+    assert_eq!(flipped.layer, "B.Cu");
+    assert_eq!(flipped.rotation, -30.0);
+    assert_eq!((flipped.position.x, flipped.position.y), (100.0, 100.0));
+    let counts = counts.lock().unwrap();
+    assert_eq!(
+        (counts.gets, counts.begin, counts.update, counts.push),
+        (2, 1, 1, 1)
+    );
+}
+
+#[test]
+fn invalid_flip_target_fails_before_begin_commit() {
+    let mut footprint = mk_footprint_r1();
+    footprint.id = Some(kiapi::common::types::Kiid {
+        value: "footprint-r1".to_string(),
+    });
+    footprint.layer = kiapi::board::types::BoardLayer::BlIn1Cu as i32;
+    let begins = Arc::new(Mutex::new(0usize));
+    let begins_in_mock = begins.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetItems") {
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items: vec![builders::pack_any(
+                        &footprint,
+                        "kiapi.board.types.FootprintInstance",
+                    )],
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("BeginCommit") {
+            *begins_in_mock.lock().unwrap() += 1;
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let error = KiCadIpcClient::new(&mock.url)
+        .flip_footprint_in(board_document("target.kicad_pcb"), "R1")
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("neither F.Cu nor B.Cu"));
+    assert_eq!(*begins.lock().unwrap(), 0);
+}
+
+#[test]
 fn duplicate_placement_target_fails_before_any_ipc_request() {
     let requests = Arc::new(Mutex::new(0usize));
     let requests_in_mock = requests.clone();

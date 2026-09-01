@@ -1842,21 +1842,20 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "flip_component",
-            "Set a placed footprint to F.Cu or B.Cu with KiCAD-equivalent geometry mirroring. \
-             This operation requires a closed board: it safely flips supported footprints with \
-             revision checks and fails closed when KiCAD is reachable or geometry is unsupported.",
+            "Flip one placed footprint between F.Cu and B.Cu in one KiCad undo transaction. \
+             The exact open board and unique reference are validated before the commit, the \
+             complete footprint object is preserved, and the result is read back from KiCad.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":     { "type": "string" },
-                    "reference": { "type": "string" },
-                    "layer":     { "type": "string", "enum": ["F.Cu", "B.Cu"] }
+                    "reference": { "type": "string" }
                 },
-                "required": ["board", "reference", "layer"]
+                "required": ["board", "reference"]
             }),
             |args, ctx| async move { handle_flip_component(args, ctx).await }
         )
-        .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "delete_component",
             "Remove a footprint from the board via KiCAD IPC.",
@@ -2516,61 +2515,83 @@ async fn handle_flip_component(
         Ok(value) => value.to_string(),
         Err(error) => return Ok(error),
     };
-    let layer = match require_str(args, "layer") {
-        Ok(value) if matches!(value, "F.Cu" | "B.Cu") => value.to_string(),
-        Ok(value) => {
+
+    // Keep the former closed-board target-layer path available to direct
+    // in-crate callers while the public contract returns to the fork's live
+    // toggle schema. It is intentionally absent from the advertised schema.
+    if let Some(layer) = args.get("layer") {
+        let Some(layer) = layer.as_str() else {
             return Ok(CallToolResult::error_kind(
                 crate::mcp::error::ToolErrorKind::InvalidArgument {
                     field: "layer".to_string(),
-                    reason: format!("must be F.Cu or B.Cu, got '{value}'"),
+                    reason: "must be a string".to_string(),
                 },
-                format!("Footprints can only be flipped between F.Cu and B.Cu, got '{value}'"),
-            ))
+                "Argument 'layer' must be a string",
+            ));
+        };
+        if !matches!(layer, "F.Cu" | "B.Cu") {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "layer".to_string(),
+                    reason: format!("must be F.Cu or B.Cu, got '{layer}'"),
+                },
+                format!("Footprints can only be flipped between F.Cu and B.Cu, got '{layer}'"),
+            ));
         }
-        Err(error) => return Ok(error),
-    };
+        if let Some(refusal) =
+            crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "footprint flip")
+                .await?
+        {
+            return Ok(refusal);
+        }
+        return match set_closed_board_footprint_side(&board, &reference, layer) {
+            Ok(changed) => Ok(CallToolResult::json(&json!({
+                "flipped": reference,
+                "layer": layer,
+                "changed": changed,
+                "source": "file",
+                "warning": "The compatibility target-layer path edited the closed board file."
+            }))),
+            Err(error) => Ok(error.into_result()),
+        };
+    }
 
-    // KiCAD 10.0.5 and the protocol Konnect vendors carry no FlipItems command,
-    // so this tool has no IPC implementation at all — which makes
-    // `refuse_if_board_open_in_kicad` the right gate rather than
-    // `attempt_ipc_write`.
-    //
-    // The distinction is not cosmetic. Running `ensure_board_is_active` and
-    // then bailing unconditionally produced an `anyhow` with no
-    // `TransportUnreachable` marker, which `IpcFailure::from_error` classifies
-    // as `Rejected` — so *every* reachable KiCAD refused the flip, including
-    // one holding an unrelated project, where this board file is demonstrably
-    // free. It also reported Konnect's own refusal as "KiCAD rejected the
-    // footprint flip over IPC", which is the class fixed in v0.5.0.
-    //
-    // The helper refuses only when KiCAD holds *this* board, because that is
-    // the only case where the edit would be discarded by its next save.
-    //
-    // Untested branch, honestly: the only IPC mock in this crate rejects every
-    // request, which exercises the *proceed* side. Confirming the refusal
-    // needs a mock that answers `GetOpenDocuments` naming this board, which
-    // does not exist here — so the refusal is equally untested for
-    // `add_zone` and the copper-pour path, this helper's two other callers.
-    // Tracked as #241 rather than pretended away.
-    if let Some(refusal) =
-        crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "footprint flip")
-            .await?
+    let board_for_ipc = board.clone();
+    let reference_for_ipc = reference.clone();
+    let flipped = match with_board_ipc_classified(ctx, &board, move |client| {
+        let document = client.find_open_board(&board_for_ipc)?;
+        client.flip_footprint_in(document, &reference_for_ipc)
+    })
+    .await?
     {
-        return Ok(refusal);
-    }
-
-    match set_closed_board_footprint_side(&board, &reference, &layer) {
-        Ok(changed) => Ok(CallToolResult::json(&json!({
-            "flipped": reference,
-            "layer": layer,
-            "changed": changed,
-            "source": "file",
-            "warning": "KiCAD has no footprint-flip command over IPC, so the board file was \
-                        flipped directly with a revision check. Reopen the board in KiCAD to \
-                        see it."
-        }))),
-        Err(error) => Ok(error.into_result()),
-    }
+        Ok(flipped) => flipped,
+        Err(konnect_ipc::IpcFailure::Unreachable(message)) => {
+            return Ok(CallToolResult::error(format!(
+                "KiCAD must be running with the board loaded (IPC error: {message})"
+            )))
+        }
+        Err(konnect_ipc::IpcFailure::Rejected(message)) => {
+            return Ok(CallToolResult::error(message))
+        }
+    };
+    let from_layer = match flipped.layer.as_str() {
+        "F.Cu" => "B.Cu",
+        "B.Cu" => "F.Cu",
+        other => {
+            return Ok(CallToolResult::error(format!(
+                "KiCad read footprint '{reference}' back on unexpected layer '{other}'"
+            )))
+        }
+    };
+    Ok(CallToolResult::json(&json!({
+        "flipped": reference,
+        "from_layer": from_layer,
+        "layer": flipped.layer,
+        "x": flipped.position.x,
+        "y": flipped.position.y,
+        "rotation": flipped.rotation,
+        "method": "kicad_ipc_commit"
+    })))
 }
 
 async fn handle_delete_component(
@@ -4931,6 +4952,27 @@ mod tests {
     (rotate (xyz 0 0 90))
   )
 )"#;
+
+    #[test]
+    fn live_flip_schema_matches_the_fork_contract() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "flip_component")
+            .expect("flip_component tool");
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("object properties");
+        assert_eq!(
+            properties.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["board", "reference"]
+        );
+        assert_eq!(tool.input_schema["required"], json!(["board", "reference"]));
+        assert_eq!(tool.board_access, crate::tools::BoardAccess::LiveOnly);
+        assert!(tool.description.contains("one KiCad undo transaction"));
+        assert!(tool.description.contains("read back"));
+    }
 
     fn flip_board(footprints: &[&str], eol: &str) -> String {
         let body = footprints
