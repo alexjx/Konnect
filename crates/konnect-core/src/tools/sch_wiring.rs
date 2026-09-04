@@ -26,6 +26,44 @@ use konnect_sexp::{
 };
 use serde_json::json;
 
+/// KiCad's default schematic grid (50 mil). Symbol-aware connection tools keep
+/// at least this much straight wire between a pin and the first bend.
+pub(crate) const SCHEMATIC_GRID_MM: f64 = 1.27;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ConnectionAnchor {
+    pub x: f64,
+    pub y: f64,
+    /// Screen-space direction leading away from the symbol body.
+    pub outward: Option<f64>,
+}
+
+impl ConnectionAnchor {
+    pub(crate) fn point(x: f64, y: f64) -> Self {
+        Self {
+            x,
+            y,
+            outward: None,
+        }
+    }
+
+    fn pin(x: f64, y: f64, outward: f64) -> Self {
+        Self {
+            x,
+            y,
+            outward: Some(outward),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ConnectionSegment {
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
+}
+
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
@@ -328,7 +366,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "connect_to_net",
             "Connect a pin to a named net by adding a short wire stub and a net label. \
-             Name the pin with reference + pin_number, or give its coordinates directly.",
+             The stub is at least one 1.27 mm schematic grid step. Name the pin with \
+             reference + pin_number, or give its coordinates directly.",
             json!({
                 "type": "object",
                 "properties": {
@@ -343,11 +382,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Direction to route the wire stub. 'auto' (default) points it \
                                         away from the symbol body so the label text does not run back \
-                                        across the pin names; it falls back to 'right' on a bare point.",
+                                        across the pin names; it falls back to 'right' on a bare point. \
+                                        A direction that conflicts with a detected symbol pin is rejected.",
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     },
-                    "stub_length": { "type": "number", "default": 2.54,
+                    "stub_length": { "type": "number", "minimum": 1.27, "default": 2.54,
                         "description": "Length of the wire stub in mm" },
                     "label_type": {
                         "type": "string",
@@ -362,7 +402,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "connect_pins",
             "Connect two component pins by reference and pin number. \
-             Looks up pin coordinates automatically and routes a wire between them.",
+             Looks up pin coordinates automatically and keeps at least one 1.27 mm \
+             straight outward stub at both symbols before routing between them.",
             json!({
                 "type": "object",
                 "properties": {
@@ -379,7 +420,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "add_schematic_connection",
             "Connect two schematic points directly with a wire (auto-routes H+V segments). \
-             Use connect_pins if you have component references instead of coordinates.",
+             An endpoint on a symbol pin keeps at least one 1.27 mm outward stub before \
+             any bend. Use connect_pins if you have component references instead of coordinates.",
             json!({
                 "type": "object",
                 "properties": {
@@ -542,16 +584,475 @@ pub(crate) fn insert_wire_with_junctions(
     c
 }
 
-/// Route a wire between two points: a single straight wire when axis-aligned,
-/// otherwise an H-then-V L-bend, each leg going through T-junction detection.
-pub(crate) fn route_between(content: String, x1: f64, y1: f64, x2: f64, y2: f64) -> String {
-    if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
-        insert_wire_with_junctions(content, x1, y1, x2, y2)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SegmentAxis {
+    Horizontal,
+    Vertical,
+}
+
+type SchematicPoint = (f64, f64);
+
+struct PathCandidate {
+    edge_count: usize,
+    distance: f64,
+    points: Vec<SchematicPoint>,
+}
+
+struct InteriorSearch<'a> {
+    end: SchematicPoint,
+    nodes: &'a [SchematicPoint],
+    first_axis: Option<SegmentAxis>,
+    last_axis: Option<SegmentAxis>,
+    best: Option<PathCandidate>,
+}
+
+impl InteriorSearch<'_> {
+    fn visit(
+        &mut self,
+        current: SchematicPoint,
+        path: &mut Vec<SchematicPoint>,
+        previous_axis: Option<SegmentAxis>,
+        distance: f64,
+    ) {
+        let edge_count = path.len() - 1;
+        if points_same(current, self.end) {
+            if self
+                .last_axis
+                .is_none_or(|required| previous_axis == Some(required))
+            {
+                let should_replace = self
+                    .best
+                    .as_ref()
+                    .is_none_or(|old| (edge_count, distance) < (old.edge_count, old.distance));
+                if should_replace {
+                    self.best = Some(PathCandidate {
+                        edge_count,
+                        distance,
+                        points: path.clone(),
+                    });
+                }
+            }
+            return;
+        }
+        if edge_count == 4
+            || self
+                .best
+                .as_ref()
+                .is_some_and(|old| edge_count >= old.edge_count)
+        {
+            return;
+        }
+
+        for index in 0..self.nodes.len() {
+            let next = self.nodes[index];
+            let Some(axis) = segment_axis(current, next) else {
+                continue;
+            };
+            if edge_count == 0 && self.first_axis.is_some_and(|required| axis != required) {
+                continue;
+            }
+            if previous_axis == Some(axis) || path.iter().any(|point| points_same(*point, next)) {
+                continue;
+            }
+            path.push(next);
+            let edge_length = (next.0 - current.0).abs() + (next.1 - current.1).abs();
+            self.visit(next, path, Some(axis), distance + edge_length);
+            path.pop();
+        }
+    }
+}
+
+fn outward_vector(angle: f64) -> anyhow::Result<(f64, f64, SegmentAxis)> {
+    let angle = angle.rem_euclid(360.0);
+    for (candidate, dx, dy, axis) in [
+        (0.0, 1.0, 0.0, SegmentAxis::Horizontal),
+        (90.0, 0.0, -1.0, SegmentAxis::Vertical),
+        (180.0, -1.0, 0.0, SegmentAxis::Horizontal),
+        (270.0, 0.0, 1.0, SegmentAxis::Vertical),
+    ] {
+        if (angle - candidate).abs() < 0.01 {
+            return Ok((dx, dy, axis));
+        }
+    }
+    anyhow::bail!("symbol pin outward angle {angle} is not orthogonal")
+}
+
+fn segment_axis(a: (f64, f64), b: (f64, f64)) -> Option<SegmentAxis> {
+    if (a.1 - b.1).abs() < 0.01 && (a.0 - b.0).abs() >= 0.01 {
+        Some(SegmentAxis::Horizontal)
+    } else if (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() >= 0.01 {
+        Some(SegmentAxis::Vertical)
     } else {
-        let mid_x = x2;
-        let mid_y = y1;
-        let content = insert_wire_with_junctions(content, x1, y1, mid_x, mid_y);
-        insert_wire_with_junctions(content, mid_x, mid_y, x2, y2)
+        None
+    }
+}
+
+fn perpendicular(axis: SegmentAxis) -> SegmentAxis {
+    match axis {
+        SegmentAxis::Horizontal => SegmentAxis::Vertical,
+        SegmentAxis::Vertical => SegmentAxis::Horizontal,
+    }
+}
+
+fn points_same(a: (f64, f64), b: (f64, f64)) -> bool {
+    (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01
+}
+
+pub(crate) fn clean_coordinate(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+fn lies_on_outward_ray(origin: (f64, f64), target: (f64, f64), dx: f64, dy: f64) -> bool {
+    let offset_x = target.0 - origin.0;
+    let offset_y = target.1 - origin.1;
+    (offset_x * dy - offset_y * dx).abs() < 0.01 && offset_x * dx + offset_y * dy >= -0.01
+}
+
+fn push_segment(segments: &mut Vec<ConnectionSegment>, a: (f64, f64), b: (f64, f64)) {
+    if !points_same(a, b) {
+        segments.push(ConnectionSegment {
+            x1: a.0,
+            y1: a.1,
+            x2: b.0,
+            y2: b.1,
+        });
+    }
+}
+
+fn candidate_coordinates(a: f64, b: f64) -> Vec<f64> {
+    let mut values = vec![
+        a,
+        b,
+        clean_coordinate(a - SCHEMATIC_GRID_MM),
+        clean_coordinate(a + SCHEMATIC_GRID_MM),
+        clean_coordinate(b - SCHEMATIC_GRID_MM),
+        clean_coordinate(b + SCHEMATIC_GRID_MM),
+    ];
+    values.sort_by(f64::total_cmp);
+    values.dedup_by(|left, right| (*left - *right).abs() < 0.01);
+    values
+}
+
+/// Find the shortest orthogonal interior path satisfying optional first/last
+/// axis constraints. Symbol stubs themselves are planned separately; forcing
+/// the interior path to start/end perpendicular prevents it from immediately
+/// doubling back over either stub.
+fn plan_interior_path(
+    start: (f64, f64),
+    end: (f64, f64),
+    first_axis: Option<SegmentAxis>,
+    last_axis: Option<SegmentAxis>,
+) -> anyhow::Result<Vec<(f64, f64)>> {
+    if points_same(start, end) {
+        return Ok(vec![start]);
+    }
+
+    if first_axis.is_none() && last_axis.is_none() {
+        if segment_axis(start, end).is_some() {
+            return Ok(vec![start, end]);
+        }
+        return Ok(vec![start, (end.0, start.1), end]);
+    }
+
+    let xs = candidate_coordinates(start.0, end.0);
+    let ys = candidate_coordinates(start.1, end.1);
+    let nodes = xs
+        .iter()
+        .flat_map(|x| ys.iter().map(move |y| (*x, *y)))
+        .collect::<Vec<_>>();
+    let mut path = vec![start];
+    let mut search = InteriorSearch {
+        end,
+        nodes: &nodes,
+        first_axis,
+        last_axis,
+        best: None,
+    };
+    search.visit(start, &mut path, None, 0.0);
+    search
+        .best
+        .map(|candidate| candidate.points)
+        .ok_or_else(|| anyhow::anyhow!("no orthogonal route can preserve both symbol pin stubs"))
+}
+
+/// Plan a symbol-aware orthogonal connection. Every known pin endpoint gets an
+/// independent one-grid outward segment before any turn. Keeping those
+/// segments explicit also prevents adjacent components from collapsing into a
+/// single direct wire with no visible pin stubs.
+pub(crate) fn plan_connection_segments(
+    start: ConnectionAnchor,
+    end: ConnectionAnchor,
+) -> anyhow::Result<Vec<ConnectionSegment>> {
+    if points_same((start.x, start.y), (end.x, end.y))
+        && (start.outward.is_some() || end.outward.is_some())
+    {
+        anyhow::bail!(
+            "symbol connection endpoints coincide; move the symbols apart before adding wire stubs"
+        );
+    }
+    let start_direction = start.outward.map(outward_vector).transpose()?;
+    let end_direction = end.outward.map(outward_vector).transpose()?;
+    let start_stub = start_direction.map_or((start.x, start.y), |(dx, dy, _)| {
+        (
+            clean_coordinate(start.x + dx * SCHEMATIC_GRID_MM),
+            clean_coordinate(start.y + dy * SCHEMATIC_GRID_MM),
+        )
+    });
+    let end_stub = end_direction.map_or((end.x, end.y), |(dx, dy, _)| {
+        (
+            clean_coordinate(end.x + dx * SCHEMATIC_GRID_MM),
+            clean_coordinate(end.y + dy * SCHEMATIC_GRID_MM),
+        )
+    });
+
+    // Two facing pins need room for both mandatory stubs. Refuse instead of
+    // producing overlapping or reversed wire segments through a symbol body.
+    if let (Some((sdx, sdy, saxis)), Some((edx, edy, eaxis))) = (start_direction, end_direction) {
+        let dx = end.x - start.x;
+        let dy = end.y - start.y;
+        let separation = dx * sdx + dy * sdy;
+        let perpendicular_separation = (dx * sdy - dy * sdx).abs();
+        let facing = saxis == eaxis && sdx * edx + sdy * edy < -0.5;
+        if facing
+            && perpendicular_separation < 0.01
+            && separation > 0.0
+            && separation < 2.0 * SCHEMATIC_GRID_MM + 0.01
+        {
+            anyhow::bail!(
+                "facing symbol pins are only {separation:.2} mm apart; more than {:.2} mm is required to keep two {:.2} mm stubs from becoming a direct connection",
+                2.0 * SCHEMATIC_GRID_MM,
+                SCHEMATIC_GRID_MM
+            );
+        }
+    }
+
+    // A pin-to-pin connection always turns away from each explicit stub, even
+    // when the symbols are aligned. That keeps adjacent components from
+    // becoming one direct segment. With only one symbol endpoint, however, a
+    // target already lying straight ahead may continue in the same direction:
+    // there is no turn to postpone, and the first one-grid segment remains
+    // explicit in the output.
+    let both_are_pins = start_direction.is_some() && end_direction.is_some();
+    let start_continues_straight = start_direction.is_some_and(|(dx, dy, _)| {
+        end_direction.is_none() && lies_on_outward_ray(start_stub, end_stub, dx, dy)
+    });
+    let end_continues_straight = end_direction.is_some_and(|(dx, dy, _)| {
+        start_direction.is_none() && lies_on_outward_ray(end_stub, start_stub, dx, dy)
+    });
+    let first_axis = start_direction.map(|(_, _, axis)| {
+        if !both_are_pins && start_continues_straight {
+            axis
+        } else {
+            perpendicular(axis)
+        }
+    });
+    let last_axis = end_direction.map(|(_, _, axis)| {
+        if !both_are_pins && end_continues_straight {
+            axis
+        } else {
+            perpendicular(axis)
+        }
+    });
+    let interior = plan_interior_path(start_stub, end_stub, first_axis, last_axis)?;
+    let mut segments = Vec::new();
+    push_segment(&mut segments, (start.x, start.y), start_stub);
+    for pair in interior.windows(2) {
+        push_segment(&mut segments, pair[0], pair[1]);
+    }
+    push_segment(&mut segments, end_stub, (end.x, end.y));
+    Ok(segments)
+}
+
+pub(crate) fn route_between_anchors(
+    mut content: String,
+    start: ConnectionAnchor,
+    end: ConnectionAnchor,
+) -> anyhow::Result<String> {
+    for segment in plan_connection_segments(start, end)? {
+        content =
+            insert_wire_with_junctions(content, segment.x1, segment.y1, segment.x2, segment.y2);
+    }
+    Ok(content)
+}
+
+/// Route coordinate endpoints, applying the pin-stub rule whenever an endpoint
+/// unambiguously coincides with a symbol pin.
+pub(crate) fn route_between(
+    content: String,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> anyhow::Result<String> {
+    let tree = parse_sexp(&content)?;
+    let anchor = |x, y| -> anyhow::Result<ConnectionAnchor> {
+        let outward = crate::tools::pin_outward_at(&tree, x, y);
+        if outward.is_none()
+            && crate::tools::all_pin_endpoints(&tree)
+                .iter()
+                .any(|&(px, py)| points_same((x, y), (px, py)))
+        {
+            anyhow::bail!(
+                "multiple symbol pins at ({x:.2}, {y:.2}) disagree about the outward direction"
+            );
+        }
+        Ok(ConnectionAnchor { x, y, outward })
+    };
+    route_between_anchors(content, anchor(x1, y1)?, anchor(x2, y2)?)
+}
+
+#[cfg(test)]
+mod connection_planner_tests {
+    use super::*;
+
+    fn pin(x: f64, y: f64, outward: f64) -> ConnectionAnchor {
+        ConnectionAnchor::pin(x, y, outward)
+    }
+
+    fn assert_valid_path(
+        segments: &[ConnectionSegment],
+        start: ConnectionAnchor,
+        end: ConnectionAnchor,
+    ) {
+        assert!(!segments.is_empty());
+        assert!(points_same(
+            (segments[0].x1, segments[0].y1),
+            (start.x, start.y)
+        ));
+        assert!(points_same(
+            (segments.last().unwrap().x2, segments.last().unwrap().y2),
+            (end.x, end.y)
+        ));
+        for (index, segment) in segments.iter().enumerate() {
+            assert!(
+                segment_axis((segment.x1, segment.y1), (segment.x2, segment.y2)).is_some(),
+                "segment {index} is zero-length or diagonal: {segment:?}"
+            );
+            if let Some(next) = segments.get(index + 1) {
+                assert!(points_same((segment.x2, segment.y2), (next.x1, next.y1)));
+            }
+        }
+    }
+
+    fn segment_length(segment: &ConnectionSegment) -> f64 {
+        (segment.x2 - segment.x1).abs() + (segment.y2 - segment.y1).abs()
+    }
+
+    #[test]
+    fn facing_offset_pins_keep_independent_outward_stubs() {
+        let start = pin(0.0, 0.0, 0.0);
+        let end = pin(10.16, 5.08, 180.0);
+        let segments = plan_connection_segments(start, end).unwrap();
+
+        assert_valid_path(&segments, start, end);
+        assert_eq!(
+            segments[0],
+            ConnectionSegment {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 1.27,
+                y2: 0.0
+            }
+        );
+        assert_eq!(
+            *segments.last().unwrap(),
+            ConnectionSegment {
+                x1: 8.89,
+                y1: 5.08,
+                x2: 10.16,
+                y2: 5.08
+            }
+        );
+        assert!(segment_length(&segments[0]) + 0.01 >= SCHEMATIC_GRID_MM);
+        assert!(segment_length(segments.last().unwrap()) + 0.01 >= SCHEMATIC_GRID_MM);
+    }
+
+    #[test]
+    fn adjacent_axis_aligned_symbols_do_not_collapse_to_one_direct_wire() {
+        let start = pin(0.0, 0.0, 0.0);
+        let end = pin(10.16, 0.0, 180.0);
+        let segments = plan_connection_segments(start, end).unwrap();
+
+        assert_valid_path(&segments, start, end);
+        assert!(segments.len() >= 5, "two stubs plus a dogleg: {segments:?}");
+        assert_eq!(segments[0].x2, SCHEMATIC_GRID_MM);
+        assert_eq!(segments.last().unwrap().x1, end.x - SCHEMATIC_GRID_MM);
+    }
+
+    #[test]
+    fn perpendicular_pin_directions_are_honoured_at_both_ends() {
+        let start = pin(0.0, 0.0, 0.0);
+        let end = pin(10.16, 5.08, 90.0);
+        let segments = plan_connection_segments(start, end).unwrap();
+
+        assert_valid_path(&segments, start, end);
+        assert_eq!((segments[0].x2, segments[0].y2), (1.27, 0.0));
+        let last = segments.last().unwrap();
+        assert_eq!((last.x1, last.y1), (10.16, 3.81));
+    }
+
+    #[test]
+    fn one_symbol_endpoint_constrains_only_that_end() {
+        let start = pin(0.0, 0.0, 90.0);
+        let end = ConnectionAnchor::point(5.08, 5.08);
+        let segments = plan_connection_segments(start, end).unwrap();
+
+        assert_valid_path(&segments, start, end);
+        assert_eq!((segments[0].x2, segments[0].y2), (0.0, -1.27));
+    }
+
+    #[test]
+    fn one_symbol_endpoint_can_continue_straight_after_its_stub() {
+        let start = pin(0.0, 0.0, 0.0);
+        let end = ConnectionAnchor::point(5.08, 0.0);
+        let segments = plan_connection_segments(start, end).unwrap();
+
+        assert_valid_path(&segments, start, end);
+        assert_eq!(segments.len(), 2);
+        assert_eq!((segments[0].x2, segments[0].y2), (1.27, 0.0));
+        assert_eq!((segments[1].x2, segments[1].y2), (5.08, 0.0));
+    }
+
+    #[test]
+    fn free_coordinates_keep_the_legacy_horizontal_then_vertical_route() {
+        let start = ConnectionAnchor::point(0.0, 0.0);
+        let end = ConnectionAnchor::point(5.08, 3.81);
+        let segments = plan_connection_segments(start, end).unwrap();
+
+        assert_eq!(
+            segments,
+            vec![
+                ConnectionSegment {
+                    x1: 0.0,
+                    y1: 0.0,
+                    x2: 5.08,
+                    y2: 0.0
+                },
+                ConnectionSegment {
+                    x1: 5.08,
+                    y1: 0.0,
+                    x2: 5.08,
+                    y2: 3.81
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn facing_pins_too_close_for_two_stubs_are_rejected() {
+        let error =
+            plan_connection_segments(pin(0.0, 0.0, 0.0), pin(1.27, 0.0, 180.0)).unwrap_err();
+        assert!(error.to_string().contains("more than 2.54 mm"), "{error}");
+        let exact =
+            plan_connection_segments(pin(0.0, 0.0, 0.0), pin(2.54, 0.0, 180.0)).unwrap_err();
+        assert!(exact.to_string().contains("direct connection"), "{exact}");
+    }
+
+    #[test]
+    fn coincident_symbol_pins_are_rejected_instead_of_getting_a_wire_loop() {
+        let error =
+            plan_connection_segments(pin(10.0, 20.0, 0.0), pin(10.0, 20.0, 180.0)).unwrap_err();
+        assert!(error.to_string().contains("coincide"), "{error}");
     }
 }
 
@@ -1978,6 +2479,12 @@ async fn handle_connect_to_net(
     };
     let direction = opt_str(args, "direction").unwrap_or("auto");
     let stub_length = opt_f64(args, "stub_length").unwrap_or(2.54);
+    if !stub_length.is_finite() || stub_length + 0.01 < SCHEMATIC_GRID_MM {
+        return Ok(crate::tools::invalid_arg(
+            "stub_length",
+            "must be at least 1.27 mm (one schematic grid step)",
+        ));
+    }
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
 
     let (_, tree) = read_schematic(&sch_path)?;
@@ -2028,11 +2535,33 @@ async fn handle_connect_to_net(
 
     // Where the stub goes, and how the label at its end must read: text
     // running back over the symbol covers its pin names (pin_label_rotation).
-    let dir = match outward {
-        Some(d) => crate::tools::stub_direction(direction, Some(d)),
-        None => crate::tools::resolve_stub_direction(direction, (pin_x, pin_y), &tree),
-    };
-    let (label_x, label_y) = (pin_x + dir.dx * stub_length, pin_y + dir.dy * stub_length);
+    let resolved_outward = outward.or_else(|| crate::tools::pin_outward_at(&tree, pin_x, pin_y));
+    if resolved_outward.is_none()
+        && crate::tools::all_pin_endpoints(&tree)
+            .iter()
+            .any(|&(x, y)| points_same((pin_x, pin_y), (x, y)))
+    {
+        return Ok(crate::tools::invalid_arg(
+            "pin_x/pin_y",
+            "stacked symbol pins disagree about the outward direction; name the pin by reference and pin_number",
+        ));
+    }
+    let dir = crate::tools::stub_direction(direction, resolved_outward);
+    if direction != "auto" {
+        if let Some(outward) = resolved_outward {
+            let required = crate::tools::stub_direction("auto", Some(outward));
+            if dir.dx != required.dx || dir.dy != required.dy {
+                return Ok(crate::tools::invalid_arg(
+                    "direction",
+                    "must follow the detected symbol pin's outward direction",
+                ));
+            }
+        }
+    }
+    let (label_x, label_y) = (
+        clean_coordinate(pin_x + dir.dx * stub_length),
+        clean_coordinate(pin_y + dir.dy * stub_length),
+    );
     let label_rot = dir.label_rotation;
 
     let mut sch = cse::Schematic::load(&sch_path)?;
@@ -2116,33 +2645,35 @@ async fn handle_connect_pins(
         .unwrap_or_default();
 
     // Resolve pin1 board-space endpoint
-    let (x1, y1) = resolve_pin_endpoint(&instances, &lib_syms, &ref1, &pin1)?;
+    let start = resolve_pin_anchor(&instances, &lib_syms, &ref1, &pin1)?;
     // Resolve pin2 board-space endpoint
-    let (x2, y2) = resolve_pin_endpoint(&instances, &lib_syms, &ref2, &pin2)?;
+    let end = resolve_pin_anchor(&instances, &lib_syms, &ref2, &pin2)?;
 
     // Route wire(s) between the two pin endpoints
-    let new_content = route_between(content, x1, y1, x2, y2);
+    let new_content = match route_between_anchors(content, start, end) {
+        Ok(content) => content,
+        Err(error) => return Ok(crate::tools::invalid_arg("ref1/ref2", &error.to_string())),
+    };
 
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "connected": {
-            "from": { "ref": ref1, "pin": pin1, "x": x1, "y": y1 },
-            "to":   { "ref": ref2, "pin": pin2, "x": x2, "y": y2 }
+            "from": { "ref": ref1, "pin": pin1, "x": start.x, "y": start.y },
+            "to":   { "ref": ref2, "pin": pin2, "x": end.x, "y": end.y }
         }
     })))
 }
 
-/// Resolve a pin's schematic-space endpoint by reference and pin number.
-/// Uses the same pattern as sch_analysis::handle_get_pin_connections.
-pub(crate) fn resolve_pin_endpoint(
+pub(crate) fn resolve_pin_anchor(
     instances: &[konnect_sexp::schematic::SymbolInstance],
     lib_syms: &[&konnect_sexp::parser::SexpNode],
     reference: &str,
     pin_number: &str,
-) -> anyhow::Result<(f64, f64)> {
+) -> anyhow::Result<ConnectionAnchor> {
     let (pin, t) = resolve_placed_pin(instances, lib_syms, reference, pin_number)?;
-    Ok(pin_endpoint(&pin, t))
+    let (x, y) = pin_endpoint(&pin, t);
+    Ok(ConnectionAnchor::pin(x, y, pin_outward_direction(&pin, t)))
 }
 
 /// The named pin and the transform placing it, for callers that need more than
@@ -2230,7 +2761,15 @@ async fn handle_add_schematic_connection(
 
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
-    let content = route_between(content, x1, y1, x2, y2);
+    // Parse failures describe the file, not the coordinates. Once parsing has
+    // succeeded, every remaining route refusal is caller-actionable geometry.
+    parse_sexp(&content)?;
+    let content = match route_between(content, x1, y1, x2, y2) {
+        Ok(content) => content,
+        Err(error) => {
+            return Ok(crate::tools::invalid_arg("x1/y1/x2/y2", &error.to_string()));
+        }
+    };
 
     write_atomic_if_unchanged(&sch_path, &expected, &content)?;
     Ok(CallToolResult::json(&json!({
@@ -2317,6 +2856,15 @@ mod unit_aware_wiring_tests {
             "unit-owned pins must connect: {:?}",
             ok.content
         );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("(xy 92.38 77.46) (xy 91.11 77.46)"),
+            "the first pin needs its westward one-grid stub: {after}"
+        );
+        assert!(
+            after.contains("(xy 141.11 77.46) (xy 142.38 77.46)"),
+            "the second pin needs an independent westward stub: {after}"
+        );
 
         // Pin 5 belongs to unit 2 — asking for it on the unit-1 instance must
         // fail instead of wiring to a superimposed phantom position (#35).
@@ -2376,6 +2924,28 @@ mod unit_aware_wiring_tests {
                 .iter()
                 .any(|&(x, y)| (x - 101.6).abs() < 0.01 && (y - 76.2).abs() < 0.01),
             "junction expected at the mid-wire pin, got {juncs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinate_connection_recognizes_a_symbol_pin_and_keeps_its_stub() {
+        let (_d, path) = single_pin_schematic();
+        let result = handle_add_schematic_connection(
+            &json!({
+                "schematic": path.display().to_string(),
+                "x1": 101.6, "y1": 76.2,
+                "x2": 110.49, "y2": 83.82
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("(xy 101.6 76.2) (xy 100.33 76.2)"),
+            "{after}"
         );
     }
 
@@ -2766,17 +3336,42 @@ mod unit_aware_wiring_tests {
         );
     }
 
-    /// An explicit direction still wins over the derived one.
+    /// A caller cannot bypass the symbol-exit rule with an explicit direction.
     #[tokio::test]
-    async fn an_explicit_direction_overrides_the_derived_one() {
+    async fn a_direction_conflicting_with_the_pin_is_rejected_without_writing() {
         let (_d, path) = dual_opamp_schematic();
-        let after = connect_to_net(
-            &path,
-            json!({ "reference": "U1", "pin_number": "1", "net": "IN",
-                    "direction": "right" }),
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_connect_to_net(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "U1", "pin_number": "1", "net": "IN",
+                "direction": "right"
+            }),
+            &test_ctx(),
         )
         .await;
-        assert!(after.contains("(at 94.92 77.46 0)"), "{after}");
+        let result = result.unwrap();
+        assert!(result.is_error, "conflicting direction must be refused");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_stub_shorter_than_one_grid_is_rejected_without_writing() {
+        let (_d, path) = dual_opamp_schematic();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_connect_to_net(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "U1", "pin_number": "1", "net": "IN",
+                "stub_length": 0.5
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "short stub must be refused");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     /// A vertical stub keeps its text horizontal: of 2562 wire-anchored labels
@@ -2786,11 +3381,11 @@ mod unit_aware_wiring_tests {
         let (_d, path) = dual_opamp_schematic();
         let after = connect_to_net(
             &path,
-            json!({ "reference": "U1", "pin_number": "1", "net": "IN",
+            json!({ "pin_x": 50.0, "pin_y": 50.0, "net": "IN",
                     "direction": "down" }),
         )
         .await;
-        assert!(after.contains("(at 92.38 80 0)"), "{after}");
+        assert!(after.contains("(at 50 52.54 0)"), "{after}");
     }
 
     /// Coordinates still work, and a bare point falls back to the old default.
@@ -2816,9 +3411,8 @@ mod unit_aware_wiring_tests {
         (dir, path)
     }
 
-    /// Naming a pin carries its own direction. Deriving one from a coordinate
-    /// cannot: two pins share this point and disagree about which way is out,
-    /// so that path has to fall back to "right".
+    /// Naming a pin carries its own direction. A coordinate shared by pins
+    /// facing opposite ways is ambiguous and must fail closed.
     #[tokio::test]
     async fn a_named_pin_outranks_the_coordinate_lookup_where_pins_stack() {
         let (_d, path) = butted_pins_schematic();
@@ -2830,12 +3424,18 @@ mod unit_aware_wiring_tests {
         assert!(after.contains("(at 99.06 76.2 180)"), "{after}");
 
         let (_d, path) = butted_pins_schematic();
-        let after = connect_to_net(
-            &path,
-            json!({ "pin_x": 101.6, "pin_y": 76.2, "net": "SHARED" }),
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_connect_to_net(
+            &json!({
+                "schematic": path.display().to_string(),
+                "pin_x": 101.6, "pin_y": 76.2, "net": "SHARED"
+            }),
+            &test_ctx(),
         )
         .await;
-        assert!(after.contains("(at 104.14 76.2 0)"), "{after}");
+        let result = result.unwrap();
+        assert!(result.is_error, "ambiguous stacked pins must be refused");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     /// [`dual_opamp_schematic`] with both units placed under one reference.

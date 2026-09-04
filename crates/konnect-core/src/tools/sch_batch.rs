@@ -17,7 +17,7 @@ use konnect_sexp::{
     schematic::{
         extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
         find_lib_symbol, format_net_label, format_wire, pin_endpoint, pin_label_rotation,
-        read_schematic, symbol_bounds_for_instance, SymbolBounds,
+        pin_outward_direction, read_schematic, symbol_bounds_for_instance, SymbolBounds,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
@@ -30,7 +30,10 @@ use std::collections::HashSet;
 use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 // Re-use the single-item component placer and pin-to-pin router.
 use super::sch_components::place_one_component;
-use super::sch_wiring::{resolve_pin_endpoint, resolve_placed_pin, route_between};
+use super::sch_wiring::{
+    insert_wire_with_junctions, resolve_pin_anchor, resolve_placed_pin, route_between_anchors,
+    ConnectionAnchor, SCHEMATIC_GRID_MM,
+};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -38,8 +41,8 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "batch_connect_to_net",
-            "Connect multiple component pins to a named net by adding net labels at each pin \
-             endpoint. Single file read → all labels inserted → single file write.",
+            "Connect multiple component pins to a named net with outward wire stubs and labels. \
+             Every stub is 2.54 mm (two schematic grid steps). Single file read and write.",
             json!({
                 "type": "object",
                 "properties": {
@@ -94,7 +97,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_connect_pins",
             "Connect multiple component pin pairs by reference and pin number, in a single \
-             file read/write cycle.",
+             file read/write cycle. Every symbol endpoint keeps at least one 1.27 mm \
+             straight outward stub before any bend.",
             json!({
                 "type": "object",
                 "properties": {
@@ -210,7 +214,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "connect_passthrough",
             "Add a wire stub and matching net label at a point to route a signal through \
-             a region without drawing a full wire path. Direction controls stub orientation.",
+             a region without drawing a full wire path. Direction controls a bare-point stub; \
+             a detected symbol pin must follow its outward direction.",
             json!({
                 "type": "object",
                 "properties": {
@@ -223,7 +228,8 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Stub direction. 'auto' (default) points it away from \
                                         the symbol body when a pin sits at (x, y), so the label \
                                         text does not run back across the symbol; it falls back \
-                                        to 'right' on a bare point.",
+                                        to 'right' on a bare point. A direction conflicting with \
+                                        a detected symbol pin is rejected.",
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     }
@@ -383,16 +389,19 @@ async fn handle_batch_connect_to_net(
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
 
-    let mut inserts = String::new();
+    let mut labels_to_insert = String::new();
+    let mut stubs_to_insert = Vec::new();
     let mut added: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
-    // Endpoints already carrying this net's label, so a second never lands
-    // on the first. Seeded from the file, extended as we go.
-    let mut labelled: Vec<(f64, f64)> = extract_labels(&tree)
+    let labels: Vec<(f64, f64)> = extract_labels(&tree)
         .iter()
         .filter(|l| l.net == net_name)
         .map(|l| (l.x, l.y))
         .collect();
+    let existing_wires = extract_wires(&tree);
+    // Pin roots already connected by this call, including stacked pins.
+    let mut connected_roots: Vec<(f64, f64)> = Vec::new();
+    let mut added_count = 0usize;
 
     for pin_spec in &pins {
         let reference = match pin_spec["reference"].as_str() {
@@ -419,22 +428,50 @@ async fn handle_batch_connect_to_net(
         };
         let (px, py) = pin_endpoint(&pin, t);
         let rotation = pin_label_rotation(&pin, t);
+        let outward = pin_outward_direction(&pin, t);
+        let dir = crate::tools::stub_direction("auto", Some(outward));
+        let label_x =
+            crate::tools::sch_wiring::clean_coordinate(px + dir.dx * (2.0 * SCHEMATIC_GRID_MM));
+        let label_y =
+            crate::tools::sch_wiring::clean_coordinate(py + dir.dy * (2.0 * SCHEMATIC_GRID_MM));
 
-        // Symbols stack several pins on one endpoint; a label each renders as
-        // a smear. They stay connected by that endpoint.
-        let duplicate = labelled
+        let label_at_pin = labels
             .iter()
-            .any(|(lx, ly)| points_coincident(*lx, *ly, px, py, 0.01));
+            .any(|&(lx, ly)| points_coincident(lx, ly, px, py, 0.01));
+        let label_at_end = labels
+            .iter()
+            .any(|&(lx, ly)| points_coincident(lx, ly, label_x, label_y, 0.01));
+        let wire_already_present = existing_wires.iter().any(|wire| {
+            (points_coincident(wire.x1, wire.y1, px, py, 0.01)
+                && points_coincident(wire.x2, wire.y2, label_x, label_y, 0.01))
+                || (points_coincident(wire.x2, wire.y2, px, py, 0.01)
+                    && points_coincident(wire.x1, wire.y1, label_x, label_y, 0.01))
+        });
+        // Symbols may stack several pins at one endpoint. The first connection
+        // serves all of them; subsequent entries report deduplication.
+        let duplicate = label_at_pin
+            || (label_at_end && wire_already_present)
+            || connected_roots
+                .iter()
+                .any(|&(x, y)| points_coincident(x, y, px, py, 0.01));
         if !duplicate {
-            inserts.push_str(&format_net_label(&net_name, px, py, rotation));
-            labelled.push((px, py));
+            if !wire_already_present {
+                stubs_to_insert.push((px, py, label_x, label_y));
+            }
+            if !label_at_end {
+                labels_to_insert.push_str(&format_net_label(&net_name, label_x, label_y, rotation));
+            }
+            connected_roots.push((px, py));
+            added_count += 1;
         }
         let mut entry = json!({
             "reference": reference,
             "pin": pin_number,
             "x": px,
             "y": py,
-            "rotation": rotation
+            "rotation": rotation,
+            "wire": { "x1": px, "y1": py, "x2": label_x, "y2": label_y },
+            "label": { "x": label_x, "y": label_y }
         });
         if duplicate {
             entry["deduplicated"] = json!(true);
@@ -442,19 +479,25 @@ async fn handle_batch_connect_to_net(
         added.push(entry);
     }
 
-    if !inserts.is_empty() {
+    if !stubs_to_insert.is_empty() || !labels_to_insert.is_empty() {
         let expected = content.clone();
+        let mut new_content = content.clone();
+        for (x1, y1, x2, y2) in stubs_to_insert {
+            new_content = insert_wire_with_junctions(new_content, x1, y1, x2, y2);
+        }
         // Labels are element class 2; symbol instances MUST come last, so a
         // splice at the file's final `)` puts them after the instances and
         // KiCad refuses the whole file (#156, same bug as add_schematic_text).
-        let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
+        let new_content =
+            crate::tools::sch_wiring::insert_before_close(&new_content, &labels_to_insert);
         write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     }
 
     Ok(CallToolResult::json(&json!({
         "net": net_name,
         "added": added,
-        "added_count": added.len(),
+        "added_count": added_count,
+        "deduplicated_count": added.len() - added_count,
         "errors": errors
     })))
 }
@@ -553,7 +596,7 @@ async fn handle_batch_connect_pins(
     // Resolve every endpoint from the initial tree before any wire is
     // inserted -- symbols/lib_symbols never change as wires are added, so
     // this is safe to do up front instead of re-resolving per connection.
-    let mut resolved: Vec<(f64, f64, f64, f64)> = Vec::new();
+    let mut resolved: Vec<(ConnectionAnchor, ConnectionAnchor)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for conn in &connections {
         let (Some(ref1), Some(pin1), Some(ref2), Some(pin2)) = (
@@ -566,29 +609,36 @@ async fn handle_batch_connect_pins(
             continue;
         };
         match (
-            resolve_pin_endpoint(&instances, &lib_syms, ref1, pin1),
-            resolve_pin_endpoint(&instances, &lib_syms, ref2, pin2),
+            resolve_pin_anchor(&instances, &lib_syms, ref1, pin1),
+            resolve_pin_anchor(&instances, &lib_syms, ref2, pin2),
         ) {
-            (Ok((x1, y1)), Ok((x2, y2))) => resolved.push((x1, y1, x2, y2)),
+            (Ok(start), Ok(end)) => resolved.push((start, end)),
             (Err(e), _) | (_, Err(e)) => errors.push(e.to_string()),
         }
     }
 
     // ponytail: re-parses content per wire; incremental tree edits if batches get huge.
     let mut new_content = content;
-    for (x1, y1, x2, y2) in &resolved {
-        new_content = route_between(new_content, *x1, *y1, *x2, *y2);
+    let mut connected_count = 0usize;
+    for (start, end) in &resolved {
+        match route_between_anchors(new_content.clone(), *start, *end) {
+            Ok(next) => {
+                new_content = next;
+                connected_count += 1;
+            }
+            Err(error) => errors.push(error.to_string()),
+        }
     }
 
-    if !resolved.is_empty() {
+    if connected_count > 0 {
         write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     }
 
     let mut result = CallToolResult::json(&json!({
-        "connected_count": resolved.len(),
+        "connected_count": connected_count,
         "errors": errors
     }));
-    result.is_error = resolved.is_empty() && !errors.is_empty();
+    result.is_error = connected_count == 0 && !errors.is_empty();
     Ok(result)
 }
 
@@ -1060,7 +1110,29 @@ async fn handle_connect_passthrough(
     let direction = opt_str(args, "direction").unwrap_or("auto");
 
     let (content, tree) = read_schematic(&sch_path)?;
-    let dir = crate::tools::resolve_stub_direction(direction, (x, y), &tree);
+    let outward = crate::tools::pin_outward_at(&tree, x, y);
+    if outward.is_none()
+        && crate::tools::all_pin_endpoints(&tree)
+            .iter()
+            .any(|&(px, py)| points_coincident(x, y, px, py, 0.01))
+    {
+        return Ok(crate::tools::invalid_arg(
+            "x/y",
+            "stacked symbol pins disagree about the outward direction",
+        ));
+    }
+    let dir = crate::tools::stub_direction(direction, outward);
+    if direction != "auto" {
+        if let Some(outward) = outward {
+            let required = crate::tools::stub_direction("auto", Some(outward));
+            if dir.dx != required.dx || dir.dy != required.dy {
+                return Ok(crate::tools::invalid_arg(
+                    "direction",
+                    "must follow the detected symbol pin's outward direction",
+                ));
+            }
+        }
+    }
 
     // Stub is 2.54mm (2×1.27 grid units)
     let stub = 2.54_f64;
@@ -1703,8 +1775,8 @@ mod batch_place_and_connect_tests {
         assert!(result.is_error, "{result:?}");
     }
 
-    /// Six single-pin instances of a synthetic part, positioned so that
-    /// connecting them by pin pairs produces a T-junction on the second pair.
+    /// Six single-pin instances of a synthetic part. Every pin faces west, so
+    /// each connection has to preserve two same-direction outward stubs.
     fn multi_point_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
         let pin_def = "\t\t\t(pin passive line (at 0 0 0) (length 0)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n";
         let lib_sym = format!("\t\t(symbol \"Test:PT\"\n{pin_def}\t\t)\n");
@@ -1733,10 +1805,7 @@ mod batch_place_and_connect_tests {
     }
 
     #[tokio::test]
-    async fn batch_connect_pins_dedupes_junction_and_collects_errors() {
-        // R3-R4's wire T-lands on R1-R2's wire at (110, 100) -- without the
-        // STEP 1 fix, processing the third connection re-detects that same
-        // T-junction from the raw wire list and inserts a second dot.
+    async fn batch_connect_pins_preserves_stubs_and_collects_errors() {
         let (_d, path) = multi_point_schematic();
         let result = handle_batch_connect_pins(
             &json!({
@@ -1757,9 +1826,11 @@ mod batch_place_and_connect_tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             after.matches("(junction").count(),
-            1,
-            "the T-junction at (110, 100) must not be re-inserted: {after}"
+            0,
+            "the new doglegs avoid the unrelated pin at (110, 100): {after}"
         );
+        assert!(after.contains("(xy 100 100) (xy 98.73 100)"), "{after}");
+        assert!(after.contains("(xy 118.73 100) (xy 120 100)"), "{after}");
 
         let body = match &result.content[0] {
             crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
@@ -2028,7 +2099,7 @@ mod connect_to_net_orientation_tests {
         let after = connect(&path, "SWDIO", "1").await;
         assert_eq!(
             label_of(&after, "SWDIO"),
-            ("89.84 100 180".into(), "right bottom".into())
+            ("87.3 100 180".into(), "right bottom".into())
         );
         assert!(konnect_sexp::parse_sexp(&after).is_ok(), "{after}");
         assert!(
@@ -2045,7 +2116,7 @@ mod connect_to_net_orientation_tests {
         let after = connect(&path, "XTAL", "2").await;
         assert_eq!(
             label_of(&after, "XTAL"),
-            ("110.16 100 0".into(), "left bottom".into())
+            ("112.7 100 0".into(), "left bottom".into())
         );
     }
 
@@ -2055,9 +2126,9 @@ mod connect_to_net_orientation_tests {
     async fn vertical_pins_keep_their_label_horizontal() {
         let (_d, path) = quad_schematic();
         let after = connect(&path, "TOP", "3").await;
-        assert_eq!(label_of(&after, "TOP").0, "100 89.84 0");
+        assert_eq!(label_of(&after, "TOP").0, "100 87.3 0");
         let after = connect(&path, "BOTTOM", "4").await;
-        assert_eq!(label_of(&after, "BOTTOM").0, "100 110.16 0");
+        assert_eq!(label_of(&after, "BOTTOM").0, "100 112.7 0");
     }
 
     /// Pins on one endpoint are already connected, so one label serves them
@@ -2084,13 +2155,15 @@ mod connect_to_net_orientation_tests {
             panic!("expected text content");
         };
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-        // Both pins are reported connected — the second is not an error.
-        assert_eq!(parsed["added_count"], 2);
+        // Both pins are reported, but only one physical stub+label was added.
+        assert_eq!(parsed["added_count"], 1);
+        assert_eq!(parsed["deduplicated_count"], 1);
         assert_eq!(parsed["errors"].as_array().unwrap().len(), 0);
         assert_eq!(parsed["added"][1]["deduplicated"], json!(true));
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(after.matches("(label \"GND\"").count(), 1, "{after}");
+        assert_eq!(after.matches("(wire").count(), 1, "{after}");
     }
 
     /// Re-running must not stack a second label on the first.
@@ -2098,8 +2171,37 @@ mod connect_to_net_orientation_tests {
     async fn re_connecting_the_same_pin_adds_no_second_label() {
         let (_d, path) = quad_schematic();
         connect(&path, "SWDIO", "1").await;
+        let result = handle_batch_connect_to_net(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net_name": "SWDIO",
+                "pins": [{ "reference": "U1", "pin_number": "1" }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["added_count"], 0);
+        assert_eq!(parsed["deduplicated_count"], 1);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after.matches("(label \"SWDIO\"").count(), 1, "{after}");
+    }
+
+    #[tokio::test]
+    async fn a_label_at_the_future_stub_end_still_gets_its_missing_wire() {
+        let (_d, path) = quad_schematic();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let label = format_net_label("SWDIO", 87.3, 100.0, 180.0);
+        let seeded = crate::tools::sch_wiring::insert_before_close(&before, &label);
+        std::fs::write(&path, seeded).unwrap();
+
         let after = connect(&path, "SWDIO", "1").await;
         assert_eq!(after.matches("(label \"SWDIO\"").count(), 1, "{after}");
+        assert!(after.contains("(xy 89.84 100) (xy 87.3 100)"), "{after}");
     }
 }
 

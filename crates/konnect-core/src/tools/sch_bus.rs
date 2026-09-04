@@ -25,12 +25,17 @@ use crate::tools::{get_path, opt_f64, opt_str, require_f64, ToolContext, ToolDef
 use konnect_sexp::{
     parser::parse_sexp,
     schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, format_bus, format_bus_entry,
-        format_net_label, format_wire, pin_endpoint, BusEntryDirection,
+        extract_symbol_instances, format_bus, format_bus_entry, format_net_label, pin_endpoint,
+        pin_outward_direction, BusEntryDirection,
     },
-    writer::write_atomic,
+    writer::{write_atomic, write_atomic_if_unchanged},
 };
 use serde_json::json;
+
+use super::sch_wiring::{
+    insert_wire_with_junctions, plan_connection_segments, resolve_placed_pin, ConnectionAnchor,
+    ConnectionSegment,
+};
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -103,6 +108,7 @@ pub fn tools() -> Vec<ToolDef> {
             "Fan a set of pins out onto a bus: for each pin, a wire stub from the pin to the bus \
              entry, the bus entry itself, and a net label naming the member. This is the whole \
              connection — a stub without a label joins nothing, since bus membership is by name. \
+             Each symbol pin first leaves outward by at least one 1.27 mm grid step. \
              Give the bus's fixed coordinate ('bus_y' for a horizontal bus, 'bus_x' for a \
              vertical one); the bus segment itself is drawn separately with add_bus.",
             json!({
@@ -324,6 +330,7 @@ async fn handle_connect_pins_to_bus(
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
 
+    let mut wire_segments = Vec::<ConnectionSegment>::new();
     let mut inserts = String::new();
     let mut added: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -343,25 +350,19 @@ async fn handle_connect_pins_to_bus(
 
         // Resolve against the unit that actually owns the pin — a multi-unit
         // part repeats its reference on every unit.
-        let ep = instances
-            .iter()
-            .filter(|i| i.reference == reference)
-            .find_map(|inst| {
-                let sym = lib_syms
-                    .iter()
-                    .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))?;
-                extract_lib_pins_for_unit(sym, inst.unit)
-                    .into_iter()
-                    .find(|p| p.number == pin_number)
-                    .map(|p| pin_endpoint(&p, inst.pin_transform()))
-            });
-
-        let (px, py) = match ep {
-            Some(v) => v,
-            None => {
-                errors.push(format!("Pin {pin_number} of '{reference}' not found"));
-                continue;
-            }
+        let (pin, transform) =
+            match resolve_placed_pin(&instances, &lib_syms, reference, pin_number) {
+                Ok(value) => value,
+                Err(error) => {
+                    errors.push(error.to_string());
+                    continue;
+                }
+            };
+        let (px, py) = pin_endpoint(&pin, transform);
+        let pin_anchor = ConnectionAnchor {
+            x: px,
+            y: py,
+            outward: Some(pin_outward_direction(&pin, transform)),
         };
 
         // The entry bridges the last `size` before the bus; the stub covers the
@@ -378,12 +379,15 @@ async fn handle_connect_pins_to_bus(
             (ex, py, dir * size, dir * size, px, py)
         };
 
-        // Stub from the pin up to the entry's wire-side end. Zero-length when
-        // the pin already sits there; KiCad rejects a degenerate wire.
-        if (sx - entry_x).abs() > 0.01 || (sy - entry_y).abs() > 0.01 {
-            inserts.push_str("\n  ");
-            inserts.push_str(&format_wire(sx, sy, entry_x, entry_y));
-        }
+        let segments =
+            match plan_connection_segments(pin_anchor, ConnectionAnchor::point(entry_x, entry_y)) {
+                Ok(segments) => segments,
+                Err(error) => {
+                    errors.push(format!("{reference} pin {pin_number}: {error}"));
+                    continue;
+                }
+            };
+        wire_segments.extend(segments);
         inserts.push_str("\n  ");
         inserts.push_str(&format_bus_entry(entry_x, entry_y, entry_dir(dx, dy)));
         // The label is what actually puts this stub on the bus.
@@ -398,8 +402,13 @@ async fn handle_connect_pins_to_bus(
         }));
     }
 
-    let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
-    write_atomic(&sch_path, &new_content)?;
+    let mut new_content = content.clone();
+    for segment in wire_segments {
+        new_content =
+            insert_wire_with_junctions(new_content, segment.x1, segment.y1, segment.x2, segment.y2);
+    }
+    let new_content = crate::tools::sch_wiring::insert_before_close(&new_content, &inserts);
+    write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "connected_count": added.len(),
@@ -452,6 +461,35 @@ mod tests {
         content.push_str(&format_bus(100.33, 100.33, 150.11, 100.33));
         content.push_str("\n)\n");
         std::fs::write(&path, content).unwrap();
+        (directory, path)
+    }
+
+    fn sheet_with_symbol_and_bus() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("symbol-bus.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch
+  (version 20260306)
+  (uuid \"11111111-1111-4111-8111-111111111111\")
+  (lib_symbols
+    (symbol \"Test:P\"
+      (symbol \"P_1_1\"
+        (pin passive line (at 0 0 0) (length 2.54)
+          (name \"~\") (number \"1\")))))
+  (bus (pts (xy 80 120) (xy 120 120)) (stroke (width 0) (type default))
+    (uuid \"22222222-2222-4222-8222-222222222222\"))
+  (wire (pts (xy 98.73 110) (xy 110 110)) (stroke (width 0) (type default))
+    (uuid \"44444444-4444-4444-8444-444444444444\"))
+  (symbol
+    (lib_id \"Test:P\")
+    (at 100 100 0)
+    (unit 1)
+    (uuid \"33333333-3333-4333-8333-333333333333\")
+    (property \"Reference\" \"U1\" (at 100 95 0))))
+",
+        )
+        .unwrap();
         (directory, path)
     }
 
@@ -517,6 +555,36 @@ mod tests {
         assert_eq!(response["bus_side"]["x"], 32.54);
         let note = response["note"].as_str().expect("note present");
         assert!(note.contains("no bus touches"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn pin_to_bus_connection_leaves_the_symbol_outward_before_turning() {
+        let (_directory, path) = sheet_with_symbol_and_bus();
+        let result = handle_connect_pins_to_bus(
+            &json!({
+                "schematic": path.display().to_string(),
+                "bus_y": 120.0,
+                "connections": [{ "reference": "U1", "pin_number": "1", "net": "DATA" }]
+            }),
+            &crate::tools::ToolContext::new(
+                crate::tools::ServerConfig::default(),
+                std::sync::Arc::new(crate::router::ToolRouter::new()),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("(xy 100 100) (xy 98.73 100)"), "{after}");
+        assert!(after.contains("(bus_entry"), "{after}");
+        let tree = konnect_sexp::parse_sexp(&after).unwrap();
+        assert!(
+            konnect_sexp::schematic::extract_junctions(&tree)
+                .iter()
+                .any(|&(x, y)| (x - 98.73).abs() < 0.01 && (y - 110.0).abs() < 0.01),
+            "the new route T-lands on an existing wire: {after}"
+        );
     }
 
     #[test]

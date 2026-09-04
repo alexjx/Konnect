@@ -660,16 +660,6 @@ pub(crate) fn stub_direction(direction: &str, outward: Option<f64>) -> StubDirec
     }
 }
 
-/// [`stub_direction`] for a caller holding only a coordinate. Naming a pin is
-/// exact; matching one by position gives up when stacked pins there disagree.
-pub(crate) fn resolve_stub_direction(
-    direction: &str,
-    anchor: (f64, f64),
-    tree: &konnect_sexp::SexpNode,
-) -> StubDirection {
-    stub_direction(direction, pin_outward_at(tree, anchor.0, anchor.1))
-}
-
 /// Add junction dots for pins of `reference` that land mid-segment on a wire.
 /// KiCad connects a pin mid-wire only through a junction dot (verified with
 /// kicad-cli 10: a junction alone connects; splitting the wire is unnecessary).

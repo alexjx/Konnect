@@ -131,9 +131,9 @@ and Workflow expose them; Legacy does not. A supported mutation follows
 | `batch_add_no_connect` | Add multiple no-connect flags in one write. Marking one MCU's unused pins is routinely 15–20 flags. |
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle. |
-| `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body. |
-| `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. |
-| `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing). Use `connect_pins` if you have references instead of coordinates. |
+| `connect_to_net` | Connect a pin to a named net by adding a wire stub of at least one 1.27 mm schematic grid step plus a net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body, and a conflicting explicit direction is rejected. |
+| `connect_pins` | Connect two component pins by reference+pin number. Each symbol endpoint gets an independent 1.27 mm outward stub before any bend; adjacent aligned symbols are routed without collapsing those stubs into one direct wire. |
+| `add_schematic_connection` | Connect two schematic points with orthogonal routing. An endpoint that coincides unambiguously with a symbol pin gets an outward 1.27 mm stub before any bend. Use `connect_pins` if you have references instead of coordinates. |
 
 ### `sch_bus` · 4 tools
 **Purpose:** Buses, bus entries, and fanning a group of pins out onto a bus.
@@ -144,7 +144,7 @@ and Workflow expose them; Legacy does not. A supported mutation follows
 | `add_bus` | Add a bus segment. Geometrically a wire; KiCad treats it as a bus, carrying the members named by the bus label (`NAME[1..6]` or `{A B C}`). Wires join it only through a bus entry. |
 | `batch_add_bus` | Add multiple bus segments in one file read/write cycle. |
 | `add_bus_entry` | Add the 45° tick that connects a wire to a bus. Required — a wire and bus that merely touch are *not* connected. `x`/`y` are the wire-side end; `direction` picks which corner the tick runs to (`down_right` default, `down_left`, `up_right`, `up_left`). |
-| `connect_pins_to_bus` | Fan a set of pins onto a bus: wire stub + bus entry + member label per pin. Bus membership is by name, so the label is part of the connection, not decoration. |
+| `connect_pins_to_bus` | Fan a set of pins onto a bus: direction-aware wire stub + bus entry + member label per pin. Every symbol pin leaves outward for at least one 1.27 mm grid step before turning. Bus membership is by name, so the label is part of the connection, not decoration. |
 
 ### `sch_analysis` · 15 tools
 **Purpose:** Net connectivity, pin queries, trace paths, overlap/orphan detection.
@@ -174,18 +174,18 @@ and Workflow expose them; Legacy does not. A supported mutation follows
 
 | Tool | Description |
 |------|-------------|
-| `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. Single read → all labels inserted → single write. |
+| `batch_connect_to_net` | Connect many pins to a named net by adding 2.54 mm outward stubs and labels oriented away from the symbol body. Single read → all wires and labels inserted → single write. |
 | `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID or reference — single file write. |
 | `bulk_move_schematic_components` | Move multiple components by a uniform dx/dy offset in a single atomic write. |
 | `batch_edit_schematic_components` | Apply field updates (Value, Footprint, custom properties) to multiple components in a single atomic write. |
 | `batch_delete_schematic_components` | Delete multiple components by reference designator in a single atomic write. |
-| `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`. |
+| `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`; when the point is a symbol pin, conflicting directions are rejected. |
 | `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. Aligns the text against that position with `justify`, per axis and defaulting to `left bottom` as KiCad does; an omitted axis is centred, and `center` centres both. Takes `bold`, `italic`, `thickness` and `color` for the font. |
 | `get_schematic_layout` | Return component positions and transformed drawing/pin bounds (excluding free text), reporting unresolved geometry; optionally include wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in a single file read/write cycle. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
-| `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. |
+| `batch_connect_pins` | Connect multiple component pin pairs in one file read/write cycle, preserving an independent 1.27 mm outward stub at every symbol endpoint. |
 
 ### `sch_export` · 10 tools
 **Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB.
