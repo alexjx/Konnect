@@ -259,7 +259,8 @@ transaction abandon` escape hatch documented in
 - Both `__init__.py` (the **Konnect Settings** SWIG ActionPlugin for the PCB
   editor settings dialog) and `plugin.json` (the **Konnect** IPC executable
   action) are included. Their names must remain distinct because KiCad loads
-  both registrations into the same menu.
+  both registrations into the same menu. The settings action is menu-only;
+  only the executable action owns a toolbar button.
 - `native_bridge.py` is a KiCad-10-only, opt-in compatibility bridge. It exposes
   only authenticated status and native Specctra export over an ephemeral
   loopback port. The caller cannot choose an output path; the plugin owns and

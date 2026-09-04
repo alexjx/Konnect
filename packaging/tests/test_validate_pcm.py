@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import tempfile
@@ -54,6 +55,32 @@ class KonnectPlugin(pcbnew.ActionPlugin):
         self.assertEqual(
             VALIDATE_PCM.duplicate_action_names(plugin, python_source),
             [],
+        )
+
+    def test_only_executable_action_requests_a_toolbar_button(self):
+        plugin = json.loads(
+            (REPOSITORY_ROOT / "plugin" / "plugin.json").read_text(encoding="utf-8")
+        )
+        python_source = (REPOSITORY_ROOT / "plugin" / "__init__.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(python_source)
+        python_toolbar_values = [
+            node.value.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Constant)
+            and any(
+                isinstance(target, ast.Attribute)
+                and target.attr == "show_toolbar_button"
+                for target in node.targets
+            )
+        ]
+
+        self.assertEqual(python_toolbar_values, [False])
+        self.assertEqual(
+            [action.get("show-button") for action in plugin["actions"]],
+            [True],
         )
 
 

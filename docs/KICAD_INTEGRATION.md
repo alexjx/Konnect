@@ -105,7 +105,9 @@ through Python.
 
 `plugin` contains the legacy KiCad 10 Python ActionPlugin for settings/server
 control and the optional native Specctra bridge. `plugin.json` declares the
-separate executable IPC integration that is the forward path. The standalone viewer in
+separate executable IPC integration that is the forward path and owns the sole
+Konnect toolbar button; the legacy settings action remains available from the
+menu. The standalone viewer in
 `crates/schematic-viewer` watches schematic files and renders through
 `kicad-cli`; it is built and tested separately from the Rust workspace.
 

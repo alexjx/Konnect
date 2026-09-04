@@ -252,7 +252,9 @@ class KonnectPlugin(pcbnew.ActionPlugin):
             "Configure and control the Konnect -- enables AI assistants "
             "like Claude to design PCBs and schematics via the Model Context Protocol."
         )
-        self.show_toolbar_button = True
+        # The executable IPC action owns the toolbar button. Keeping this
+        # settings action menu-only avoids two identical Konnect buttons.
+        self.show_toolbar_button = False
         self.icon_file_name = os.path.join(PLUGIN_DIR, "resources", "icon.png")
 
     def Run(self):
