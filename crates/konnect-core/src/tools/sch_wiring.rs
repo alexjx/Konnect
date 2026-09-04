@@ -15,8 +15,8 @@ use konnect_sexp::{
     parser::parse_sexp,
     schematic::{
         extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
-        format_junction, format_wire, parse_at, pin_endpoint, pin_outward_direction,
-        read_schematic, Wire,
+        format_junction, format_wire, horizontal_label_rotation, parse_at, pin_endpoint,
+        pin_outward_direction, read_schematic, Wire,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
@@ -69,6 +69,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "add_wire",
             "Add a wire segment between two points. The wire must be horizontal or vertical. \
+             A segment ending on a symbol pin is accepted only when it leaves the pin outward \
+             by at least one 1.27 mm grid step. Attached labels are faced automatically. \
              T-junctions are automatically detected and junction dots inserted.",
             json!({
                 "type": "object",
@@ -83,7 +85,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_add_wire",
-            "Add multiple wire segments in a single file read/write cycle.",
+            "Add multiple wire segments in a single file read/write cycle. Segments ending on \
+             symbol pins must leave outward by at least one 1.27 mm grid step; attached labels \
+             are faced automatically.",
             json!({
                 "type": "object",
                 "properties": {
@@ -156,14 +160,16 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "add_schematic_net_label",
             "Add a net label to the schematic. Type can be 'net_label', 'global_label', \
-             or 'hierarchical_label'.",
+             or 'hierarchical_label'. When the anchor is on a pin or wire endpoint, MCP derives \
+             the label direction from that geometry; rotation is only used at a bare point.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
                     "net": { "type": "string", "description": "Net name" },
                     "x": { "type": "number" }, "y": { "type": "number" },
-                    "rotation": { "type": "number", "default": 0 },
+                    "rotation": { "type": "number", "default": 0,
+                        "description": "Fallback rotation for a bare point; attached geometry overrides it" },
                     "label_type": {
                         "type": "string",
                         "enum": ["net_label", "global_label", "hierarchical_label"],
@@ -195,7 +201,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "rotate_schematic_label",
-            "Rotate a net label to a new angle and update its justify direction accordingly.",
+            "Rotate a bare net label and update its justify direction. A label attached to a \
+             symbol pin or unambiguous wire endpoint keeps the direction derived by MCP.",
             json!({
                 "type": "object",
                 "properties": {
@@ -698,6 +705,158 @@ fn points_same(a: (f64, f64), b: (f64, f64)) -> bool {
     (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01
 }
 
+pub(crate) fn direction_from_to(from: (f64, f64), to: (f64, f64)) -> anyhow::Result<f64> {
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    if dy.abs() < 0.01 && dx > 0.01 {
+        Ok(0.0)
+    } else if dx.abs() < 0.01 && dy < -0.01 {
+        Ok(90.0)
+    } else if dy.abs() < 0.01 && dx < -0.01 {
+        Ok(180.0)
+    } else if dx.abs() < 0.01 && dy > 0.01 {
+        Ok(270.0)
+    } else {
+        anyhow::bail!("wire segment must be horizontal or vertical and non-zero")
+    }
+}
+
+/// Refuse a raw segment that would bypass the symbol-aware connection tools.
+/// A pin endpoint may only be the start of a straight outward segment of at
+/// least one schematic grid step. Validation happens before the first write.
+fn validate_pin_exit(
+    tree: &konnect_sexp::SexpNode,
+    start: (f64, f64),
+    end: (f64, f64),
+) -> anyhow::Result<()> {
+    let all_pins = crate::tools::all_pin_endpoints(tree);
+    for (anchor, other) in [(start, end), (end, start)] {
+        let outward = crate::tools::pin_outward_at(tree, anchor.0, anchor.1);
+        let is_pin = all_pins.iter().any(|point| points_same(*point, anchor));
+        let Some(outward) = outward else {
+            if is_pin {
+                anyhow::bail!(
+                    "stacked symbol pins at ({}, {}) disagree about the outward direction",
+                    anchor.0,
+                    anchor.1
+                );
+            }
+            continue;
+        };
+        let actual = direction_from_to(anchor, other)?;
+        if (actual - outward).abs() >= 0.01 {
+            anyhow::bail!(
+                "wire at symbol pin ({}, {}) must leave outward at {} degrees, not {} degrees",
+                anchor.0,
+                anchor.1,
+                outward,
+                actual
+            );
+        }
+        let length = (other.0 - anchor.0).abs() + (other.1 - anchor.1).abs();
+        if length + 0.01 < SCHEMATIC_GRID_MM {
+            anyhow::bail!(
+                "wire at symbol pin ({}, {}) is {:.2} mm; at least {:.2} mm is required",
+                anchor.0,
+                anchor.1,
+                length,
+                SCHEMATIC_GRID_MM
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Determine how a label at `anchor` must face. A symbol pin is authoritative.
+/// Otherwise the label continues away from the one unambiguous wire side that
+/// reaches the anchor. Junctions with conflicting sides have no forced face.
+fn label_rotation_from_geometry(
+    tree: &konnect_sexp::SexpNode,
+    wires: &[Wire],
+    anchor: (f64, f64),
+) -> anyhow::Result<Option<f64>> {
+    if let Some(outward) = crate::tools::pin_outward_at(tree, anchor.0, anchor.1) {
+        return Ok(Some(horizontal_label_rotation(outward)));
+    }
+    if crate::tools::all_pin_endpoints(tree)
+        .iter()
+        .any(|point| points_same(*point, anchor))
+    {
+        anyhow::bail!(
+            "stacked symbol pins at ({}, {}) disagree about the label direction",
+            anchor.0,
+            anchor.1
+        );
+    }
+
+    let mut rotations = Vec::new();
+    for wire in wires {
+        let other = if points_same((wire.x1, wire.y1), anchor) {
+            Some((wire.x2, wire.y2))
+        } else if points_same((wire.x2, wire.y2), anchor) {
+            Some((wire.x1, wire.y1))
+        } else {
+            None
+        };
+        if let Some(other) = other {
+            let rotation = horizontal_label_rotation(direction_from_to(other, anchor)?);
+            if !rotations.contains(&rotation) {
+                rotations.push(rotation);
+            }
+        }
+    }
+    Ok(match rotations.as_slice() {
+        [rotation] => Some(*rotation),
+        _ => None,
+    })
+}
+
+fn face_attached_labels(
+    sch: &mut cse::Schematic,
+    tree: &konnect_sexp::SexpNode,
+    wires: &[Wire],
+    anchors: &[(f64, f64)],
+) -> anyhow::Result<usize> {
+    let mut changed = 0usize;
+    for label in &mut sch.labels {
+        if !anchors
+            .iter()
+            .any(|anchor| points_same(*anchor, label.position()))
+        {
+            continue;
+        }
+        if let Some(rotation) = label_rotation_from_geometry(tree, wires, label.position())? {
+            label.set_rotation(rotation);
+            changed += 1;
+        }
+    }
+    for label in &mut sch.global_labels {
+        if !anchors
+            .iter()
+            .any(|anchor| points_same(*anchor, label.position()))
+        {
+            continue;
+        }
+        if let Some(rotation) = label_rotation_from_geometry(tree, wires, label.position())? {
+            label.set_rotation(rotation);
+            changed += 1;
+        }
+    }
+    for label in &mut sch.hierarchical_labels {
+        if !anchors
+            .iter()
+            .any(|anchor| points_same(*anchor, label.position()))
+        {
+            continue;
+        }
+        if let Some(rotation) = label_rotation_from_geometry(tree, wires, label.position())? {
+            label.set_rotation(rotation);
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
 pub(crate) fn clean_coordinate(value: f64) -> f64 {
     (value * 1_000_000.0).round() / 1_000_000.0
 }
@@ -1083,6 +1242,11 @@ async fn handle_add_wire(
     let (x1, y1) = snap_point(x1, y1, 1.27);
     let (x2, y2) = snap_point(x2, y2, 1.27);
 
+    let (_, tree) = read_schematic(&sch_path)?;
+    if let Err(error) = validate_pin_exit(&tree, (x1, y1), (x2, y2)) {
+        return Ok(crate::tools::invalid_arg("x1/y1/x2/y2", &error.to_string()));
+    }
+
     let mut sch = cse::Schematic::load(&sch_path)?;
 
     // T-junction detection: bridge cse wires to konnect_sexp wires
@@ -1099,14 +1263,16 @@ async fn handle_add_wire(
     sch.add_wire(x1, y1, x2, y2);
     add_missing_junctions(&mut sch, &junctions);
     // Pins the new wire passes over mid-segment also need junction dots.
-    let (_, tree) = read_schematic(&sch_path)?;
     let pins = crate::tools::all_pin_endpoints(&tree);
     add_missing_junctions(&mut sch, &pins_mid_segment(&pins, x1, y1, x2, y2));
+    let labels_faced =
+        face_attached_labels(&mut sch, &tree, &existing_wires, &[(x1, y1), (x2, y2)])?;
     sch.overwrite()?;
 
-    Ok(CallToolResult::json(
-        &json!({ "added_wire": { "x1": x1, "y1": y1, "x2": x2, "y2": y2 } }),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "added_wire": { "x1": x1, "y1": y1, "x2": x2, "y2": y2 },
+        "labels_faced": labels_faced
+    })))
 }
 
 async fn handle_batch_add_wire(
@@ -1135,22 +1301,27 @@ async fn handle_batch_add_wire(
         }
     }
 
-    let mut sch = cse::Schematic::load(&sch_path)?;
-    let mut added = 0usize;
-
-    // Pin endpoints are fixed for the whole batch (only wires change below).
-    let pins = read_schematic(&sch_path)
-        .map(|(_, tree)| crate::tools::all_pin_endpoints(&tree))
-        .unwrap_or_default();
-
-    for w in &wires {
+    let (_, tree) = read_schematic(&sch_path)?;
+    let mut prepared = Vec::with_capacity(wires.len());
+    for (index, w) in wires.iter().enumerate() {
         let x1 = w["x1"].as_f64().unwrap_or(0.0);
         let y1 = w["y1"].as_f64().unwrap_or(0.0);
         let x2 = w["x2"].as_f64().unwrap_or(0.0);
         let y2 = w["y2"].as_f64().unwrap_or(0.0);
         let (x1, y1) = snap_point(x1, y1, 1.27);
         let (x2, y2) = snap_point(x2, y2, 1.27);
+        if let Err(error) = validate_pin_exit(&tree, (x1, y1), (x2, y2)) {
+            return Ok(crate::tools::invalid_arg(
+                &format!("wires[{index}]"),
+                &error.to_string(),
+            ));
+        }
+        prepared.push((x1, y1, x2, y2));
+    }
 
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    let pins = crate::tools::all_pin_endpoints(&tree);
+    for &(x1, y1, x2, y2) in &prepared {
         // T-junction detection for each wire added incrementally.
         let mut existing_wires = cse_wires_to_sexp(&sch);
         existing_wires.push(konnect_sexp::schematic::Wire {
@@ -1166,11 +1337,19 @@ async fn handle_batch_add_wire(
         add_missing_junctions(&mut sch, &junctions);
         // Pins this wire passes over mid-segment also need junction dots.
         add_missing_junctions(&mut sch, &pins_mid_segment(&pins, x1, y1, x2, y2));
-        added += 1;
     }
 
+    let final_wires = cse_wires_to_sexp(&sch);
+    let anchors = prepared
+        .iter()
+        .flat_map(|&(x1, y1, x2, y2)| [(x1, y1), (x2, y2)])
+        .collect::<Vec<_>>();
+    let labels_faced = face_attached_labels(&mut sch, &tree, &final_wires, &anchors)?;
     sch.overwrite()?;
-    Ok(CallToolResult::json(&json!({ "added_wires": added })))
+    Ok(CallToolResult::json(&json!({
+        "added_wires": prepared.len(),
+        "labels_faced": labels_faced
+    })))
 }
 
 async fn handle_delete_wire(
@@ -1662,9 +1841,17 @@ async fn handle_add_net_label(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
+    let requested_rotation = opt_f64(args, "rotation").unwrap_or(0.0);
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
     let shape = opt_str(args, "shape").unwrap_or("input");
+
+    let (_, tree) = read_schematic(&sch_path)?;
+    let wires = extract_wires(&tree);
+    let derived_rotation = match label_rotation_from_geometry(&tree, &wires, (x, y)) {
+        Ok(rotation) => rotation,
+        Err(error) => return Ok(crate::tools::invalid_arg("x/y", &error.to_string())),
+    };
+    let rotation = derived_rotation.unwrap_or(requested_rotation);
 
     let mut sch = cse::Schematic::load(&sch_path)?;
 
@@ -1694,9 +1881,14 @@ async fn handle_add_net_label(
 
     sch.overwrite()?;
 
-    Ok(CallToolResult::json(
-        &json!({ "added_label": net, "type": label_type, "x": x, "y": y }),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "added_label": net,
+        "type": label_type,
+        "x": x,
+        "y": y,
+        "rotation": rotation,
+        "rotation_source": if derived_rotation.is_some() { "attached_geometry" } else { "request_or_default" }
+    })))
 }
 
 async fn handle_delete_net_label(
@@ -1856,13 +2048,20 @@ async fn handle_rotate_label(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let rotation = match require_f64(args, "rotation") {
+    let requested_rotation = match require_f64(args, "rotation") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
 
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
+    let tree = parse_sexp(&content)?;
+    let wires = extract_wires(&tree);
+    let derived_rotation = match label_rotation_from_geometry(&tree, &wires, (x, y)) {
+        Ok(rotation) => rotation,
+        Err(error) => return Ok(crate::tools::invalid_arg("x/y", &error.to_string())),
+    };
+    let rotation = derived_rotation.unwrap_or(requested_rotation);
 
     let labels = find_label_blocks(&content);
     let named: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
@@ -1960,7 +2159,8 @@ async fn handle_rotate_label(
         "rotated_label": net,
         "type": label.kind,
         "rotation": rotation,
-        "justify": justify
+        "justify": justify,
+        "rotation_source": if derived_rotation.is_some() { "attached_geometry" } else { "request" }
     })))
 }
 
@@ -2925,6 +3125,119 @@ mod unit_aware_wiring_tests {
                 .any(|&(x, y)| (x - 101.6).abs() < 0.01 && (y - 76.2).abs() < 0.01),
             "junction expected at the mid-wire pin, got {juncs:?}"
         );
+    }
+
+    /// The raw primitive used to bypass the direction-aware connection tools:
+    /// U1's pin faces west, yet a caller could draw its first segment east.
+    #[tokio::test]
+    async fn raw_add_wire_refuses_a_segment_back_through_the_symbol() {
+        let (_d, path) = single_pin_schematic();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_add_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "x1": 101.6, "y1": 76.2, "x2": 106.68, "y2": 76.2
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "an inward pin segment must be refused");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn raw_batch_refuses_one_bad_pin_exit_before_writing_any_wire() {
+        let (_d, path) = single_pin_schematic();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_batch_add_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "wires": [
+                    { "x1": 50.8, "y1": 50.8, "x2": 55.88, "y2": 50.8 },
+                    { "x1": 101.6, "y1": 76.2, "x2": 106.68, "y2": 76.2 }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "the batch must reject the bad pin exit");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn adding_wire_after_a_label_refaces_the_label_from_geometry() {
+        let (_d, path) = bare_schematic();
+        handle_add_net_label(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "SIG", "x": 50.8, "y": 50.8, "rotation": 0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let result = handle_add_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "x1": 50.8, "y1": 50.8, "x2": 55.88, "y2": 50.8
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("(at 50.8 50.8 180)"), "{after}");
+        assert!(after.contains("(justify right bottom)"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn adding_label_after_a_wire_ignores_a_conflicting_requested_rotation() {
+        let (_d, path) = bare_schematic();
+        handle_add_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "x1": 50.8, "y1": 50.8, "x2": 55.88, "y2": 50.8
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let result = handle_add_net_label(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "SIG", "x": 55.88, "y": 50.8, "rotation": 180
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("(at 55.88 50.8 0)"), "{after}");
+        assert!(after.contains("(justify left bottom)"), "{after}");
+
+        let result = handle_rotate_label(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "SIG", "x": 55.88, "y": 50.8, "rotation": 180
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("(at 55.88 50.8 0)"), "{after}");
+        assert!(after.contains("(justify left bottom)"), "{after}");
     }
 
     #[tokio::test]

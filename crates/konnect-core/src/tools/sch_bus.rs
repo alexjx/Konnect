@@ -25,16 +25,16 @@ use crate::tools::{get_path, opt_f64, opt_str, require_f64, ToolContext, ToolDef
 use konnect_sexp::{
     parser::parse_sexp,
     schematic::{
-        extract_symbol_instances, format_bus, format_bus_entry, format_net_label, pin_endpoint,
-        pin_outward_direction, BusEntryDirection,
+        extract_symbol_instances, format_bus, format_bus_entry, format_net_label,
+        horizontal_label_rotation, pin_endpoint, pin_outward_direction, BusEntryDirection,
     },
     writer::{write_atomic, write_atomic_if_unchanged},
 };
 use serde_json::json;
 
 use super::sch_wiring::{
-    insert_wire_with_junctions, plan_connection_segments, resolve_placed_pin, ConnectionAnchor,
-    ConnectionSegment,
+    direction_from_to, insert_wire_with_junctions, plan_connection_segments, resolve_placed_pin,
+    ConnectionAnchor, ConnectionSegment,
 };
 
 pub fn tools() -> Vec<ToolDef> {
@@ -367,16 +367,16 @@ async fn handle_connect_pins_to_bus(
 
         // The entry bridges the last `size` before the bus; the stub covers the
         // rest of the way from the pin.
-        let (entry_x, entry_y, dx, dy, sx, sy) = if horizontal {
+        let (entry_x, entry_y, dx, dy) = if horizontal {
             let by = bus_y.unwrap();
             let dir = if by > py { 1.0 } else { -1.0 };
             let ey = by - dir * size;
-            (px, ey, dir * size, dir * size, px, py)
+            (px, ey, dir * size, dir * size)
         } else {
             let bx = bus_x.unwrap();
             let dir = if bx > px { 1.0 } else { -1.0 };
             let ex = bx - dir * size;
-            (ex, py, dir * size, dir * size, px, py)
+            (ex, py, dir * size, dir * size)
         };
 
         let segments =
@@ -387,18 +387,44 @@ async fn handle_connect_pins_to_bus(
                     continue;
                 }
             };
+        let Some(last) = segments.last() else {
+            errors.push(format!(
+                "{reference} pin {pin_number}: connection planner returned no wire segment"
+            ));
+            continue;
+        };
+        let entry = (entry_x, entry_y);
+        let other = if (last.x2 - entry_x).abs() < 0.01 && (last.y2 - entry_y).abs() < 0.01 {
+            (last.x1, last.y1)
+        } else if (last.x1 - entry_x).abs() < 0.01 && (last.y1 - entry_y).abs() < 0.01 {
+            (last.x2, last.y2)
+        } else {
+            errors.push(format!(
+                "{reference} pin {pin_number}: planned wire does not reach the bus entry"
+            ));
+            continue;
+        };
+        let label_rotation = match direction_from_to(other, entry) {
+            Ok(direction) => horizontal_label_rotation(direction),
+            Err(error) => {
+                errors.push(format!("{reference} pin {pin_number}: {error}"));
+                continue;
+            }
+        };
         wire_segments.extend(segments);
         inserts.push_str("\n  ");
         inserts.push_str(&format_bus_entry(entry_x, entry_y, entry_dir(dx, dy)));
-        // The label is what actually puts this stub on the bus.
-        let rot = if horizontal { 90.0 } else { 0.0 };
+        // The label is what actually puts this stub on the bus. Anchor it at
+        // the wire side of the entry and face it from the final wire segment;
+        // putting it back on the pin bypasses the visible outgoing stub.
         inserts.push_str("\n  ");
-        inserts.push_str(&format_net_label(net, sx, sy, rot));
+        inserts.push_str(&format_net_label(net, entry_x, entry_y, label_rotation));
 
         added.push(json!({
             "reference": reference, "pin": pin_number, "net": net,
             "pin_at": { "x": px, "y": py },
-            "entry_at": { "x": entry_x, "y": entry_y }
+            "entry_at": { "x": entry_x, "y": entry_y },
+            "label": { "x": entry_x, "y": entry_y, "rotation": label_rotation }
         }));
     }
 
@@ -579,6 +605,11 @@ mod tests {
         assert!(after.contains("(xy 100 100) (xy 98.73 100)"), "{after}");
         assert!(after.contains("(bus_entry"), "{after}");
         let tree = konnect_sexp::parse_sexp(&after).unwrap();
+        let label = konnect_sexp::schematic::extract_labels(&tree)
+            .into_iter()
+            .find(|label| label.net == "DATA")
+            .expect("member label");
+        assert_eq!((label.x, label.y, label.rotation), (100.0, 117.46, 0.0));
         assert!(
             konnect_sexp::schematic::extract_junctions(&tree)
                 .iter()
