@@ -32,8 +32,8 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "create_schematic",
-            "Create a new blank .kicad_sch schematic file, on A4 unless another paper \
-             size is given. Use set_schematic_page to change it later.",
+            "Create a new blank .kicad_sch schematic file with a numbered root instance, on A4 \
+             unless another paper size is given. Use set_schematic_page to change it later.",
             json!({
                 "type": "object",
                 "properties": {

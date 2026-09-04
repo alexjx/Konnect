@@ -8,8 +8,8 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_str, project_name_for, require_array,
-    require_f64, require_str, ToolDef,
+    find_all_symbol_instance_blocks, get_path, opt_str, require_array, require_f64, require_str,
+    ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -68,8 +68,9 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_place_components",
             "Place multiple symbols from KiCAD libraries in a single file read/write cycle. \
-             Pass explicit references -- there is no auto-numbering; an omitted reference \
-             becomes '?' like an eeschema-unannotated symbol, same as add_schematic_component.",
+             Hierarchical child symbols use their root project and full sheet path. Pass explicit \
+             references -- there is no auto-numbering; an omitted reference becomes '?' like an \
+             eeschema-unannotated symbol, same as add_schematic_component.",
             json!({
                 "type": "object",
                 "properties": {
@@ -522,8 +523,9 @@ async fn handle_batch_place_components(
     };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
-    let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
-    let project_name = project_name_for(&sch_path);
+    let context = crate::tools::sheet_instance_context(&sch_path, &mut sch);
+    let instance_path = context.instance_path;
+    let project_name = context.project_name;
     // Built once: the lib-table parse is memoised across the whole batch.
     let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
 
@@ -546,7 +548,7 @@ async fn handle_batch_place_components(
 
         match place_one_component(
             &mut sch,
-            &root_uuid,
+            &instance_path,
             &project_name,
             lib_id,
             x,
@@ -1724,6 +1726,48 @@ mod batch_place_and_connect_tests {
                 .any(|line| line.ends_with(' ') || line.ends_with('\t')),
             "batch placement must not leave trailing whitespace: {after:?}"
         );
+    }
+
+    /// Batch placement must resolve the same root-project instance context as
+    /// single placement. Otherwise KiCad repairs every child symbol on first
+    /// hierarchy load and shows the generic broken-file warning.
+    #[tokio::test]
+    async fn batch_place_components_keys_child_instances_to_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("board.kicad_sch");
+        let child = dir.path().join("amp.kicad_sch");
+        std::fs::write(dir.path().join("board.kicad_pro"), "{}").unwrap();
+        std::fs::write(
+            &root,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"eeschema\")\n  (uuid \"ROOTUUID\")\n  (paper \"A4\")\n  (lib_symbols)\n  (sheet\n    (at 50 50)\n    (size 20 20)\n    (uuid \"SHEETUUID\")\n    (property \"Sheetname\" \"amp\")\n    (property \"Sheetfile\" \"amp.kicad_sch\")\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            format!(
+                "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"CHILDUUID\")\n  (paper \"A4\")\n  (lib_symbols\n{DEVICE_R}  )\n)\n"
+            ),
+        )
+        .unwrap();
+
+        let result = handle_batch_place_components(
+            &json!({
+                "schematic": child.display().to_string(),
+                "components": [
+                    { "lib_id": "Device:R", "x": 100.0, "y": 100.0, "reference": "R1" }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let written = std::fs::read_to_string(&child).unwrap();
+        assert!(written.contains("(project \"board\""), "{written}");
+        assert!(written.contains("/ROOTUUID/SHEETUUID"), "{written}");
+        assert!(!written.contains("(project \"amp\""), "{written}");
+        assert!(!written.contains("/CHILDUUID"), "{written}");
     }
 
     #[tokio::test]

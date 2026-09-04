@@ -16,6 +16,12 @@ Existing-file writes use the atomic/conflict-aware machinery in
 `konnect-sexp/src/transaction.rs`; a source revision change must become a
 conflict rather than an overwrite.
 
+New schematic files include the root `sheet_instances` entry with page `1`.
+Both single and batch component placement resolve a child file through the
+nearest project root and store the full `/root-uuid/sheet-uuid/...` instance
+path. These are file-validity invariants: omitting either makes Eeschema repair
+the hierarchy on first load and display its broken-file warning.
+
 ## KiCad IPC
 
 `crates/konnect-ipc` sends typed protobuf requests over NNG. The socket comes

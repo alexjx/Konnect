@@ -22,9 +22,24 @@ pub fn format_blank_schematic() -> String {
 pub fn format_blank_schematic_with_paper(size: &str, portrait: bool) -> String {
     let orientation = if portrait { " portrait" } else { "" };
     format!(
-        "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"{size}\"{orientation})\n\t(lib_symbols\n\t)\n)\n",
+        "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"{size}\"{orientation})\n\t(lib_symbols\n\t)\n\t(sheet_instances\n\t\t(path \"/\"\n\t\t\t(page \"1\")\n\t\t)\n\t)\n)\n",
         crate::writer::new_uuid()
     )
+}
+
+#[cfg(test)]
+mod blank_schematic_tests {
+    use super::*;
+
+    #[test]
+    fn blank_schematic_has_a_numbered_root_instance() {
+        let source = format_blank_schematic();
+        let tree = parse_sexp(&source).unwrap();
+        let instances = tree.find("sheet_instances").expect("root instances");
+        let path = instances.find("path").expect("root path");
+        assert_eq!(path.get(1).and_then(SexpNode::as_str), Some("/"));
+        assert_eq!(path.find_str("page"), Some("1"));
+    }
 }
 
 pub fn read_schematic(path: &Path) -> Result<(String, SexpNode), SexpError> {

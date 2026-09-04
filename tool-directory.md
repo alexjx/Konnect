@@ -89,7 +89,7 @@ and Workflow expose them; Legacy does not. A supported mutation follows
 
 | Tool | Description |
 |------|-------------|
-| `create_schematic` | Create a new blank `.kicad_sch` schematic file, on A4 unless another paper size is given. Use `set_schematic_page` to change it later. |
+| `create_schematic` | Create a new blank `.kicad_sch` schematic file with a numbered root instance, on A4 unless another paper size is given. Use `set_schematic_page` to change it later. |
 | `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
 | `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid. |
 | `delete_schematic_component` | Remove a component and all of its placed units by reference designator. |
@@ -184,7 +184,7 @@ and Workflow expose them; Legacy does not. A supported mutation follows
 | `get_schematic_layout` | Return component positions and transformed drawing/pin bounds (excluding free text), reporting unresolved geometry; optionally include wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
-| `batch_place_components` | Place multiple symbols from KiCAD libraries in a single file read/write cycle. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
+| `batch_place_components` | Place multiple symbols from KiCAD libraries in one file read/write cycle, using the root project and full sheet path for hierarchical children. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
 | `batch_connect_pins` | Connect multiple component pin pairs in one file read/write cycle, preserving an independent 1.27 mm outward stub at every symbol endpoint. |
 
 ### `sch_export` · 10 tools
