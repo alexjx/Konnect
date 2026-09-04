@@ -459,13 +459,13 @@ fn tool_directory_lists_workflows_but_not_disabled_raw_implementations() {
 #[test]
 fn implementation_exposure_and_profile_counts_are_stable() {
     let counts = counts();
-    assert_eq!(counts.implemented_raw, 227);
-    assert_eq!(counts.exposed_raw, 194);
+    assert_eq!(counts.implemented_raw, 228);
+    assert_eq!(counts.exposed_raw, 195);
     assert_eq!(registry::DISABLED_TOOLS.len(), 33);
     assert_eq!(counts.workflow, 7);
     assert_eq!(counts.meta, 6);
-    assert_eq!(counts.legacy_full, 200);
-    assert_eq!(counts.expert_full, 207);
+    assert_eq!(counts.legacy_full, 201);
+    assert_eq!(counts.expert_full, 208);
     assert_eq!(counts.workflow_full, 9);
     assert_eq!(counts.legacy_starter, 18);
     assert_eq!(counts.expert_starter, 25);

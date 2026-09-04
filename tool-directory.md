@@ -13,8 +13,8 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **227 raw implementations**: **194 exposed raw tools** and 33 intentionally disabled implementations
-- **194 exposed raw tools** + **7 guarded workflow tools** + **6 meta-tools**
+- **228 raw implementations**: **195 exposed raw tools** and 33 intentionally disabled implementations
+- **195 exposed raw tools** + **7 guarded workflow tools** + **6 meta-tools**
 - **Profiles**: Legacy exposes raw + meta (200 full; 18 starter), Expert adds workflows (207 full; 25 starter), and Workflow exposes workflow + observability only (9).
 - **Discovery pattern**: Legacy and Expert pre-load only the **starter kit** (`project`, `config`). The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional raw tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. Workflow has no raw router. Set `exposure_profile` to `legacy`, `expert`, or `workflow`.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
@@ -83,7 +83,7 @@ and Workflow expose them; Legacy does not. A supported mutation follows
 
 ## Schematic
 
-### `sch_components` · 19 tools
+### `sch_components` · 20 tools
 **Purpose:** Add, edit, move, rotate, and delete schematic symbols, and set the page size.
 **Source:** [`crates/konnect-core/src/tools/sch_components.rs`](crates/konnect-core/src/tools/sch_components.rs)
 
@@ -103,6 +103,7 @@ and Workflow expose them; Legacy does not. A supported mutation follows
 | `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read, with the same per-pin fields. |
 | `get_schematic_symbol_bounds` | Return transformed symbol-body bounds and estimated visible Reference/Value text bounds without modifying the schematic. |
 | `check_schematic_field_spacing` | Audit visible Reference/Value clearance, overlap, orientation, and pin-corridor conflicts against transformed symbol geometry. |
+| `set_schematic_field_positions` | Atomically place exact Reference/Value fields at reviewed absolute sheet coordinates without moving their symbols; validates the complete batch and reads committed positions back. |
 | `add_component_annotation` | Add or update a custom property across every placed unit of a component. |
 | `replace_component` | Replace every placed unit's `lib_id` while preserving and validating its unit number. |
 | `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library". Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set. |

@@ -351,7 +351,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The binary contains 227 raw implementations. Policy disables 33, leaving 194
+The binary contains 228 raw implementations. Policy disables 33, leaving 195
 exposed raw tools; seven guarded workflow tools form a separate surface.
 `exposure_profile` selects the process-wide contract:
 
@@ -369,7 +369,7 @@ default. Instead:
 - **Error recovery**: if the LLM calls an unloaded tool, `handler.rs` returns an actionable error naming the toolset that owns it (so the LLM can load it and retry in one hop — no extra `list_toolboxes` round-trip).
 - **`auto_load_toolsets` (config key, default `false`)**: when set, a miss in `dispatch_tool` loads the owning toolset and executes the call in the same hop instead of returning `toolset_not_loaded` -- fewer round trips, at the cost of toolsets accumulating monotonically for the rest of the session (`unload_toolset` still prunes, but a tool call reloads its toolset right back). Off by default because the router's whole point is keeping `tools/list` small; turn it on only if your client would rather eat the context growth than handle one recoverable error per miss. Set via `konnect.toml`/`settings.json` (`auto_load_toolsets = true`) or the equivalent `ServerConfig` field when embedding.
 
-- **`eager_toolsets` (config key, default `false`)**: in Legacy or Expert, pre-loads every exposed raw toolset at startup via `ToolRouter::load_all`, so the *first* `tools/list` is complete for that profile (200 and 207 tools respectively). This is for MCP clients that cache the initial tool list and never act on `notifications/tools/list_changed`. It does not affect Workflow, which has no raw router.
+- **`eager_toolsets` (config key, default `false`)**: in Legacy or Expert, pre-loads every exposed raw toolset at startup via `ToolRouter::load_all`, so the *first* `tools/list` is complete for that profile (201 and 208 tools respectively). This is for MCP clients that cache the initial tool list and never act on `notifications/tools/list_changed`. It does not affect Workflow, which has no raw router.
 
 The router is defined in `crates/konnect-core/src/router/mod.rs`.
 
@@ -436,10 +436,10 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **227 raw implementations, 194 exposed raw tools** across 20 toolsets; 33 raw implementations are intentionally disabled
+- **228 raw implementations, 195 exposed raw tools** across 20 toolsets; 33 raw implementations are intentionally disabled
 - 7 guarded workflow tools + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
 - Starter `tools/list`: Legacy 18 tools; Expert 25 tools; Workflow 9 tools
-- Legacy full: 200 tools; Expert full: 207 tools; Workflow: 9 tools
+- Legacy full: 201 tools; Expert full: 208 tools; Workflow: 9 tools
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands.

@@ -13,7 +13,7 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**227 raw implementations: 194 exposed across 20 on-demand toolsets, plus 7 guarded workflow tools.**
+**228 raw implementations: 195 exposed across 20 on-demand toolsets, plus 7 guarded workflow tools.**
 Schematic capture, PCB layout and routing, ERC/DRC, design-review audits,
 reference circuits, and a manufacturing export pipeline — with bundled
 namespaced skills and safety hooks that teach supported KiCAD conventions out
@@ -95,9 +95,9 @@ through its own S-expression engine with atomic writes (write, fsync, rename), U
 preservation, and round-trip tests — no third-party schematic library with known
 gaps, no text-manipulation workarounds.
 
-**Context economy is a feature.** The 227 raw implementations include 33 that
+**Context economy is a feature.** The 228 raw implementations include 33 that
 are intentionally disabled because they do not meet the fork's current safety
-or workflow policy. Of the 194 exposed raw tools, Konnect's router loads only a
+or workflow policy. Of the 195 exposed raw tools, Konnect's router loads only a
 starter kit and lets the model pull in toolsets on demand. Guarded workflows
 add an explicit inspect → plan → apply → verify lifecycle, while built-in
 observability (`get_recent_calls`, `server_stats`, JSONL call logs) lets the

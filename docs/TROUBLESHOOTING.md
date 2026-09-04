@@ -253,7 +253,7 @@ callable tools, the fix is to make the *first* listing complete:
 
 in `konnect.toml` in the working directory, or a `settings.json` beside the
 binary. Every exposed raw toolset is then loaded at startup, so the first
-`tools/list` carries 200 tools in Legacy or 207 in Expert.
+`tools/list` carries 201 tools in Legacy or 208 in Expert.
 
 It is off by default because it costs what the router exists to save: roughly
 the full catalogue instead of the 18-tool Legacy or 25-tool Expert starter.

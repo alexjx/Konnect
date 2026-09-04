@@ -379,6 +379,38 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_update_symbols_from_library(args, ctx).await }
         ),
         tool!(
+            "set_schematic_field_positions",
+            "Atomically place visible Reference or Value fields at explicit absolute sheet \
+             coordinates without moving their symbols. Validates every target before writing; \
+             a reference with multiple placed units requires `unit`. Render and run the field-\
+             spacing audit after applying page-level field placement.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "edits": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reference": { "type": "string" },
+                                "unit": { "type": "integer", "minimum": 1 },
+                                "field": { "type": "string", "enum": ["Reference", "Value"] },
+                                "x": { "type": "number" },
+                                "y": { "type": "number" },
+                                "rotation": { "type": "integer", "enum": [0, 90, 180, 270], "default": 0 }
+                            },
+                            "required": ["reference", "field", "x", "y"]
+                        }
+                    },
+                    "dry_run": { "type": "boolean", "default": false }
+                },
+                "required": ["schematic", "edits"]
+            }),
+            |args, ctx| async move { handle_set_schematic_field_positions(args, ctx).await }
+        ),
+        tool!(
             "reset_schematic_field_positions",
             "Move each placed symbol's Reference and Value text back to the position its \
              library definition anchors them at, carried through the symbol's own rotation \
@@ -2878,6 +2910,238 @@ fn set_property_at(prop: &mut cse::types::Property, x: f64, y: f64, rotation: f6
     true
 }
 
+#[derive(Clone)]
+struct FieldPlacement {
+    reference: String,
+    unit: Option<u32>,
+    field: String,
+    x: f64,
+    y: f64,
+    rotation: f64,
+}
+
+fn invalid_field_placement(field: impl Into<String>, reason: impl Into<String>) -> CallToolResult {
+    let field = field.into();
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidArgument {
+            field: field.clone(),
+            reason: reason.clone(),
+        },
+        format!("Argument '{field}' is invalid: {reason}"),
+    )
+}
+
+fn field_position(property: &cse::types::Property) -> Option<(f64, f64, f64)> {
+    let at = property
+        .sub_nodes
+        .iter()
+        .find(|node| node.tag() == Some("at"))
+        .and_then(cse::types::At::from_sexp)?;
+    Some((at.x, at.y, at.rotation.unwrap_or(0.0)))
+}
+
+async fn handle_set_schematic_field_positions(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let raw_edits = match require_array(args, "edits") {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) => return Ok(invalid_field_placement("edits", "must not be empty")),
+        Err(error) => return Ok(error),
+    };
+    let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+    let mut edits = Vec::with_capacity(raw_edits.len());
+    let mut seen = HashSet::new();
+
+    for (index, raw) in raw_edits.iter().enumerate() {
+        let path = format!("edits[{index}]");
+        let Some(object) = raw.as_object() else {
+            return Ok(invalid_field_placement(path, "must be an object"));
+        };
+        let Some(reference) = object
+            .get("reference")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(invalid_field_placement(
+                format!("{path}.reference"),
+                "must be a non-empty string",
+            ));
+        };
+        let Some(field @ ("Reference" | "Value")) =
+            object.get("field").and_then(serde_json::Value::as_str)
+        else {
+            return Ok(invalid_field_placement(
+                format!("{path}.field"),
+                "must be Reference or Value",
+            ));
+        };
+        let unit = match object.get("unit") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => match value
+                .as_u64()
+                .filter(|value| *value > 0 && *value <= u32::MAX as u64)
+            {
+                Some(value) => Some(value as u32),
+                None => {
+                    return Ok(invalid_field_placement(
+                        format!("{path}.unit"),
+                        "must be a positive integer",
+                    ))
+                }
+            },
+        };
+        let coordinate = |name: &str| {
+            object
+                .get(name)
+                .and_then(serde_json::Value::as_f64)
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    invalid_field_placement(format!("{path}.{name}"), "must be a finite number")
+                })
+        };
+        let x = match coordinate("x") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        let y = match coordinate("y") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        let rotation = match object.get("rotation") {
+            None | Some(serde_json::Value::Null) => 0.0,
+            Some(value) => match value.as_i64() {
+                Some(value @ (0 | 90 | 180 | 270)) => value as f64,
+                _ => {
+                    return Ok(invalid_field_placement(
+                        format!("{path}.rotation"),
+                        "must be 0, 90, 180, or 270",
+                    ))
+                }
+            },
+        };
+        if !seen.insert((reference.to_string(), unit, field.to_string())) {
+            return Ok(invalid_field_placement(
+                path,
+                format!("duplicates {reference}.{}.{field}", unit.unwrap_or(0)),
+            ));
+        }
+        edits.push(FieldPlacement {
+            reference: reference.to_string(),
+            unit,
+            field: field.to_string(),
+            x,
+            y,
+            rotation,
+        });
+    }
+
+    let mut schematic = cse::Schematic::load(&sch_path)?;
+    let mut targets = Vec::with_capacity(edits.len());
+    let mut resolved_targets = HashSet::new();
+    for edit in &edits {
+        let matches: Vec<usize> = schematic
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| symbol.reference() == Some(edit.reference.as_str()))
+            .filter(|(_, symbol)| edit.unit.is_none_or(|unit| symbol.unit == unit))
+            .map(|(index, _)| index)
+            .collect();
+        if matches.is_empty() {
+            return Ok(invalid_field_placement(
+                "edits",
+                format!("{} was not found", edit.reference),
+            ));
+        }
+        if matches.len() > 1 {
+            return Ok(invalid_field_placement(
+                "edits",
+                format!("{} has multiple units; specify unit", edit.reference),
+            ));
+        }
+        let symbol_index = matches[0];
+        let Some(property_index) = schematic.symbols[symbol_index]
+            .properties
+            .iter()
+            .position(|property| property.name == edit.field)
+        else {
+            return Ok(invalid_field_placement(
+                "edits",
+                format!("{}.{} does not exist", edit.reference, edit.field),
+            ));
+        };
+        if !resolved_targets.insert((symbol_index, property_index)) {
+            return Ok(invalid_field_placement(
+                "edits",
+                format!(
+                    "multiple selectors resolve to {}.{}.{}",
+                    edit.reference, schematic.symbols[symbol_index].unit, edit.field
+                ),
+            ));
+        }
+        targets.push((symbol_index, property_index));
+    }
+
+    let mut changed_count = 0usize;
+    let mut placements = Vec::with_capacity(edits.len());
+    for (edit, (symbol_index, property_index)) in edits.iter().zip(targets.iter().copied()) {
+        let symbol = &mut schematic.symbols[symbol_index];
+        let property = &mut symbol.properties[property_index];
+        let before = field_position(property);
+        let changed = set_property_at(property, edit.x, edit.y, edit.rotation);
+        if changed {
+            changed_count += 1;
+            symbol.fields_autoplaced = false;
+        }
+        placements.push(json!({
+            "reference": edit.reference,
+            "unit": symbol.unit,
+            "field": edit.field,
+            "before": before.map(|(x, y, rotation)| json!({"x": x, "y": y, "rotation": rotation})),
+            "after": {"x": edit.x, "y": edit.y, "rotation": edit.rotation},
+            "changed": changed
+        }));
+    }
+
+    if changed_count > 0 && !dry_run {
+        schematic.overwrite()?;
+        let written = cse::Schematic::load(&sch_path)?;
+        for edit in &edits {
+            let symbol = written
+                .symbols
+                .iter()
+                .find(|symbol| {
+                    symbol.reference() == Some(edit.reference.as_str())
+                        && edit.unit.is_none_or(|unit| symbol.unit == unit)
+                })
+                .ok_or_else(|| anyhow::anyhow!("readback lost {}", edit.reference))?;
+            let actual = symbol
+                .properties
+                .iter()
+                .find(|property| property.name == edit.field)
+                .and_then(field_position);
+            if actual != Some((edit.x, edit.y, edit.rotation)) {
+                anyhow::bail!(
+                    "field placement readback mismatch for {}.{}: {:?}",
+                    edit.reference,
+                    edit.field,
+                    actual
+                );
+            }
+        }
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "changed_count": changed_count,
+        "dry_run": dry_run,
+        "placements": placements,
+        "verified": !dry_run
+    })))
+}
+
 async fn handle_replace_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -3986,6 +4250,133 @@ mod tests {
         assert!(
             value.contains("(at 101.6 50.8 90)"),
             "Value must follow the rotated body: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_field_positions_is_atomic_dry_runnable_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("field-placement.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 2.032 0 90))\n      (property \"Value\" \"R\" (at 0 0 90))\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 101.6 50.8 180)\n    (unit 1)\n    (uuid \"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\")\n    (property \"Reference\" \"R1\" (at 101.6 54.61 180))\n    (property \"Value\" \"10k\" (at 101.6 46.99 180))\n  )\n)\n",
+        )
+        .unwrap();
+        let edits = json!([
+            {"reference":"R1","field":"Reference","x":101.6,"y":47.625,"rotation":0},
+            {"reference":"R1","field":"Value","x":101.6,"y":53.975,"rotation":0}
+        ]);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let dry = handle_set_schematic_field_positions(
+            &json!({"schematic":path.display().to_string(),"edits":edits,"dry_run":true}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &dry.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["changed_count"], 2);
+        assert_eq!(body["verified"], false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let applied = handle_set_schematic_field_positions(
+            &json!({"schematic":path.display().to_string(),"edits":edits}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!applied.is_error, "{applied:?}");
+        let schematic = cse::Schematic::load(&path).unwrap();
+        let symbol = schematic.symbols.by_reference("R1").unwrap();
+        assert_eq!(
+            field_position(
+                symbol
+                    .properties
+                    .iter()
+                    .find(|property| property.name == "Reference")
+                    .unwrap()
+            ),
+            Some((101.6, 47.625, 0.0))
+        );
+        assert_eq!(
+            field_position(
+                symbol
+                    .properties
+                    .iter()
+                    .find(|property| property.name == "Value")
+                    .unwrap()
+            ),
+            Some((101.6, 53.975, 0.0))
+        );
+    }
+
+    #[tokio::test]
+    async fn set_field_positions_refuses_duplicate_targets_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicate-field-placement.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols)\n)\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_set_schematic_field_positions(
+            &json!({
+                "schematic":path.display().to_string(),
+                "edits":[
+                    {"reference":"R1","field":"Reference","x":1,"y":2},
+                    {"reference":"R1","field":"Reference","x":3,"y":4}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn set_field_positions_refuses_selectors_that_resolve_to_the_same_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("resolved-duplicate-field-placement.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols)\n  (symbol\n    (lib_id \"Device:R\")\n    (at 10 10 0)\n    (unit 1)\n    (uuid \"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\")\n    (property \"Reference\" \"R1\" (at 10 8 0))\n    (property \"Value\" \"10k\" (at 10 12 0))\n  )\n)\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_set_schematic_field_positions(
+            &json!({
+                "schematic":path.display().to_string(),
+                "edits":[
+                    {"reference":"R1","field":"Reference","x":1,"y":2},
+                    {"reference":"R1","unit":1,"field":"Reference","x":3,"y":4}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn set_field_positions_schema_requires_explicit_targets() {
+        let schema = tools()
+            .into_iter()
+            .find(|tool| tool.name == "set_schematic_field_positions")
+            .unwrap()
+            .input_schema;
+        assert_eq!(schema["properties"]["edits"]["minItems"], 1);
+        assert_eq!(
+            schema["properties"]["edits"]["items"]["properties"]["field"]["enum"],
+            json!(["Reference", "Value"])
         );
     }
 

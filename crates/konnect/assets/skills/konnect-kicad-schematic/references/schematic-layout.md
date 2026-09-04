@@ -98,7 +98,37 @@ Do not place one label on every passive pin inside a small circuit.
 - A rendered page must be understandable at normal whole-page review scale;
   zooming in must not be required to identify which parts form one circuit.
 
-## 5. Power, ground and repeated pins
+## 5. Place Reference and Value as part of the circuit
+
+Reference and Value fields belong to the symbol's visual bounding box; they are
+not annotations to scatter after wiring. Their content is governed by the
+workspace and project design authority, not by this drawing skill.
+
+- Keep both fields visible for ordinary fitted components. Hide only fields
+  whose established symbol convention makes them non-user-facing, such as a
+  power symbol's generated reference.
+- Reference normally sits above the body and Value below it. When a narrow
+  vertical passive has wiring above and below, use one consistent side pair—
+  normally Reference to the right and Value to the left—instead of entering the
+  pin corridors.
+- Keep field text horizontal at normal reading scale unless a deliberate
+  vertical placement is materially clearer. A rotated or mirrored symbol does
+  not justify leaving its fields inverted or carrying them through the body.
+- Keep fields close enough that ownership is immediate, normally one 25–50 mil
+  placement step from the nearest body edge. Allow more space only to clear a
+  pin name or local wire; never let a field appear to belong to a neighbor.
+- Reference and Value must not overlap each other, the symbol body, pin names,
+  pin numbers, labels, wires, or another component's fields.
+
+Use `set_schematic_field_positions` for reviewed page-specific placement. It
+accepts an atomic list of exact Reference/Value targets and absolute sheet
+coordinates. `reset_schematic_field_positions` only restores library anchors;
+it is not a layout solution when rotation, mirroring, or local wiring makes
+those anchors unreadable. After placement, run `check_schematic_field_spacing`
+and inspect the rendered page. Resolve every real collision; investigate audit
+geometry that disagrees with the rendering rather than ignoring it silently.
+
+## 6. Power, ground and repeated pins
 
 Use the project's consistent power/global labels at points of use instead of
 page-spanning supply or ground rails. A `PWR_FLAG` is only an ERC assertion on
@@ -126,7 +156,7 @@ NC pins may be omitted from a symbol only when the exact symbol/footprint
 contract and project library policy allow it; otherwise retain them with their
 correct no-connect type or markers.
 
-## 6. Dense controllers and modules
+## 7. Dense controllers and modules
 
 For an MCU or radio module, keep only genuinely local support circuits directly
 wired at the symbol: supply/decoupling, enable/reset timing, required strap
@@ -138,7 +168,7 @@ edge order. UART, I2C, SPI, analog inputs, strap pins and ordinary GPIOs should
 form readable groups. Equivalent ground and supply pads should be stacked or
 collected compactly as described above.
 
-## 7. Visual acceptance before ERC
+## 8. Visual acceptance before ERC
 
 Render every changed page and reject it before ERC if any of these are true:
 

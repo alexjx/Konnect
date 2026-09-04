@@ -608,13 +608,13 @@ mod exposure_profile_tests {
             listed_names(&handler(ExposureProfile::Legacy, true).await)
                 .await
                 .len(),
-            200
+            201
         );
         assert_eq!(
             listed_names(&handler(ExposureProfile::Expert, true).await)
                 .await
                 .len(),
-            207
+            208
         );
         assert_eq!(
             listed_names(&handler(ExposureProfile::Workflow, true).await)

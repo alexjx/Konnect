@@ -245,8 +245,8 @@ mod tests {
             .map(|meta| registry::tools_for(meta.name).unwrap().len())
             .sum();
 
-        assert_eq!(implemented, 227, "unexpected implementation catalogue size");
-        assert_eq!(exposed, 194, "unexpected exposed raw tool count");
+        assert_eq!(implemented, 228, "unexpected implementation catalogue size");
+        assert_eq!(exposed, 195, "unexpected exposed raw tool count");
         assert_eq!(implemented - exposed, registry::DISABLED_TOOLS.len());
     }
 

@@ -76,10 +76,11 @@ ID from another server process as durable authorization.
 ## Raw tools for unsupported operations
 
 The guarded schematic schema currently supports existing-component edits and
-relative moves. Wiring, hierarchy, symbol creation/deletion, and other
-unsupported mutations require exposed raw tools in Legacy or Expert. Workflow
-has no raw router; report the capability gap instead of changing profiles or
-using a hidden implementation without user direction.
+relative moves. Wiring, hierarchy, symbol creation/deletion, explicit
+Reference/Value field placement, and other unsupported mutations require
+exposed raw tools in Legacy or Expert. Workflow has no raw router; report the
+capability gap instead of changing profiles or using a hidden implementation
+without user direction.
 
 For a supported raw operation, load only its toolset, inspect the exact file and
 targets, take a snapshot when rollback matters, invoke the smallest atomic or
