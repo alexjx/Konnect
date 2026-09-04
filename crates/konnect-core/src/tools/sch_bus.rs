@@ -25,8 +25,8 @@ use crate::tools::{get_path, opt_f64, opt_str, require_f64, ToolContext, ToolDef
 use konnect_sexp::{
     parser::parse_sexp,
     schematic::{
-        extract_symbol_instances, format_bus, format_bus_entry, format_net_label,
-        horizontal_label_rotation, pin_endpoint, pin_outward_direction, BusEntryDirection,
+        extract_symbol_instances, format_bus, format_bus_entry, format_net_label, pin_endpoint,
+        pin_outward_direction, wire_end_label_rotation, BusEntryDirection,
     },
     writer::{write_atomic, write_atomic_if_unchanged},
 };
@@ -405,7 +405,7 @@ async fn handle_connect_pins_to_bus(
             continue;
         };
         let label_rotation = match direction_from_to(other, entry) {
-            Ok(direction) => horizontal_label_rotation(direction),
+            Ok(direction) => wire_end_label_rotation(direction),
             Err(error) => {
                 errors.push(format!("{reference} pin {pin_number}: {error}"));
                 continue;

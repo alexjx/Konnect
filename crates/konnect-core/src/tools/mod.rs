@@ -645,7 +645,7 @@ pub(crate) struct StubDirection {
 /// `"auto"` follows `outward`, falling back to `"right"` — the default before
 /// `"auto"` existed — when the caller could not determine one.
 pub(crate) fn stub_direction(direction: &str, outward: Option<f64>) -> StubDirection {
-    use konnect_sexp::schematic::horizontal_label_rotation;
+    use konnect_sexp::schematic::wire_end_label_rotation;
     let row = match direction {
         // Outward angles are snapped to quadrants, so this compares exactly.
         "auto" => outward.and_then(|d| STUB_DIRECTIONS.iter().find(|r| r.3 == d)),
@@ -656,7 +656,7 @@ pub(crate) fn stub_direction(direction: &str, outward: Option<f64>) -> StubDirec
         name: row.0,
         dx: row.1,
         dy: row.2,
-        label_rotation: horizontal_label_rotation(row.3),
+        label_rotation: wire_end_label_rotation(row.3),
     }
 }
 

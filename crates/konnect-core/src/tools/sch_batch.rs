@@ -16,8 +16,8 @@ use konnect_sexp::{
     geometry::{points_coincident, snap_point},
     schematic::{
         extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
-        find_lib_symbol, format_net_label, format_wire, pin_endpoint, pin_label_rotation,
-        pin_outward_direction, read_schematic, symbol_bounds_for_instance, SymbolBounds,
+        find_lib_symbol, format_net_label, format_wire, pin_endpoint, pin_outward_direction,
+        read_schematic, symbol_bounds_for_instance, wire_end_label_rotation, SymbolBounds,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
@@ -428,8 +428,8 @@ async fn handle_batch_connect_to_net(
             }
         };
         let (px, py) = pin_endpoint(&pin, t);
-        let rotation = pin_label_rotation(&pin, t);
         let outward = pin_outward_direction(&pin, t);
+        let rotation = wire_end_label_rotation(outward);
         let dir = crate::tools::stub_direction("auto", Some(outward));
         let label_x =
             crate::tools::sch_wiring::clean_coordinate(px + dir.dx * (2.0 * SCHEMATIC_GRID_MM));
@@ -2164,15 +2164,14 @@ mod connect_to_net_orientation_tests {
         );
     }
 
-    /// eeschema never turns a pin-anchored label sideways, whichever way a
-    /// vertical pin faces — see `pin_label_rotation`.
+    /// Vertical stub-end labels preserve the pin's full up/down direction.
     #[tokio::test]
-    async fn vertical_pins_keep_their_label_horizontal() {
+    async fn vertical_pins_keep_their_label_direction() {
         let (_d, path) = quad_schematic();
         let after = connect(&path, "TOP", "3").await;
-        assert_eq!(label_of(&after, "TOP").0, "100 87.3 0");
+        assert_eq!(label_of(&after, "TOP").0, "100 87.3 90");
         let after = connect(&path, "BOTTOM", "4").await;
-        assert_eq!(label_of(&after, "BOTTOM").0, "100 112.7 0");
+        assert_eq!(label_of(&after, "BOTTOM").0, "100 112.7 270");
     }
 
     /// Pins on one endpoint are already connected, so one label serves them

@@ -927,10 +927,18 @@ pub fn pin_label_rotation(pin: &LibPin, t: PinTransform) -> f64 {
     horizontal_label_rotation(pin_outward_direction(pin, t))
 }
 
+/// Preserve the complete four-way direction for a label at the free end of a
+/// wire stub. Unlike a label placed directly on a pin, a stub-end label has
+/// explicit approach geometry: folding an upward/downward endpoint to 0° puts
+/// the label on the wrong side of that vertical wire.
+pub fn wire_end_label_rotation(direction: f64) -> f64 {
+    direction.rem_euclid(360.0)
+}
+
 /// Keep a label's text horizontal: pass 0/180 through, fold 90/270 to 0.
 ///
-/// Shared with the wire-stub paths, whose `direction` argument can also ask
-/// for an up/down stub. See [`pin_label_rotation`] for the corpus evidence.
+/// This is for direct pin-label presentation only. Wire-stub endpoint labels
+/// use [`wire_end_label_rotation`] so up/down directions remain explicit.
 pub fn horizontal_label_rotation(direction: f64) -> f64 {
     if direction.rem_euclid(360.0) == 180.0 {
         180.0
@@ -1669,5 +1677,14 @@ mod pin_label_rotation_tests {
         assert_eq!(horizontal_label_rotation(90.0), 0.0);
         assert_eq!(horizontal_label_rotation(270.0), 0.0);
         assert_eq!(horizontal_label_rotation(-180.0), 180.0);
+    }
+
+    #[test]
+    fn wire_end_rotation_preserves_all_four_directions() {
+        assert_eq!(wire_end_label_rotation(0.0), 0.0);
+        assert_eq!(wire_end_label_rotation(90.0), 90.0);
+        assert_eq!(wire_end_label_rotation(180.0), 180.0);
+        assert_eq!(wire_end_label_rotation(270.0), 270.0);
+        assert_eq!(wire_end_label_rotation(-90.0), 270.0);
     }
 }

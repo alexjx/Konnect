@@ -15,8 +15,8 @@ use konnect_sexp::{
     parser::parse_sexp,
     schematic::{
         extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
-        format_junction, format_wire, horizontal_label_rotation, parse_at, pin_endpoint,
-        pin_outward_direction, read_schematic, Wire,
+        format_junction, format_wire, parse_at, pin_endpoint, pin_outward_direction,
+        read_schematic, wire_end_label_rotation, Wire,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
@@ -776,7 +776,7 @@ fn label_rotation_from_geometry(
     anchor: (f64, f64),
 ) -> anyhow::Result<Option<f64>> {
     if let Some(outward) = crate::tools::pin_outward_at(tree, anchor.0, anchor.1) {
-        return Ok(Some(horizontal_label_rotation(outward)));
+        return Ok(Some(wire_end_label_rotation(outward)));
     }
     if crate::tools::all_pin_endpoints(tree)
         .iter()
@@ -799,7 +799,7 @@ fn label_rotation_from_geometry(
             None
         };
         if let Some(other) = other {
-            let rotation = horizontal_label_rotation(direction_from_to(other, anchor)?);
+            let rotation = wire_end_label_rotation(direction_from_to(other, anchor)?);
             if !rotations.contains(&rotation) {
                 rotations.push(rotation);
             }
@@ -3241,6 +3241,48 @@ mod unit_aware_wiring_tests {
     }
 
     #[tokio::test]
+    async fn raw_labels_derive_up_and_down_from_vertical_wire_ends() {
+        let (_d, path) = bare_schematic();
+        handle_batch_add_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "wires": [
+                    { "x1": 50.8, "y1": 55.88, "x2": 50.8, "y2": 50.8 },
+                    { "x1": 60.96, "y1": 60.96, "x2": 60.96, "y2": 66.04 }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        handle_add_net_label(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "UP", "x": 50.8, "y": 50.8, "rotation": 0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        handle_add_net_label(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "DOWN", "x": 60.96, "y": 66.04, "rotation": 0,
+                "label_type": "global_label"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("(at 50.8 50.8 90)"), "{after}");
+        assert!(after.contains("(justify left bottom)"), "{after}");
+        assert!(after.contains("(at 60.96 66.04 270)"), "{after}");
+        assert!(after.contains("(justify right)"), "{after}");
+    }
+
+    #[tokio::test]
     async fn coordinate_connection_recognizes_a_symbol_pin_and_keeps_its_stub() {
         let (_d, path) = single_pin_schematic();
         let result = handle_add_schematic_connection(
@@ -3687,10 +3729,11 @@ mod unit_aware_wiring_tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
-    /// A vertical stub keeps its text horizontal: of 2562 wire-anchored labels
-    /// in the KiCad demos, only ~1% are rotated 90 or 270.
+    /// A label at a vertical stub end preserves that up/down direction. Folding
+    /// it to 0° is the screenshot defect: its anchor faces sideways even though
+    /// the only wire reaching it is vertical.
     #[tokio::test]
-    async fn a_vertical_stub_keeps_its_label_horizontal() {
+    async fn a_vertical_stub_preserves_its_downward_label_direction() {
         let (_d, path) = dual_opamp_schematic();
         let after = connect_to_net(
             &path,
@@ -3698,7 +3741,21 @@ mod unit_aware_wiring_tests {
                     "direction": "down" }),
         )
         .await;
-        assert!(after.contains("(at 50 52.54 0)"), "{after}");
+        assert!(after.contains("(at 50 52.54 270)"), "{after}");
+        assert!(after.contains("(justify right bottom)"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn a_vertical_global_label_preserves_its_upward_direction() {
+        let (_d, path) = dual_opamp_schematic();
+        let after = connect_to_net(
+            &path,
+            json!({ "pin_x": 50.0, "pin_y": 50.0, "net": "VHEAT",
+                    "direction": "up", "label_type": "global_label" }),
+        )
+        .await;
+        assert!(after.contains("(at 50 47.46 90)"), "{after}");
+        assert!(after.contains("(justify left)"), "{after}");
     }
 
     /// Coordinates still work, and a bare point falls back to the old default.
