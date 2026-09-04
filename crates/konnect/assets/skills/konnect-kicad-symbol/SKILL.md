@@ -65,10 +65,12 @@ Do not create the symbol until this contract is complete.
 
 Use the smallest supported Konnect operation. Snapshot a shared library before a
 write and search workspace references to understand impact. `create_symbol`
-appends a new symbol; it is not permission to overwrite an existing qualified
-name. Preserve a qualified official symbol's verified representation of
-equivalent pads, including a visible anchor pin with hidden passive pins at the
-same connection point. For a custom symbol with many equivalent pads, this
+refuses a duplicate name by default. Use `replace_existing: true` only for an
+explicitly reviewed replacement; it atomically collapses any legacy duplicate
+definitions to the one requested definition. Preserve a qualified official
+symbol's verified representation of equivalent pads, including a visible anchor
+pin with hidden passive pins at the same connection point. For a custom symbol
+with many equivalent pads, this
 co-located representation is also acceptable—and normally clearer than a comb
 of repeated visible pins—when every physical pad remains auditable.
 
@@ -79,6 +81,13 @@ visible-anchor form, give the anchor and every equivalent physical pin the same
 resolved overlap after body sizing and reports each pin's final `x`, `y`, and
 `hidden` state. A standalone hidden `no_connect` pin is also supported. Do not
 use hidden standalone power pins or assume hidden pins create global nets.
+
+KiCad 10 connector pin swapping is unconstrained PCB reassignment rather than a
+symbol-level swap-group property. For intentionally interchangeable connector
+pins, use identical neutral names and the same passive electrical type, record
+the equivalence in the symbol name/description and design authority, and keep
+the schematic nets plus final board polarity explicit. Do not invent swap-group
+metadata that KiCad does not preserve.
 
 If another required feature cannot be represented by exposed Konnect tools,
 stop and report the capability gap instead of text-editing the library.

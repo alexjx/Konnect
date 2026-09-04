@@ -19,6 +19,10 @@ unstated page architecture.
 For any placement or wiring work, also read
 [references/schematic-layout.md](references/schematic-layout.md). Its normal
 schematic grammar is an acceptance gate, not optional polish after ERC.
+Before placing individual parts, define the usable page area, assign every
+functional block a region, name its primary component, and estimate the block's
+required bounding box. Place those primary components as page-level anchors
+before arranging any support parts.
 
 Start by inspecting maintained schematics, block-design documents, layout
 standards, and shared application circuits already present in the workspace.
@@ -89,10 +93,12 @@ unless the user explicitly accepts partial completion.
 - Treat the current schematic as authoritative. Keep edits surgical and
   preserve unrelated pages, objects, annotations, and user placement. Do not
   regenerate, reflow, or normalize existing work without explicit scope.
-- For new layout, arrange each functional chain in a natural left-to-right row
-  that follows signal or power flow. Keep support parts near the component they
-  serve; short branches and uneven spacing are acceptable when they improve
-  clarity.
+- For new layout, plan the whole page before arranging individual parts. Size
+  functional regions from their estimated circuit bounding boxes rather than
+  scattering symbols into unused space. Arrange each functional chain in a
+  natural left-to-right row that follows signal or power flow. Keep support
+  parts near the primary component they serve; short branches and unequal
+  spacing are acceptable when they improve clarity.
 - Draw each *local functional cluster* as a complete connected circuit first.
   Use direct wires between a main device and the nearby parts that serve that
   exact function. Direct wiring is not a goal by itself: never stretch a wire

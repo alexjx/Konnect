@@ -3,7 +3,48 @@
 Read this reference before placing or wiring any schematic page. Electrical
 correctness is necessary but does not make an unreadable drawing acceptable.
 
-## 1. Plan local functional clusters
+## 1. Allocate the page before placing parts
+
+Treat the sheet as a finite composition, not as an empty coordinate plane. For
+an A4 page, first identify the usable area inside the drawing frame and title
+block. Then make a page plan before moving or adding individual symbols:
+
+1. List every functional block and name one primary component for each block.
+   This is normally the IC, module, power device, or connector that defines the
+   block's purpose. A passive network may use its first functional element as
+   the anchor when it has no IC.
+2. Estimate each block's required bounding box from the primary symbol, its
+   owned support parts, visible fields, local wiring, and labels. Do not size a
+   region from symbol origins alone.
+3. Partition the usable page into non-overlapping regions that follow system
+   power or signal flow. Size regions according to those estimated bounding
+   boxes rather than using an arbitrary equal grid.
+4. Place all primary components at stable anchors inside their assigned
+   regions. Inspect their transformed symbol bounds and the gaps between
+   regions before placing support parts.
+5. Place each support part relative to the bounding box of the primary device
+   or the pin group it serves. Use the smallest readable gap that leaves room
+   for fields and orthogonal wiring; do not use one universal coordinate offset
+   or leave a part floating merely because space exists.
+
+Connect and finish one region at a time. Prefer complete direct connections
+inside the region while they remain short and do not cross. When a connection
+must leave its region, cross an unrelated path, or create a long route, end it
+with a descriptive label on a short stub. This decision is made after the
+regional placement is sound, not as a substitute for placement.
+
+Render once after placing the primary anchors and again after completing each
+block. Reject a layout when blocks spill into one another, unexplained empty
+space separates owned parts, or a block has no clear visual center. If the
+estimated blocks do not fit legibly on A4, compact or reallocate the regions;
+if that still fails, split the page rather than shrinking the drawing below
+normal review readability.
+
+Use Konnect's symbol-bound and schematic-layout inspection tools when
+available. Final acceptance is based on the rendered page because numeric
+origins alone do not include fields, pin names, and wire corridors.
+
+## 2. Plan local functional clusters
 
 Partition each page into small circuits that can be reviewed independently,
 such as an input-protection path, converter power stage, feedback divider,
@@ -25,7 +66,7 @@ Arrange the page so that:
 Do not distribute one functional cluster across the page merely to fill space.
 Whitespace separates clusters; it is not a corridor for long wires.
 
-## 2. Choose wires or labels by relationship
+## 3. Choose wires or labels by relationship
 
 Use a direct wire when both endpoints belong to the same local cluster and the
 route remains short and obvious. The wire should show the local circuit, not
@@ -43,7 +84,7 @@ Move or rotate parts before introducing a label when they belong to the same
 cluster. Do not draw a long wrap-around wire to preserve direct connectivity.
 Do not place one label on every passive pin inside a small circuit.
 
-## 3. Draw unambiguous local wiring
+## 4. Draw unambiguous local wiring
 
 - Use the schematic connection grid consistently; prefer orthogonal segments.
 - Minimize bends, crossings and junctions. Prefer T-junctions; avoid four-way
@@ -57,7 +98,7 @@ Do not place one label on every passive pin inside a small circuit.
 - A rendered page must be understandable at normal whole-page review scale;
   zooming in must not be required to identify which parts form one circuit.
 
-## 4. Power, ground and repeated pins
+## 5. Power, ground and repeated pins
 
 Use the project's consistent power/global labels at points of use instead of
 page-spanning supply or ground rails. A `PWR_FLAG` is only an ERC assertion on
@@ -85,7 +126,7 @@ NC pins may be omitted from a symbol only when the exact symbol/footprint
 contract and project library policy allow it; otherwise retain them with their
 correct no-connect type or markers.
 
-## 5. Dense controllers and modules
+## 6. Dense controllers and modules
 
 For an MCU or radio module, keep only genuinely local support circuits directly
 wired at the symbol: supply/decoupling, enable/reset timing, required strap
@@ -97,7 +138,7 @@ edge order. UART, I2C, SPI, analog inputs, strap pins and ordinary GPIOs should
 form readable groups. Equivalent ground and supply pads should be stacked or
 collected compactly as described above.
 
-## 6. Visual acceptance before ERC
+## 7. Visual acceptance before ERC
 
 Render every changed page and reject it before ERC if any of these are true:
 

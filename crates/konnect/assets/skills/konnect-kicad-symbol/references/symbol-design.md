@@ -155,8 +155,10 @@ directions:
 1. Inspect project authority, shared library index and existing references.
 2. Load only the Konnect `library` toolset; search exact candidates.
 3. Read the chosen candidate and build the pin-contract comparison.
-4. If creation is necessary, snapshot the target shared library and append one
-   new, uniquely named symbol with `create_symbol`.
+4. If creation is necessary, snapshot the target shared library and add one new,
+   uniquely named symbol with `create_symbol`. Existing names are refused unless
+   the reviewed request explicitly sets `replace_existing: true`; replacement
+   is atomic and removes legacy duplicate definitions of that exact name.
 5. Read it back with `get_symbol_info`; compare all pins and properties.
 6. Register the library only if needed; do not silently replace a nickname.
 7. Place the symbol in a schematic, connect representative nets, render and run
@@ -173,6 +175,14 @@ coordinates and visibility. `get_symbol_info` also reports `hidden` for every
 pin. Standalone hidden `no_connect` pins are supported; standalone hidden power
 pins remain prohibited by this workflow because their connectivity is easy to
 misread.
+
+KiCad 10 does not store a constrained per-symbol swap group for PCB pin
+reassignment. When two connector contacts are physically and electrically safe
+to exchange, represent both as same-name passive pins, state the intended
+equivalence in maintained metadata, and let PCB pin swapping/back-annotation
+choose the assignment. This never makes positive and ground interchangeable in
+the finished design: the schematic net, board copper, silk, harness and physical
+connector orientation must still agree.
 
 Selecting and preserving a qualified official symbol does not require
 re-authoring its native or co-located pin representation. For a new custom

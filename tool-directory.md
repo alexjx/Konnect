@@ -337,7 +337,7 @@ and Workflow expose them; Legacy does not. A supported mutation follows
 | `set_footprint_models` | Atomically append, replace, or delete one or more top-level 3D model blocks with optional offset, scale, and rotation transforms. |
 | `register_footprint_library` | Register a local footprint library directory in the KiCAD global or project library table. Set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |
-| `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library, including hidden pins and a verified one-visible-anchor plus co-located-hidden-passive representation for equivalent pads. |
+| `create_symbol` | Create a KiCad schematic symbol in a `.kicad_sym` library, including default footprint/description metadata, hidden pins, and a verified one-visible-anchor plus co-located-hidden-passive representation for equivalent pads. Existing names are refused by default; explicit atomic replacement also collapses legacy duplicate definitions. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |

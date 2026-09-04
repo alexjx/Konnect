@@ -244,7 +244,9 @@ pub fn tools() -> Vec<ToolDef> {
              glyph, pins auto-place by their `type` (inputs left in the order listed top-to- \
              bottom, output right, power top/bottom) and their x/y are ignored. Pin definitions \
              may set `hidden: true`; equivalent physical pads can share one connection point by \
-             keeping one visible anchor and co-locating hidden passive pins with it.",
+             keeping one visible anchor and co-locating hidden passive pins with it. Refuses an \
+             existing name unless `replace_existing` is explicitly true; replacement is atomic \
+             and collapses any legacy duplicate definitions to one.",
             json!({
                 "type": "object",
                 "properties": {
@@ -252,7 +254,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "name": { "type": "string", "description": "Symbol name" },
                     "reference_prefix": { "type": "string", "description": "Default reference prefix (e.g. 'U')" },
                     "value": { "type": "string", "description": "Default value string" },
+                    "footprint": { "type": "string", "description": "Default Footprint library identifier (default empty)" },
                     "datasheet": { "type": "string", "description": "Datasheet URL or path (default empty). A '~' is written as an empty string — carrying it fails ERC's library-match check." },
+                    "description": { "type": "string", "description": "Symbol description (default empty)" },
                     "glyph": {
                         "type": "string",
                         "enum": ["rectangle", "opamp", "buffer", "inverter", "schmitt", "schmitt_inverter", "and", "nand", "or", "nor", "xor", "xnor"],
@@ -265,6 +269,11 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "show_pin_names": { "type": "boolean", "description": "Show pin names on the symbol (default true).", "default": true },
                     "show_pin_numbers": { "type": "boolean", "description": "Show pin numbers on the symbol (default true).", "default": true },
+                    "replace_existing": {
+                        "type": "boolean",
+                        "description": "Atomically replace an existing same-name definition. Default false; when true, all legacy duplicate definitions of that exact name are replaced by one new definition.",
+                        "default": false
+                    },
                     "units": {
                         "type": "array",
                         "description": "For MULTI-UNIT parts (dual/quad op-amps, gate banks, multi-bank connectors). Each element is one unit (becomes Unit A, B, C...) with its own pins and body. When given, `units` replaces `pins` (use `pins` for single-unit symbols instead). Each unit may set its own `glyph`, overriding the symbol-level default.",
@@ -3847,6 +3856,21 @@ struct BuiltUnit {
 }
 
 impl BuiltUnit {
+    /// Vertical drawing extent used to keep symbol-level fields clear of the
+    /// first unit. The body alone is insufficient when a visible pin enters
+    /// from the top or bottom: its connection endpoint lies outside the body
+    /// and a field anchored there overlaps the pin number and wire.
+    fn visible_vertical_extent(&self) -> Option<(f64, f64)> {
+        let mut extent = self.rect.map(|(_, min_y, _, max_y)| (min_y, max_y));
+        for pin in self.pins.iter().filter(|pin| !pin.hidden) {
+            extent = Some(match extent {
+                Some((min_y, max_y)) => (min_y.min(pin.y), max_y.max(pin.y)),
+                None => (pin.y, pin.y),
+            });
+        }
+        extent
+    }
+
     /// A per-unit summary of the auto-size override, or `None` when nothing
     /// moved. Per pin would be a dozen lines of noise on a normal symbol, and a
     /// glyph unit moves every pin by design.
@@ -3896,6 +3920,7 @@ async fn handle_create_symbol(
         Err(e) => return Ok(e),
     };
     let value_str = args["value"].as_str().unwrap_or(name);
+    let footprint = args["footprint"].as_str().unwrap_or("");
     // `~` is KiCAD's legacy "no datasheet" placeholder. Its library loader
     // normalises it to the empty string and its schematic lib_symbols loader
     // does not, so a symbol carrying `~` never matches its own library copy in
@@ -3904,8 +3929,21 @@ async fn handle_create_symbol(
         "~" => "",
         s => s,
     };
+    let description = args["description"].as_str().unwrap_or("");
     let show_names = args["show_pin_names"].as_bool().unwrap_or(true);
     let show_numbers = args["show_pin_numbers"].as_bool().unwrap_or(true);
+    let replace_existing = match args.get("replace_existing") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => {
+                return Ok(invalid_library_argument(
+                    "replace_existing",
+                    "must be a boolean when supplied",
+                ))
+            }
+        },
+    };
 
     // Optional conventional body shape. `glyph` may be set at the symbol level
     // (a default for every unit) and/or per unit (overriding the default).
@@ -3933,7 +3971,7 @@ async fn handle_create_symbol(
 
     let mut units_sexp = String::new();
     let unit_count: usize;
-    let ref_body: SymbolRect;
+    let field_extent: Option<(f64, f64)>;
     if unit_objs.is_empty() {
         let pins_val = args["pins"].as_array().cloned().unwrap_or_default();
         // A single-unit triangular glyph (op-amp/buffer/inverter/schmitt) has no
@@ -3961,7 +3999,8 @@ async fn handle_create_symbol(
             warnings.extend(unit1.warning.clone());
             warnings.extend(unit1.displacement_warning("unit 1"));
             units_report.push(unit1.to_json(1));
-            let (inner1, body1) = (unit1.sexp, unit1.rect);
+            field_extent = unit1.visible_vertical_extent();
+            let inner1 = unit1.sexp;
             units_sexp.push_str(&format!("\n    (symbol \"{}_1_1\"{}\n    )", name, inner1));
             // Unit 2: a rectangular power unit.
             let power_laid = layout_power_unit(&power);
@@ -3975,7 +4014,6 @@ async fn handle_create_symbol(
             let inner2 = unit2.sexp;
             units_sexp.push_str(&format!("\n    (symbol \"{}_2_1\"{}\n    )", name, inner2));
             unit_count = 2;
-            ref_body = body1;
         } else {
             // Single unit: body + all pins live in NAME_0_1 (unchanged behavior).
             let unit = match build_symbol_unit(&pins_val, sym_glyph, show_names) {
@@ -3985,10 +4023,10 @@ async fn handle_create_symbol(
             warnings.extend(unit.warning.clone());
             warnings.extend(unit.displacement_warning("unit 1"));
             units_report.push(unit.to_json(1));
-            let (inner, body) = (unit.sexp, unit.rect);
+            field_extent = unit.visible_vertical_extent();
+            let inner = unit.sexp;
             units_sexp.push_str(&format!("\n    (symbol \"{}_0_1\"{}\n    )", name, inner));
             unit_count = 1;
-            ref_body = body;
         }
     } else {
         // Multi-unit: each signal unit is NAME_1_1..NAME_N_1, and the power
@@ -3997,7 +4035,7 @@ async fn handle_create_symbol(
         // the four gates as units 1..4 and VCC/GND as unit 5). It means the
         // power pins appear on exactly one placed unit instead of on every
         // unit, where each duplicate would otherwise need wiring to pass ERC.
-        let mut first_body: SymbolRect = None;
+        let mut first_field_extent = None;
         for (i, u) in unit_objs.iter().enumerate() {
             let unit_pins = u["pins"].as_array().cloned().unwrap_or_default();
             // A per-unit `glyph` overrides the symbol-level default.
@@ -4024,10 +4062,10 @@ async fn handle_create_symbol(
             }
             warnings.extend(unit.displacement_warning(&format!("unit {}", i + 1)));
             units_report.push(unit.to_json(i + 1));
-            let (inner, body) = (unit.sexp, unit.rect);
             if i == 0 {
-                first_body = body;
+                first_field_extent = unit.visible_vertical_extent();
             }
+            let inner = unit.sexp;
             units_sexp.push_str(&format!(
                 "\n    (symbol \"{}_{}_1\"{}\n    )",
                 name,
@@ -4052,12 +4090,13 @@ async fn handle_create_symbol(
             ));
         }
         unit_count = total;
-        ref_body = first_body;
+        field_extent = first_field_extent;
     }
 
-    // Reference/value placement above/below the (first) unit body (Y-up).
-    let (ref_y, value_y) = match ref_body {
-        Some((_, min_y, _, max_y)) => (max_y + 2.54, min_y - 2.54),
+    // Reference/value placement above/below the first unit's complete visible
+    // vertical extent (Y-up), including top/bottom pin endpoints.
+    let (ref_y, value_y) = match field_extent {
+        Some((min_y, max_y)) => (max_y + 2.54, min_y - 2.54),
         None => (2.54, -2.54),
     };
 
@@ -4081,14 +4120,16 @@ async fn handle_create_symbol(
         format!(
             "\n    (property \"{name}\" \"{value}\" (at 0 {y:.4} 0) \
              (show_name no) (do_not_autoplace no) \
-             (effects (font (size 1.27 1.27))))"
+             (effects (font (size 1.27 1.27))))",
+            value = escape_library_string(value)
         )
     };
     let hidden_property = |name: &str, value: &str| {
         format!(
             "\n    (property \"{name}\" \"{value}\" (at 0 0 0) \
              (show_name no) (do_not_autoplace no) (hide yes) \
-             (effects (font (size 1.27 1.27))))"
+             (effects (font (size 1.27 1.27))))",
+            value = escape_library_string(value)
         )
     };
 
@@ -4099,9 +4140,9 @@ async fn handle_create_symbol(
         names,
         visible_property("Reference", ref_prefix, ref_y),
         visible_property("Value", value_str, value_y),
-        hidden_property("Footprint", ""),
+        hidden_property("Footprint", footprint),
         hidden_property("Datasheet", datasheet),
-        hidden_property("Description", ""),
+        hidden_property("Description", description),
         units_sexp
     );
 
@@ -4124,9 +4165,55 @@ async fn handle_create_symbol(
             .to_string()
     };
 
-    // Insert before closing paren of root expression
-    let insert_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = format!("{}{}\n)", &content[..insert_pos], symbol_sexp);
+    let matching_ranges: Vec<(usize, usize)> =
+        find_direct_child_blocks(&content, "kicad_symbol_lib")
+            .into_iter()
+            .filter(|(start, end)| {
+                parse_sexp(&content[*start..*end])
+                    .ok()
+                    .filter(|node| node.head() == Some("symbol"))
+                    .and_then(|node| node.get(1).and_then(SexpNode::as_str).map(str::to_owned))
+                    .as_deref()
+                    == Some(name)
+            })
+            .collect();
+    if !matching_ranges.is_empty() && !replace_existing {
+        return Ok(invalid_library_argument(
+            "name",
+            format!(
+                "symbol '{name}' already exists; set replace_existing to true to replace it atomically"
+            ),
+        ));
+    }
+
+    // Remove every same-name top-level definition before inserting the new
+    // one. Older Konnect versions could append duplicate names, so explicit
+    // replacement also repairs those libraries in one atomic write.
+    let replaced_count = matching_ranges.len();
+    let mut content_without_matches = content;
+    for (start, end) in matching_ranges.into_iter().rev() {
+        let line_start = content_without_matches[..start]
+            .rfind('\n')
+            .map(|position| position + 1)
+            .unwrap_or(start);
+        let mut line_end = end;
+        if content_without_matches[line_end..].starts_with("\r\n") {
+            line_end += 2;
+        } else if content_without_matches[line_end..].starts_with('\n') {
+            line_end += 1;
+        }
+        content_without_matches.replace_range(line_start..line_end, "");
+    }
+
+    // Insert before closing paren of root expression.
+    let insert_pos = content_without_matches
+        .rfind(')')
+        .unwrap_or(content_without_matches.len());
+    let new_content = format!(
+        "{}{}\n)",
+        &content_without_matches[..insert_pos],
+        symbol_sexp
+    );
 
     if let Some(parent) = lib_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -4138,7 +4225,8 @@ async fn handle_create_symbol(
         "symbol": name,
         "library": lib_path.to_str().unwrap_or(""),
         "unit_count": unit_count,
-        "power_pin_count": power_pins.len()
+        "power_pin_count": power_pins.len(),
+        "replaced_count": replaced_count
     });
     result["units"] = json!(units_report);
     if !warnings.is_empty() {
@@ -6821,9 +6909,139 @@ mod tests {
             "KiCad 10 shows pin numbers by omitting the hide override"
         );
         assert!(
+            c.contains("(property \"Reference\" \"U\" (at 0 7.6200 0)"),
+            "horizontal-pin symbol reference anchor changed unexpectedly:\n{c}"
+        );
+        assert!(
+            c.contains("(property \"Value\" \"TEST_IC\" (at 0 -7.6200 0)"),
+            "horizontal-pin symbol value anchor changed unexpectedly:\n{c}"
+        );
+        assert!(
             konnect_sexp::parser::parse_sexp(&c).is_ok(),
             "generated symbol doesn't parse"
         );
+    }
+
+    #[tokio::test]
+    async fn create_symbol_keeps_fields_clear_of_vertical_pin_endpoints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("vertical-pin.kicad_sym");
+        let result = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "VERTICAL_PIN",
+                "reference_prefix": "J",
+                "pins": [
+                    {"number":"1","name":"PWR","type":"passive","x":7.62,"y":0.0,"angle":180,"length":2.54},
+                    {"number":"2","name":"PWR","type":"passive","x":0.0,"y":-7.62,"angle":90,"length":2.54}
+                ],
+                "show_pin_names": false
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let content = std::fs::read_to_string(&lib).unwrap();
+        assert!(
+            content.contains("(property \"Reference\" \"J\" (at 0 5.0800 0)"),
+            "reference should remain one pitch above the visible extent:\n{content}"
+        );
+        assert!(
+            content.contains("(property \"Value\" \"VERTICAL_PIN\" (at 0 -10.1600 0)"),
+            "value should sit one pitch below the bottom pin endpoint:\n{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_symbol_refuses_duplicate_name_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("duplicate.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "DUPLICATE",
+            "reference_prefix": "J",
+            "pins": [
+                {"number":"1","name":"PWR","type":"passive","x":3.81,"y":0.0,"angle":180}
+            ]
+        });
+        let first = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(!first.is_error);
+        let before = std::fs::read_to_string(&lib).unwrap();
+
+        let second = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(second.is_error);
+        assert!(result_text(&second).contains("already exists"));
+        assert_eq!(std::fs::read_to_string(&lib).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn create_symbol_explicit_replacement_collapses_legacy_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("replace.kicad_sym");
+        let original = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "REPLACE_ME",
+            "reference_prefix": "J",
+            "value": "OLD",
+            "pins": [
+                {"number":"1","name":"PWR","type":"passive","x":3.81,"y":0.0,"angle":180}
+            ]
+        });
+        assert!(
+            !handle_create_symbol(&original, &test_ctx())
+                .await
+                .unwrap()
+                .is_error
+        );
+
+        // Reproduce a library written by the legacy append-only behavior.
+        let once = std::fs::read_to_string(&lib).unwrap();
+        let block = find_direct_child_blocks(&once, "kicad_symbol_lib")
+            .into_iter()
+            .find_map(|(start, end)| {
+                let node = parse_sexp(&once[start..end]).ok()?;
+                (node.head() == Some("symbol") && node.get(1)?.as_str()? == "REPLACE_ME")
+                    .then(|| once[start..end].to_string())
+            })
+            .unwrap();
+        let insert = once.rfind(')').unwrap();
+        std::fs::write(&lib, format!("{}\n  {}\n)", &once[..insert], block)).unwrap();
+
+        let replacement = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "REPLACE_ME",
+            "reference_prefix": "J",
+            "value": "NEW",
+            "replace_existing": true,
+            "pins": [
+                {"number":"1","name":"PWR","type":"passive","x":3.81,"y":1.27,"angle":180},
+                {"number":"2","name":"PWR","type":"passive","x":3.81,"y":-1.27,"angle":180}
+            ]
+        });
+        let result = handle_create_symbol(&replacement, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let report: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(report["replaced_count"], 2);
+
+        let content = std::fs::read_to_string(&lib).unwrap();
+        let definitions = find_direct_child_blocks(&content, "kicad_symbol_lib")
+            .into_iter()
+            .filter(|(start, end)| {
+                parse_sexp(&content[*start..*end])
+                    .ok()
+                    .filter(|node| node.head() == Some("symbol"))
+                    .and_then(|node| node.get(1).and_then(SexpNode::as_str).map(str::to_owned))
+                    .as_deref()
+                    == Some("REPLACE_ME")
+            })
+            .count();
+        assert_eq!(definitions, 1);
+        assert!(content.contains("(property \"Value\" \"NEW\""));
+        parse_sexp(&content).expect("replacement must leave a valid symbol library");
     }
 
     #[test]
@@ -6846,6 +7064,7 @@ mod tests {
             schema["properties"]["power_pins"]["items"]["properties"]["hidden"]["type"],
             "boolean"
         );
+        assert_eq!(schema["properties"]["replace_existing"]["default"], false);
     }
 
     #[tokio::test]
@@ -7012,6 +7231,36 @@ mod tests {
                 "{output}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn create_symbol_writes_escaped_footprint_and_description() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("metadata.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "Metadata",
+            "reference_prefix": "J",
+            "value": "Connector \"qualified\"",
+            "footprint": "Connector_AMASS:AMASS_XT60-M_1x02_P7.20mm_Vertical",
+            "description": "Reusable connector \"contract\"",
+            "pins": [
+                {"number":"1","name":"PWR","type":"passive","x":3.81,"y":1.27,"angle":180}
+            ]
+        });
+
+        let result = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error);
+        let output = std::fs::read_to_string(&lib).unwrap();
+        assert!(output.contains("Connector \\\"qualified\\\""), "{output}");
+        assert!(
+            output.contains("Connector_AMASS:AMASS_XT60-M_1x02_P7.20mm_Vertical"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Reusable connector \\\"contract\\\""),
+            "{output}"
+        );
     }
 
     #[tokio::test]
