@@ -117,8 +117,11 @@ unless the user explicitly accepts partial completion.
 - Represent power rails and ground with the project's consistent power/global
   labels instead of drawing long rail wires through a block. A KiCad
   `PWR_FLAG`, when ERC genuinely needs an external-source declaration, is an
-  ERC-only assertion attached to the already labelled rail; it is not a visual
-  rail marker and never replaces the rail label.
+  ERC-only assertion, not a rail marker or a net name. Collect every
+  `PWR_FLAG` in a compact page-corner flag area and connect it by a short stub
+  to an explicit label naming the asserted rail. Put the matching label at the
+  real circuit node; never attach a flag directly to an anonymous device pin or
+  branch and rely on distant connectivity to explain it.
 - Prefer qualified official symbols whose pins are grouped by logical function
   rather than package edge order. For custom symbols, group interfaces together
   and put positive power at the top and ground at the bottom. Equivalent supply

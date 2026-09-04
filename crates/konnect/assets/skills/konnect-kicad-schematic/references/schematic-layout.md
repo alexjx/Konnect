@@ -132,7 +132,12 @@ geometry that disagrees with the rendering rather than ignoring it silently.
 
 Use the project's consistent power/global labels at points of use instead of
 page-spanning supply or ground rails. A `PWR_FLAG` is only an ERC assertion on
-an already named rail.
+an already named rail. Group all `PWR_FLAG` symbols in one compact, aligned
+page-corner area. Each flag uses a short local stub ending in an explicit label
+for the asserted net; use the label type appropriate to that net's scope. The
+real circuit node carries the matching label. Do not place a flag directly on
+an IC supply pin, converter output, or anonymous branch, and do not make the
+reviewer trace a distant wire to discover which net the flag asserts.
 
 Prefer logical symbols with positive power pins at the top, ground pins at the
 bottom, inputs/control on the left, outputs on the right, and related interfaces
