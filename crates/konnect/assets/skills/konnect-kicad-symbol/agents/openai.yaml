@@ -1,0 +1,4 @@
+interface:
+  display_name: "Konnect KiCad Symbol"
+  short_description: "Create and verify logical KiCad symbols"
+  default_prompt: "Use $konnect-kicad-symbol to search, create, and verify this KiCad symbol safely through Konnect MCP."

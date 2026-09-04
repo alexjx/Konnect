@@ -47,7 +47,7 @@ fn repository_root() -> PathBuf {
 }
 
 /// The fork deliberately replaced upstream's generic skills and standalone
-/// agents with four namespaced skills. Keep that product boundary executable:
+/// agents with five namespaced skills. Keep that product boundary executable:
 /// a future upstream integration must fail before any removed asset can be
 /// embedded or installed again.
 #[test]
@@ -58,6 +58,7 @@ fn intentional_removals_stay_absent_and_namespaced_skills_remain_present() {
         "konnect-kicad-package-audit",
         "konnect-kicad-pcb-layout",
         "konnect-kicad-schematic",
+        "konnect-kicad-symbol",
     ];
 
     let root = repository_root();

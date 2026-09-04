@@ -62,6 +62,31 @@ pub const SKILLS: &[SkillManifest] = &[
                     "../assets/skills/konnect-kicad-schematic/references/schematic-architecture.md"
                 ),
             ),
+            (
+                "references/schematic-layout.md",
+                include_str!(
+                    "../assets/skills/konnect-kicad-schematic/references/schematic-layout.md"
+                ),
+            ),
+        ],
+    },
+    SkillManifest {
+        name: "konnect-kicad-symbol",
+        files: &[
+            (
+                "SKILL.md",
+                include_str!("../assets/skills/konnect-kicad-symbol/SKILL.md"),
+            ),
+            (
+                "agents/openai.yaml",
+                include_str!("../assets/skills/konnect-kicad-symbol/agents/openai.yaml"),
+            ),
+            (
+                "references/symbol-design.md",
+                include_str!(
+                    "../assets/skills/konnect-kicad-symbol/references/symbol-design.md"
+                ),
+            ),
         ],
     },
     SkillManifest {
@@ -179,6 +204,15 @@ mod tests {
                     "SKILL.md",
                     "agents/openai.yaml",
                     "references/schematic-architecture.md",
+                    "references/schematic-layout.md",
+                ]),
+            ),
+            (
+                "konnect-kicad-symbol",
+                BTreeSet::from([
+                    "SKILL.md",
+                    "agents/openai.yaml",
+                    "references/symbol-design.md",
                 ]),
             ),
             (

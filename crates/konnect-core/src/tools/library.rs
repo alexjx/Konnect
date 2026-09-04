@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
-/// The pin-item object schema (number/name/type/style/x/y/angle/length) shared
+/// The pin-item object schema (number/name/type/style/x/y/angle/length/hidden) shared
 /// by `pins`, `units[].pins`, and `power_pins` in the create_symbol schema
 /// below. `type_desc` parameterizes the one wording difference between call
 /// sites. `require_xy` is false where a `glyph` may auto-place the pins (so x/y
@@ -54,7 +54,12 @@ fn pin_item_schema(type_desc: &str, require_xy: bool) -> serde_json::Value {
                 "description": "Starting position, not a fixed one — see `x`."
             },
             "angle": { "type": "number", "default": 0 },
-            "length": { "type": "number", "default": 2.54 }
+            "length": { "type": "number", "default": 2.54 },
+            "hidden": {
+                "type": "boolean",
+                "default": false,
+                "description": "Write this physical pin as hidden. To compact equivalent pads, give one visible anchor and co-locate the remaining hidden passive pins at the same x/y with the same angle, length and style. A standalone hidden no-connect pin is also valid. Hidden pins never imply a global connection."
+            }
         },
         "required": required
     })
@@ -237,7 +242,9 @@ pub fn tools() -> Vec<ToolDef> {
              gets a rectangular body sized to its pins; set `glyph` (symbol-level and/or per \
              unit) to draw a conventional op-amp triangle or logic-gate body instead. With a \
              glyph, pins auto-place by their `type` (inputs left in the order listed top-to- \
-             bottom, output right, power top/bottom) and their x/y are ignored.",
+             bottom, output right, power top/bottom) and their x/y are ignored. Pin definitions \
+             may set `hidden: true`; equivalent physical pads can share one connection point by \
+             keeping one visible anchor and co-locating hidden passive pins with it.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2787,6 +2794,7 @@ struct PinGeom {
     angle: f64,
     length: f64,
     name: String,
+    hidden: bool,
 }
 
 /// The point where a pin meets the symbol body. In KiCAD symbols the pin's
@@ -2923,6 +2931,9 @@ fn names_span(pins: &[PinGeom], axis: Axis) -> f64 {
     };
     let mut rows: std::collections::HashMap<i64, (f64, f64)> = std::collections::HashMap::new();
     for p in pins {
+        if p.hidden {
+            continue;
+        }
         let Some(edge) = pin_edge(p.angle).filter(|e| *e == a || *e == b) else {
             continue;
         };
@@ -3213,15 +3224,18 @@ fn emit_pin(
     name: &str,
     number: &str,
     name_font: f64,
+    hidden: bool,
 ) -> String {
+    let hidden_sexp = if hidden { "\n      (hide yes)" } else { "" };
     format!(
-        "\n    (pin {} {} (at {} {} {})\n      (length {})\n      (name \"{}\" (effects (font (size {} {}))))\n      (number \"{}\" (effects (font (size {} {}))))\n    )",
+        "\n    (pin {} {} (at {} {} {})\n      (length {}){}\n      (name \"{}\" (effects (font (size {} {}))))\n      (number \"{}\" (effects (font (size {} {}))))\n    )",
         pin_type,
         style,
         fmt_f64(x),
         fmt_f64(y),
         fmt_f64(angle),
         fmt_f64(length),
+        hidden_sexp,
         name,
         name_font,
         name_font,
@@ -3481,10 +3495,10 @@ fn build_glyph_unit(
 
     // Inputs map onto the glyph anchors in the caller's order (top-to-bottom).
     for (p, &(x, y, angle, length)) in inputs.iter().zip(geom.inputs.iter()) {
-        resolved.push(ResolvedPin::new(p, x, y));
         let number = p["number"].as_str().unwrap_or("1");
         let name = p["name"].as_str().unwrap_or("~");
         let style = pin_style_token(p["style"].as_str());
+        resolved.push(ResolvedPin::new(p, x, y, angle, length, style));
         sexp.push_str(&emit_pin(
             "input",
             style,
@@ -3495,6 +3509,7 @@ fn build_glyph_unit(
             name,
             number,
             GLYPH_PIN_NAME_TEXT,
+            p["hidden"].as_bool().unwrap_or(false),
         ));
     }
 
@@ -3510,7 +3525,7 @@ fn build_glyph_unit(
         None => "line",
     };
     let (ox, oy, oa, ol) = geom.output;
-    resolved.push(ResolvedPin::new(out, ox, oy));
+    resolved.push(ResolvedPin::new(out, ox, oy, oa, ol, out_style));
     sexp.push_str(&emit_pin(
         out_type,
         out_style,
@@ -3521,6 +3536,7 @@ fn build_glyph_unit(
         out_name,
         out_number,
         GLYPH_PIN_NAME_TEXT,
+        out["hidden"].as_bool().unwrap_or(false),
     ));
 
     // Power pins (e.g. a single op-amp's V+/V-) enter vertically, alternating
@@ -3538,7 +3554,7 @@ fn build_glyph_unit(
             let (ax, ay) = geom.power_bottom;
             (ax, ay - length, 90.0) // bulb below, root on the bottom edge
         };
-        resolved.push(ResolvedPin::new(p, x, y));
+        resolved.push(ResolvedPin::new(p, x, y, angle, length, style));
         sexp.push_str(&emit_pin(
             ptype,
             style,
@@ -3549,6 +3565,7 @@ fn build_glyph_unit(
             name,
             number,
             GLYPH_PIN_NAME_TEXT,
+            p["hidden"].as_bool().unwrap_or(false),
         ));
     }
 
@@ -3575,16 +3592,18 @@ fn build_symbol_unit(
         if g != Glyph::Rectangle {
             match build_glyph_unit(pins_val, g) {
                 Ok((sexp, rect, pins)) => {
+                    validate_co_located_pins(&pins)?;
                     return Ok(BuiltUnit {
                         sexp,
                         rect,
                         warning: None,
                         body: g.name(),
                         pins,
-                    })
+                    });
                 }
                 Err(reason) => {
                     let (sexp, rect, pins) = build_rect_unit(pins_val, show_names);
+                    validate_co_located_pins(&pins)?;
                     return Ok(BuiltUnit {
                         sexp,
                         rect,
@@ -3597,6 +3616,7 @@ fn build_symbol_unit(
         }
     }
     let (sexp, rect, pins) = build_rect_unit(pins_val, show_names);
+    validate_co_located_pins(&pins)?;
     Ok(BuiltUnit {
         sexp,
         rect,
@@ -3620,6 +3640,7 @@ fn build_rect_unit(
             angle: pin["angle"].as_f64().unwrap_or(0.0),
             length: pin["length"].as_f64().unwrap_or(2.54),
             name: pin["name"].as_str().unwrap_or("~").to_string(),
+            hidden: pin["hidden"].as_bool().unwrap_or(false),
         });
     }
     let body = symbol_body_rect(&pin_geoms, show_names);
@@ -3640,7 +3661,14 @@ fn build_rect_unit(
     let mut pins_sexp = String::new();
     let mut resolved = Vec::with_capacity(pins_val.len());
     for (pin, g) in pins_val.iter().zip(&pin_geoms) {
-        resolved.push(ResolvedPin::new(pin, g.x, g.y));
+        resolved.push(ResolvedPin::new(
+            pin,
+            g.x,
+            g.y,
+            g.angle,
+            g.length,
+            pin_style_token(pin["style"].as_str()),
+        ));
         pins_sexp.push_str(&emit_pin(
             pin["type"].as_str().unwrap_or("passive"),
             pin_style_token(pin["style"].as_str()),
@@ -3651,6 +3679,7 @@ fn build_rect_unit(
             &g.name,
             pin["number"].as_str().unwrap_or("1"),
             PIN_TEXT,
+            pin["hidden"].as_bool().unwrap_or(false),
         ));
     }
     let body_sexp = match body {
@@ -3677,10 +3706,15 @@ struct ResolvedPin {
     requested: Option<(f64, f64)>,
     x: f64,
     y: f64,
+    angle: f64,
+    length: f64,
+    pin_type: String,
+    style: String,
+    hidden: bool,
 }
 
 impl ResolvedPin {
-    fn new(pin: &serde_json::Value, x: f64, y: f64) -> Self {
+    fn new(pin: &serde_json::Value, x: f64, y: f64, angle: f64, length: f64, style: &str) -> Self {
         let requested = match (pin["x"].as_f64(), pin["y"].as_f64()) {
             (Some(rx), Some(ry)) => Some((rx, ry)),
             _ => None,
@@ -3691,6 +3725,11 @@ impl ResolvedPin {
             requested,
             x,
             y,
+            angle,
+            length,
+            pin_type: pin["type"].as_str().unwrap_or("passive").to_string(),
+            style: style.to_string(),
+            hidden: pin["hidden"].as_bool().unwrap_or(false),
         }
     }
 
@@ -3706,7 +3745,8 @@ impl ResolvedPin {
             "number": self.number,
             "name": self.name,
             "x": self.x,
-            "y": self.y
+            "y": self.y,
+            "hidden": self.hidden
         });
         // Only when it differs, so the common case stays compact and a moved
         // pin stands out.
@@ -3715,6 +3755,80 @@ impl ResolvedPin {
         }
         out
     }
+}
+
+/// Validate KiCad's visible-anchor form of a pin stack after layout has
+/// resolved the actual connection points. Hidden standalone pins remain valid
+/// (notably true NC pads), and legacy visible-only overlaps keep their existing
+/// behavior. A group containing hidden pins must be visually and electrically
+/// unambiguous: one visible anchor, passive hidden members, identical rendered
+/// geometry and unique physical pin numbers.
+fn validate_co_located_pins(pins: &[ResolvedPin]) -> anyhow::Result<()> {
+    let mut visited = vec![false; pins.len()];
+    for i in 0..pins.len() {
+        if visited[i] {
+            continue;
+        }
+        let group: Vec<usize> = (i..pins.len())
+            .filter(|&j| {
+                (pins[j].x - pins[i].x).abs() <= POSITION_EPSILON
+                    && (pins[j].y - pins[i].y).abs() <= POSITION_EPSILON
+            })
+            .collect();
+        for &j in &group {
+            visited[j] = true;
+        }
+        if group.len() < 2 || !group.iter().any(|&j| pins[j].hidden) {
+            continue;
+        }
+
+        let numbers = group
+            .iter()
+            .map(|&j| pins[j].number.as_str())
+            .collect::<Vec<_>>();
+        let visible_count = group.iter().filter(|&&j| !pins[j].hidden).count();
+        if visible_count != 1 {
+            anyhow::bail!(
+                "co-located pins [{}] at ({}, {}) include hidden pins but have {} visible anchors; exactly one is required",
+                numbers.join(", "),
+                fmt_f64(pins[i].x),
+                fmt_f64(pins[i].y),
+                visible_count
+            );
+        }
+        if let Some(pin) = group
+            .iter()
+            .map(|&j| &pins[j])
+            .find(|pin| pin.hidden && pin.pin_type != "passive")
+        {
+            anyhow::bail!(
+                "co-located hidden pin \"{}\" must use electrical type \"passive\" (got \"{}\")",
+                pin.number,
+                pin.pin_type
+            );
+        }
+        let first = &pins[group[0]];
+        if let Some(pin) = group.iter().skip(1).map(|&j| &pins[j]).find(|pin| {
+            (pin.angle - first.angle).abs() > POSITION_EPSILON
+                || (pin.length - first.length).abs() > POSITION_EPSILON
+                || pin.style != first.style
+        }) {
+            anyhow::bail!(
+                "co-located pin \"{}\" must match anchor geometry (angle, length and style)",
+                pin.number
+            );
+        }
+        let mut unique = std::collections::HashSet::new();
+        if let Some(number) = numbers.iter().find(|number| !unique.insert(**number)) {
+            anyhow::bail!(
+                "co-located pins at ({}, {}) repeat physical pin number \"{}\"",
+                fmt_f64(first.x),
+                fmt_f64(first.y),
+                number
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Below this a difference is float noise from the body arithmetic, not a move.
@@ -4552,7 +4666,8 @@ async fn handle_get_symbol_info(
                 "name": pin.find("name").and_then(|n| n.get(1)).and_then(|n| n.as_str()).unwrap_or(""),
                 "type": pin_type,
                 "x": px,
-                "y": py
+                "y": py,
+                "hidden": pin.find_str("hide") == Some("yes")
             })
         })
         .collect();
@@ -6109,6 +6224,7 @@ mod tests {
             angle,
             length,
             name: name.into(),
+            hidden: false,
         }
     }
 
@@ -6710,6 +6826,119 @@ mod tests {
         );
     }
 
+    #[test]
+    fn create_symbol_schema_exposes_pin_visibility_everywhere() {
+        let schema = tools()
+            .into_iter()
+            .find(|tool| tool.name == "create_symbol")
+            .expect("library must expose create_symbol")
+            .input_schema;
+        assert_eq!(
+            schema["properties"]["pins"]["items"]["properties"]["hidden"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            schema["properties"]["units"]["items"]["properties"]["pins"]["items"]["properties"]
+                ["hidden"]["default"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["power_pins"]["items"]["properties"]["hidden"]["type"],
+            "boolean"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_symbol_emits_and_reports_co_located_hidden_passive_pins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("stacked.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "STACKED_GND",
+            "reference_prefix": "U",
+            "pins": [
+                {"number":"1","name":"GND","type":"power_in","x":0.0,"y":-7.62,"angle":90,"length":2.54},
+                {"number":"2","name":"GND","type":"passive","x":0.0,"y":-7.62,"angle":90,"length":2.54,"hidden":true},
+                {"number":"11","name":"GND","type":"passive","x":0.0,"y":-7.62,"angle":90,"length":2.54,"hidden":true}
+            ]
+        });
+
+        let result = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let report: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(report["units"][0]["pins"][0]["hidden"], false);
+        assert_eq!(report["units"][0]["pins"][1]["hidden"], true);
+        assert_eq!(report["units"][0]["pins"][2]["hidden"], true);
+        let x = report["units"][0]["pins"][0]["x"].as_f64().unwrap();
+        let y = report["units"][0]["pins"][0]["y"].as_f64().unwrap();
+        for pin in report["units"][0]["pins"].as_array().unwrap() {
+            assert_eq!(pin["x"], x);
+            assert_eq!(pin["y"], y);
+        }
+
+        let content = std::fs::read_to_string(&lib).unwrap();
+        let root = parse_sexp(&content).unwrap();
+        let unit = root.find("symbol").unwrap().find("symbol").unwrap();
+        let pins = unit.find_all("pin");
+        assert_eq!(pins.len(), 3);
+        assert!(pins[0].find("hide").is_none());
+        assert_eq!(pins[1].find_str("hide"), Some("yes"));
+        assert_eq!(pins[2].find_str("hide"), Some("yes"));
+    }
+
+    #[tokio::test]
+    async fn create_symbol_rejects_non_passive_hidden_member_of_overlap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("unsafe_stack.kicad_sym");
+        let result = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "UNSAFE_STACK",
+                "reference_prefix": "U",
+                "pins": [
+                    {"number":"1","name":"GND","type":"power_in","x":0.0,"y":-7.62,"angle":90},
+                    {"number":"2","name":"GND","type":"power_in","x":0.0,"y":-7.62,"angle":90,"hidden":true}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("must use electrical type \"passive\""));
+        assert!(
+            !lib.exists(),
+            "validation must happen before the atomic write"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_symbol_allows_standalone_hidden_no_connect_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("hidden_nc.kicad_sym");
+        let result = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "HIDDEN_NC",
+                "reference_prefix": "U",
+                "pins": [
+                    {"number":"1","name":"NC","type":"no_connect","x":-5.08,"y":0.0,"hidden":true}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result_text(&result)).unwrap()["units"][0]
+                ["pins"][0]["hidden"],
+            true
+        );
+    }
+
     #[tokio::test]
     async fn create_symbol_emits_kicad10_library_match_defaults() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6898,7 +7127,7 @@ mod tests {
             "\t\t(property \"Value\" \"T1\" (at 0 -5.08 0))\r\n",
             "\t\t(symbol \"T1_1_1\"\r\n",
             "\t\t\t(pin input line (at -5.08 2.54 0) (length 2.54) (name \"G\") (number \"1\"))\r\n",
-            "\t\t\t(pin output line (at 5.08 0 180) (length 2.54) (name \"S\") (number \"3\"))\r\n",
+            "\t\t\t(pin output line (at 5.08 0 180) (length 2.54) (hide yes) (name \"S\") (number \"3\"))\r\n",
             "\t\t)\r\n",
             "\t)\r\n",
             ")\r\n",
@@ -6929,6 +7158,14 @@ mod tests {
             .unwrap();
         assert_eq!(g_pin["type"], "input", "{g_pin}");
         assert_eq!(g_pin["name"], "G", "{g_pin}");
+        assert_eq!(g_pin["hidden"], false, "{g_pin}");
+        let s_pin = out["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["number"] == "3")
+            .unwrap();
+        assert_eq!(s_pin["hidden"], true, "{s_pin}");
         assert_eq!(out["properties"]["Reference"], "Q", "{out}");
         assert_eq!(out["properties"]["Value"], "T1", "{out}");
     }

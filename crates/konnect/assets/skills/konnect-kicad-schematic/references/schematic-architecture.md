@@ -86,8 +86,15 @@ grammar across the project:
 - positive supplies above and ground/returns below when this clarifies flow;
 - decoupling, bootstrap, feedback, pull-up/down, filtering, and protection next
   to the pins or connector they serve;
-- short direct local wires for one functional cluster;
-- short stubs and labels for separated clusters or cross-page nets;
+- complete direct wiring inside each functional cluster as the default: a
+  reviewer must be able to follow the local circuit without joining a field of
+  repeated labels mentally;
+- matching short-stub labels for cross-page nets and intentionally separated
+  clusters, and for any local connection that would otherwise cross unrelated
+  content, span large empty space or require a wrap-around route;
+- consistent power/global labels for positive rails and ground rather than long
+  rail wires; `PWR_FLAG` is reserved for a necessary ERC source assertion on an
+  already labelled rail and is not used as the visible rail marker;
 - analog/measurement clusters visibly separated from switching nodes;
 - high-current switch, shunt, Kelvin pickup, and current amplifier kept together
   when their physical/electrical relationship is part of correctness.
@@ -115,6 +122,16 @@ update the proposal and obtain approval rather than silently drifting.
 - Every function and external connector has exactly one owning page.
 - Cross-page nets have documented sources and consumers.
 - Local helper nets do not leak across pages without a reason.
+- Each functional block is visibly continuous through direct local wiring;
+  labels do not replace ordinary intra-block connections.
+- Direct wires stay within one functional cluster; none crosses another cluster,
+  wraps around the page, or spans large empty space merely to avoid a label.
+- Every local labelled break has a concrete crossover, cluster-boundary, dense
+  fan-out, or cross-page reason; placement was considered before introducing it.
+- Equivalent supply/ground pads on dense symbols are stacked or connected to one
+  compact local bus rather than expanded into a comb of repeated labels.
+- Power and ground markers use the project's label convention, while any
+  required `PWR_FLAG` has only the narrow ERC-source role.
 - Tight power, switching, analog, and Kelvin relationships are not split.
 - The root shows the system at a glance, or the approved single page remains
   readable without an unnecessary hierarchy.

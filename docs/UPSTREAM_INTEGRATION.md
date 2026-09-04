@@ -207,11 +207,12 @@ The first product slice makes the intended final policy visible:
    if ($trackedLegacyPaths.Count -gt 0) { git rm -- $trackedLegacyPaths }
    ```
 
-2. Add or update the four namespaced replacements:
+2. Add or update the five namespaced replacements:
    - `konnect-kicad-schematic`
    - `konnect-kicad-pcb-layout`
    - `konnect-kicad-layout-review`
    - `konnect-kicad-package-audit`
+   - `konnect-kicad-symbol`
 3. Adapt the namespaced manifests and auxiliary files to upstream's current
    installer model. Do not transplant the old installer wholesale.
 4. Import relevant upstream safety or tool-signature corrections into the

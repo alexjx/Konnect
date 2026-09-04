@@ -16,6 +16,10 @@ and complete its workflow before placing, moving, or wiring component-level
 symbols. A request to "start the schematic" does not by itself approve an
 unstated page architecture.
 
+For any placement or wiring work, also read
+[references/schematic-layout.md](references/schematic-layout.md). Its normal
+schematic grammar is an acceptance gate, not optional polish after ERC.
+
 Start by inspecting maintained schematics, block-design documents, layout
 standards, and shared application circuits already present in the workspace.
 Preserve proven page composition and relative circuit grouping when the target
@@ -89,10 +93,35 @@ unless the user explicitly accepts partial completion.
   that follows signal or power flow. Keep support parts near the component they
   serve; short branches and uneven spacing are acceptable when they improve
   clarity.
-- Place parts to keep local wires short and avoid crossings. Do not draw long
-  wrap-around wire loops to escape a crossover. When unrelated connections
-  would cross or obscure the flow, use matching net labels on short local
-  stubs.
+- Draw each *local functional cluster* as a complete connected circuit first.
+  Use direct wires between a main device and the nearby parts that serve that
+  exact function. Direct wiring is not a goal by itself: never stretch a wire
+  across another cluster, around the page perimeter, or through large empty
+  space merely to avoid a label.
+- Connect separated clusters with matching labels on short outward stubs, even
+  when they are on the same page. Do not replace the short, reviewable wiring
+  inside a cluster with one label per pin merely because that is easier to
+  generate.
+- Place and, when useful, rotate parts to keep those direct local wires short,
+  orthogonal and free of crossings. If a connection leaves its cluster, crosses
+  an unrelated symbol/net, or needs a wrap-around route, split it into matching
+  labels on short local stubs. Reposition first when the parts actually belong
+  together; label the connection when they do not.
+- Represent power rails and ground with the project's consistent power/global
+  labels instead of drawing long rail wires through a block. A KiCad
+  `PWR_FLAG`, when ERC genuinely needs an external-source declaration, is an
+  ERC-only assertion attached to the already labelled rail; it is not a visual
+  rail marker and never replaces the rail label.
+- Prefer qualified official symbols whose pins are grouped by logical function
+  rather than package edge order. For custom symbols, group interfaces together
+  and put positive power at the top and ground at the bottom. Equivalent supply
+  or ground pads may use a native pin stack or one visible anchor with verified
+  hidden passive pins co-located at the same point. Preserve this compact
+  representation in qualified official symbols. When creating a custom symbol,
+  `create_symbol` can express the latter by giving the equivalent pins identical
+  geometry, leaving one anchor visible, and setting `hidden: true` plus passive
+  type on the others. Use a short local bus only when the chosen symbol exposes
+  separate visible pins.
 - Omit label rotation for normal placement so Konnect derives rotation and
   justification from the attached wire. Use an explicit rotation only for a
   deliberate exception, and preserve electrical label shape where relevant.

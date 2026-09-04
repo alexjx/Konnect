@@ -36,9 +36,10 @@ The fork currently focuses on three integration policies:
 - prefer safety-gated mutations: exact document revisions and editor-lock
   refusal on guarded file edits, explicit live-board identity for IPC
   operations, and plan/apply/read-back workflows where the tool supports them;
-- install four namespaced skills — `konnect-kicad-schematic`,
+- install five namespaced skills — `konnect-kicad-schematic`,
   `konnect-kicad-pcb-layout`, `konnect-kicad-layout-review`, and
-  `konnect-kicad-package-audit` — without overwriting unrelated user skills;
+  `konnect-kicad-package-audit`, plus `konnect-kicad-symbol` — without
+  overwriting unrelated user skills;
 - preserve deliberate removals during upstream integration, using the
   [integration runbook](docs/UPSTREAM_INTEGRATION.md) and its
   [intentional-removal manifest](docs/upstream-intentional-removals.txt).
@@ -196,7 +197,7 @@ cargo build --release -p konnect
 
 ### Install guidance for your AI client
 
-This fork bundles four namespaced KiCad skills for Claude and Codex. Select the
+This fork bundles five namespaced KiCad skills for Claude and Codex. Select the
 client when installing, checking, or removing that guidance:
 
 ```bash
@@ -211,7 +212,7 @@ konnect uninstall --client codex
 
 The installed skills are `konnect-kicad-schematic`,
 `konnect-kicad-pcb-layout`, `konnect-kicad-layout-review`, and
-`konnect-kicad-package-audit`. Installation removes only legacy Konnect-owned
+`konnect-kicad-package-audit`, plus `konnect-kicad-symbol`. Installation removes only legacy Konnect-owned
 skill names and preserves unrelated user skills. A Codex install also removes
 stale Konnect-owned copies from the old canonical `~/.codex/skills` location
 when that directory is not the active `CODEX_HOME` target.
