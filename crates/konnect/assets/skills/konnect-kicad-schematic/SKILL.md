@@ -1,12 +1,46 @@
 ---
 name: konnect-kicad-schematic
-description: Create, modify, or verify KiCad schematics through Konnect MCP. Use for schematic structure, symbols, wiring, component properties, placement, or electrical validation; use the guarded workflow whenever it supports the requested mutation.
+description: Plan, create, modify, or verify KiCad schematics through Konnect MCP. Use for reusable single-page or hierarchical architecture, symbols, wiring, component properties, placement, or electrical validation; use the guarded workflow whenever it supports the requested mutation.
 ---
 
 # Konnect KiCad Schematic
 
 Use Konnect for every schematic write. Never edit `.kicad_sch` text directly.
 Do not automate the KiCad GUI unless the user explicitly requests it.
+
+## Architecture before drawing
+
+For a new schematic, a substantial redraw, or a flat-to-hierarchy conversion,
+read [references/schematic-architecture.md](references/schematic-architecture.md)
+and complete its workflow before placing, moving, or wiring component-level
+symbols. A request to "start the schematic" does not by itself approve an
+unstated page architecture.
+
+Start by inspecting maintained schematics, block-design documents, layout
+standards, and shared application circuits already present in the workspace.
+Preserve proven page composition and relative circuit grouping when the target
+uses the same topology. Reuse is evidence-based: re-check values, device pins,
+footprints, and project-specific constraints instead of copying them blindly.
+
+Choose the structure that fits the design:
+
+- A simple, cohesive circuit may use one well-planned page.
+- A multi-function design normally uses a root architecture page plus complete
+  functional child pages.
+- For an existing project, preserve its established pinless/global-label or
+  ported-sheet convention unless there is a documented reason to change it.
+
+Before drawing, present the complete architecture: system flow; every page and
+its responsibility, exclusions, connector ownership and visual composition;
+all cross-page interfaces; power/ground ownership; reusable source pages; and
+the verification plan. Obtain explicit user approval and record the accepted
+architecture in the project design authority.
+
+For a hierarchy, build and review the root plus all empty child pages before
+populating component circuits. Then complete and render one child page at a
+time. For a single-page design, review the planned functional zones before
+placement. ERC success does not substitute for architecture approval or
+readability at normal review scale.
 
 ## Prefer the guarded workflow
 

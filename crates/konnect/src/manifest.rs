@@ -56,6 +56,12 @@ pub const SKILLS: &[SkillManifest] = &[
                 "agents/openai.yaml",
                 include_str!("../assets/skills/konnect-kicad-schematic/agents/openai.yaml"),
             ),
+            (
+                "references/schematic-architecture.md",
+                include_str!(
+                    "../assets/skills/konnect-kicad-schematic/references/schematic-architecture.md"
+                ),
+            ),
         ],
     },
     SkillManifest {
@@ -169,7 +175,11 @@ mod tests {
             ),
             (
                 "konnect-kicad-schematic",
-                BTreeSet::from(["SKILL.md", "agents/openai.yaml"]),
+                BTreeSet::from([
+                    "SKILL.md",
+                    "agents/openai.yaml",
+                    "references/schematic-architecture.md",
+                ]),
             ),
             (
                 "konnect-kicad-package-audit",
