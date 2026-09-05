@@ -151,3 +151,10 @@ change. Export changed pages when geometry or presentation changed, and run
 connectivity/ERC checks when electrical connectivity could have changed. If
 Konnect lacks the required surgical or verification operation, stop instead of
 rebuilding the page or using an unapproved fallback.
+
+For wiring work, `validate_wire_connections` is the completion gate, not only
+a dangling-wire check. Treat every reported label-direction issue as a
+failure: rotate those exact labels with `batch_rotate_labels`, then rerun the
+validator and render the page. A clean result requires both zero floating
+endpoints and zero label-direction issues; do not accept ERC or visual inspection
+alone while this MCP gate is failing.

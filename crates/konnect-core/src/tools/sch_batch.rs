@@ -291,7 +291,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "validate_wire_connections",
             "Check all wire endpoints for floating ends (not connected to a pin, label, \
-             or another wire). Reports each floating endpoint with its coordinates.",
+             or another wire), and reject attached labels whose stored direction disagrees \
+             with their pin or wire-end geometry.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1495,10 +1496,27 @@ async fn handle_validate_wire_connections(
         .map(|(x, y, wire_uuid)| json!({ "x": x, "y": y, "wire_uuid": wire_uuid }))
         .collect();
 
+    let label_direction_issues: Vec<serde_json::Value> =
+        crate::tools::sch_wiring::attached_label_direction_issues(&tree, &wires)?
+            .into_iter()
+            .map(|(label, expected_rotation)| {
+                json!({
+                    "net": label.net,
+                    "type": format!("{:?}", label.kind),
+                    "x": label.x,
+                    "y": label.y,
+                    "rotation": label.rotation.rem_euclid(360.0),
+                    "expected_rotation": expected_rotation
+                })
+            })
+            .collect();
+
     Ok(CallToolResult::json(&json!({
-        "valid": floating.is_empty(),
+        "valid": floating.is_empty() && label_direction_issues.is_empty(),
         "floating_count": floating.len(),
-        "floating_endpoints": floating
+        "floating_endpoints": floating,
+        "label_direction_issue_count": label_direction_issues.len(),
+        "label_direction_issues": label_direction_issues
     })))
 }
 
@@ -2135,6 +2153,19 @@ mod connect_to_net_orientation_tests {
         std::fs::read_to_string(path).unwrap()
     }
 
+    async fn validate_wires(path: &std::path::Path) -> serde_json::Value {
+        let result = handle_validate_wire_connections(
+            &json!({ "schematic": path.display().to_string() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
     /// The reported bug: a left-edge pin's label was written at rotation 0,
     /// so its text ran east across the body, over the pin names.
     #[tokio::test]
@@ -2172,6 +2203,27 @@ mod connect_to_net_orientation_tests {
         assert_eq!(label_of(&after, "TOP").0, "100 87.3 90");
         let after = connect(&path, "BOTTOM", "4").await;
         assert_eq!(label_of(&after, "BOTTOM").0, "100 112.7 270");
+    }
+
+    #[tokio::test]
+    async fn wire_validation_rejects_an_existing_vertical_label_facing_sideways() {
+        let (_d, path) = quad_schematic();
+        connect(&path, "TOP", "3").await;
+        let after = connect(&path, "BOTTOM", "4").await;
+        let wrong = after.replace("(at 100 87.3 90)", "(at 100 87.3 0)");
+        assert_ne!(wrong, after, "fixture must contain the upward label");
+        std::fs::write(&path, wrong).unwrap();
+
+        let validation = validate_wires(&path).await;
+        assert_eq!(validation["valid"], false);
+        assert_eq!(validation["floating_count"], 0);
+        assert_eq!(validation["label_direction_issue_count"], 1);
+        assert_eq!(validation["label_direction_issues"][0]["net"], "TOP");
+        assert_eq!(validation["label_direction_issues"][0]["rotation"], 0.0);
+        assert_eq!(
+            validation["label_direction_issues"][0]["expected_rotation"],
+            90.0
+        );
     }
 
     /// Pins on one endpoint are already connected, so one label serves them

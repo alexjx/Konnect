@@ -125,7 +125,7 @@ and Workflow expose them; Legacy does not. A supported mutation follows
 | `delete_schematic_net_label` | Delete a net label by net name and position. |
 | `rotate_schematic_label` | Rotate a bare net label and update its justify direction; attached pin/wire geometry remains authoritative. |
 | `move_labels_by_offset` | Move all labels matching a net name by a given X/Y offset. |
-| `batch_rotate_labels` | Rotate multiple labels by net name in a single file read/write cycle. |
+| `batch_rotate_labels` | Rotate labels selected by exact net name and position; attached pin/wire geometry overrides the requested angle, allowing `validate_wire_connections` direction issues to be repaired. |
 | `add_no_connect` | Add a no-connect flag (X marker) to an unconnected pin endpoint. |
 | `delete_no_connect` | Remove a no-connect flag at a given position. |
 | `batch_delete_no_connect` | Delete multiple no-connect flags in a single file read/write cycle. |
@@ -183,7 +183,7 @@ and Workflow expose them; Legacy does not. A supported mutation follows
 | `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`; when the point is a symbol pin, conflicting directions are rejected. |
 | `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. Aligns the text against that position with `justify`, per axis and defaulting to `left bottom` as KiCad does; an omitted axis is centred, and `center` centres both. Takes `bold`, `italic`, `thickness` and `color` for the font. |
 | `get_schematic_layout` | Return component positions and transformed drawing/pin bounds (excluding free text), reporting unresolved geometry; optionally include wires and labels. |
-| `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
+| `validate_wire_connections` | Check all wire endpoints for floating ends and reject attached labels whose stored direction disagrees with their pin or wire-end geometry. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in one file read/write cycle, using the root project and full sheet path for hierarchical children. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
 | `batch_connect_pins` | Connect multiple component pin pairs in one file read/write cycle, preserving an independent 1.27 mm outward stub at every symbol endpoint. |

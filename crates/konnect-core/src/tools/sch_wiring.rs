@@ -14,7 +14,7 @@ use konnect_sexp::{
     geometry::snap_point,
     parser::parse_sexp,
     schematic::{
-        extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
+        extract_labels, extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
         format_junction, format_wire, parse_at, pin_endpoint, pin_outward_direction,
         read_schematic, wire_end_label_rotation, Wire,
     },
@@ -231,7 +231,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_rotate_labels",
-            "Rotate multiple labels by net name in a single file read/write cycle.",
+            "Rotate multiple labels by exact net name and position. Attached pin/wire \
+             geometry overrides each requested rotation; use the issue list returned by \
+             validate_wire_connections to repair existing label directions.",
             json!({
                 "type": "object",
                 "properties": {
@@ -770,7 +772,7 @@ fn validate_pin_exit(
 /// Determine how a label at `anchor` must face. A symbol pin is authoritative.
 /// Otherwise the label continues away from the one unambiguous wire side that
 /// reaches the anchor. Junctions with conflicting sides have no forced face.
-fn label_rotation_from_geometry(
+pub(crate) fn label_rotation_from_geometry(
     tree: &konnect_sexp::SexpNode,
     wires: &[Wire],
     anchor: (f64, f64),
@@ -809,6 +811,27 @@ fn label_rotation_from_geometry(
         [rotation] => Some(*rotation),
         _ => None,
     })
+}
+
+/// Labels whose stored direction disagrees with the one unambiguous pin/wire
+/// side reaching their anchor. Bare labels and junction labels are deliberate
+/// presentation choices, so they are not forced here.
+pub(crate) fn attached_label_direction_issues(
+    tree: &konnect_sexp::SexpNode,
+    wires: &[Wire],
+) -> anyhow::Result<Vec<(konnect_sexp::schematic::Label, f64)>> {
+    let mut issues = Vec::new();
+    for label in extract_labels(tree) {
+        let Some(expected) = label_rotation_from_geometry(tree, wires, (label.x, label.y))? else {
+            continue;
+        };
+        let current = label.rotation.rem_euclid(360.0);
+        let delta = (current - expected).abs();
+        if delta.min(360.0 - delta) >= 0.01 {
+            issues.push((label, expected));
+        }
+    }
+    Ok(issues)
 }
 
 fn face_attached_labels(
